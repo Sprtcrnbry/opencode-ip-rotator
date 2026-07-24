@@ -1,23 +1,37 @@
-# OpenCode IP Rotator & Zen Proxy
+# OpenCode IP Rotator & Proxy Server ⚡
 
-OpenCode IP Rotator & Zen Proxy is a production-grade, lightweight infrastructure service designed to eliminate HTTP 429 (Rate Limit) bottlenecks when using OpenCode Zen free AI models. It combines Cloudflare WARP (`warp-cli`) dynamic IP rotation, transparent request retries, active flow locking, and a FastAPI-based OpenAI-compatible proxy server.
+[![GitHub release](https://img.shields.io/github/v/release/alztrk/opencode-ip-rotator?style=flat-square&color=blue)](https://github.com/alztrk/opencode-ip-rotator)
+[![Docker Image](https://img.shields.io/badge/docker-microservices-blue.svg?style=flat-square&logo=docker)](https://github.com/alztrk/opencode-ip-rotator)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg?style=flat-square)](https://opensource.org/licenses/MIT)
+[![Python 3.11](https://img.shields.io/badge/python-3.11-brightgreen.svg?style=flat-square&logo=python)](https://python.org)
+
+An enterprise-grade, microservice-architected **Cloudflare WARP IP Rotator & Resilient Proxy Server** specifically engineered for OpenCode AI. Eliminates HTTP 429 (Rate Limit) bottlenecks, guarantees unique IP rotation, tracks live USD token cost savings, and persists metrics to SQLite.
+
+---
+
+## Key Features 🚀
+
+- 🔄 **Guaranteed IP Diversity Loop:** Uses `warp-cli registration delete & new` loops to guarantee a brand-new public IP address on every rotation.
+- 🐳 **Microservices Architecture:** Decoupled `proxy-server` (FastAPI) and `warp-rotator` (Cloudflare WARP daemon) services via `docker-compose`.
+- 📊 **Minimalist Dashboard (shadcn/ui style):** Beautiful, clean white UI featuring real-time country flags 🇹🇷, live token stats, and instant rotation feedback.
+- 💾 **SQLite Data Persistence:** Persistent disk storage for token consumption, model metrics, and historical IP rotation logs across container restarts.
+- 💵 **USD Token Savings Calculator:** Real-time financial estimation of token usage savings per model based on input/output pricing models.
+- 📄 **Built-in Pagination:** Smooth 5-item pagination for both Model Usage Breakdown and IP Rotation Log tables.
+- 🛡️ **Active Flow Locking:** Prevents IP rotations during active Server-Sent Events (SSE) streaming sessions to prevent connection drops.
 
 ---
 
 ## Architecture Overview
 
-The system operates as an intermediary layer between OpenCode clients (CLI or Desktop) and OpenCode Zen API endpoints.
-
 ```
-[OpenCode Client] ──(HTTP/2)──> [Proxy Server (server.py:8000)]
+[OpenCode Client] ──(HTTP/2)──> [Proxy Server (Port 8000)] ──(SQLite)──> [metrics.db]
                                            │
-                                  (Transparent Retry & Flow Guard)
+                                  (Inter-Service IPC)
+                                           ▼
+                                [WARP Rotator (Port 8001)] ──> [Cloudflare WARP Daemon]
                                            │
                                            ▼
-                                [Rotator Module (rotator.py)] ──> [Cloudflare WARP CLI]
-                                           │
-                                           ▼
-                             [OpenCode Zen API Endpoint]
+                              [OpenCode Zen API Endpoint]
 ```
 
 ### Core Architecture Components
