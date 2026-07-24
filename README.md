@@ -5,7 +5,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg?style=flat-square)](https://opensource.org/licenses/MIT)
 [![Python 3.11](https://img.shields.io/badge/python-3.11-brightgreen.svg?style=flat-square&logo=python)](https://python.org)
 
-A microservice-architected Cloudflare WARP IP rotator and proxy server for OpenCode AI. Designed to prevent HTTP 429 rate limits, guarantee unique IP rotation per cycle, log usage metrics into SQLite, and display real-time statistics on a clean web dashboard.
+A microservice-architected Cloudflare WARP IP rotator and proxy server for OpenCode Zen. Designed to prevent HTTP 429 rate limits, guarantee unique IP rotation per cycle, log usage metrics into SQLite, and display real-time statistics on a clean web dashboard.
 
 ---
 
