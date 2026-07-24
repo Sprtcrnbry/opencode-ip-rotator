@@ -1,0 +1,9 @@
+[project]
+name = "opencode-ip-rotator"
+version = "1.0.0"
+description = "Cloudflare WARP IP rotator with health monitoring for opencode"
+requires-python = ">=3.10"
+
+[build-system]
+requires = ["setuptools"]
+build-backend = "setuptools.backends._legacy:_Backend"

@@ -1,0 +1,30 @@
+services:
+  proxy-server:
+    build:
+      context: .
+      dockerfile: Dockerfile.proxy
+    container_name: opencode_proxy_server
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./data:/app/data
+    restart: unless-stopped
+    environment:
+      - OPENCODE_ZEN_PORT=8000
+      - OPENCODE_ZEN_HOST=0.0.0.0
+
+  warp-rotator:
+    build:
+      context: .
+      dockerfile: Dockerfile.warp
+    container_name: opencode_warp_rotator
+    privileged: true
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    restart: unless-stopped
+    environment:
+      - WARP_CHECK_ENDPOINT=https://opencode.ai
+      - WARP_CHECK_INTERVAL=15
+      - WARP_ROTATION_INTERVAL=300

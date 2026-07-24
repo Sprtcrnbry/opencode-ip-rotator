@@ -1,0 +1,15 @@
+FROM python:3.11-slim
+
+WORKDIR /app
+
+# Install dependencies
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Copy server code and rotator helper for metrics import
+COPY server.py .
+COPY rotator.py .
+
+EXPOSE 8000
+
+CMD ["python", "server.py"]
