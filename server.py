@@ -673,16 +673,21 @@ def get_realistic_headers() -> Dict[str, str]:
         "Sec-Fetch-Site": "same-origin",
     }
 
-async def stream_openai_response(raw_stream, model_name: str) -> AsyncGenerator[bytes, None]:
+async def stream_openai_response(response, model_name: str) -> AsyncGenerator[bytes, None]:
     with FlowContext():
         try:
-            for line in raw_stream:
+            # Synchronous iter_lines via thread pool executor or direct line iteration
+            for line in response.iter_lines():
                 if not line:
                     continue
-                line_str = line.decode("utf-8").strip()
+                line_str = line.decode("utf-8", errors="replace").strip()
+                if not line_str:
+                    continue
                 
                 if line_str.startswith("data:"):
                     yield f"{line_str}\n\n".encode("utf-8")
+                elif line_str == "[DONE]":
+                    yield b"data: [DONE]\n\n"
                 else:
                     chunk = {
                         "id": f"chatcmpl-zen-stream-{int(time.time())}",
@@ -698,10 +703,11 @@ async def stream_openai_response(raw_stream, model_name: str) -> AsyncGenerator[
                         ]
                     }
                     yield f"data: {json.dumps(chunk)}\n\n".encode("utf-8")
+                    await asyncio.sleep(0) # Yield control back to event loop
             
             yield b"data: [DONE]\n\n"
         except Exception as e:
-            log.error(f"Stream dropped: {e}")
+            log.error(f"Stream exception caught: {e}")
             yield b"data: [DONE]\n\n"
 
 @app.get("/dashboard", response_class=HTMLResponse)
@@ -812,7 +818,7 @@ async def chat_completions(req_data: ChatCompletionRequest, raw_request: Request
                 if req_data.stream:
                     track_token_usage(current_model, prompt_tokens=100, completion_tokens=150)
                     return StreamingResponse(
-                        stream_openai_response(response.iter_lines(), current_model),
+                        stream_openai_response(response, current_model),
                         media_type="text/event-stream"
                     )
                 else:
