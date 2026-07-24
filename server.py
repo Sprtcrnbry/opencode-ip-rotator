@@ -29,8 +29,50 @@ MODEL_PRICING = {
     "laguna-s-2.1-free": {"input_per_1m": 0.20, "output_per_1m": 0.70},
 }
 
-# SQLite Database setup
-DB_FILE = Path(os.environ.get("METRICS_DB_PATH", "/app/data/metrics.db"))
+# Proxy Pool / Custom Proxy List Support
+# -----------------------------------------------------------------------------
+PROXY_FILE = Path(os.environ.get("PROXY_LIST_FILE", "/app/data/proxies.txt"))
+_proxy_pool: List[str] = []
+_proxy_index = 0
+_proxy_lock = threading.Lock()
+
+def load_proxy_list():
+    """Loads proxy addresses from proxies.txt or PROXY_LIST environment variable."""
+    global _proxy_pool
+    proxies = []
+    
+    # 1. Try reading from proxies.txt file
+    if PROXY_FILE.exists():
+        try:
+            with open(PROXY_FILE, "r", encoding="utf-8") as f:
+                lines = [line.strip() for line in f if line.strip() and not line.startswith("#")]
+                proxies.extend(lines)
+        except Exception as e:
+            log.error(f"Error reading proxies.txt: {e}")
+
+    # 2. Try environment variable PROXY_LIST (comma-separated)
+    env_proxies = os.environ.get("PROXY_LIST", "").strip()
+    if env_proxies:
+        proxies.extend([p.strip() for p in env_proxies.split(",") if p.strip()])
+
+    _proxy_pool = list(dict.fromkeys(proxies)) # Unique proxy list
+    if _proxy_pool:
+        log.info(f"Loaded {len(_proxy_pool)} custom proxies into pool.")
+
+def get_next_outbound_proxy() -> Optional[Dict[str, str]]:
+    """Retrieves next proxy from pool using Round-Robin, or falls back to CUSTOM_OUTBOUND_PROXY."""
+    global _proxy_index
+    with _proxy_lock:
+        if _proxy_pool:
+            proxy_url = _proxy_pool[_proxy_index % len(_proxy_pool)]
+            _proxy_index += 1
+            return {"http": proxy_url, "https": proxy_url}
+        
+        custom_proxy = os.environ.get("CUSTOM_OUTBOUND_PROXY", "").strip()
+        if custom_proxy:
+            return {"http": custom_proxy, "https": custom_proxy}
+        
+        return None
 
 def init_db():
     """Initializes SQLite database and creates metrics & ip_history tables if not exists."""
@@ -754,12 +796,15 @@ async def chat_completions(req_data: ChatCompletionRequest, raw_request: Request
                 
                 time.sleep(random.uniform(0.1, 0.3))
 
+                proxies = get_next_outbound_proxy()
+
                 response = cffi_requests.post(
                     TARGET_ZEN_URL,
                     json=payload,
                     headers=headers,
                     impersonate="chrome124",
                     stream=req_data.stream,
+                    proxies=proxies,
                     timeout=60
                 )
                 metrics["successful_requests"] += 1
@@ -821,5 +866,7 @@ model_usage_stats = load_metrics_from_db()
 threading.Thread(target=discover_models_task, daemon=True).start()
 
 if __name__ == "__main__":
-    log.info(f"Starting OpenCode Zen v3.0 Resilient Proxy on http://{HOST}:{PORT}")
+    init_db()
+    load_proxy_list()
+    log.info(f"Starting OpenCode IP Proxy Server on {HOST}:{PORT}...")
     uvicorn.run(app, host=HOST, port=PORT)
