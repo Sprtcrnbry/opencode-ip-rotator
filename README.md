@@ -7,6 +7,8 @@
 
 A microservice-architected Cloudflare WARP IP rotator and proxy server for OpenCode Zen. Designed to prevent HTTP 429 rate limits, guarantee unique IP rotation per cycle, log usage metrics into SQLite, and display real-time statistics on a clean web dashboard.
 
+![OpenCode IP Rotator Dashboard Preview](docs/dashboard_preview.jpg)
+
 ---
 
 ## Key Features
