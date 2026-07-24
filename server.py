@@ -684,17 +684,16 @@ async def stream_openai_response(response, model_name: str) -> AsyncGenerator[by
                 if not line_str:
                     continue
                 
-                # If the upstream already sends SSE data: prefix
+                # Forward exact raw SSE line as-is if it starts with data:
                 if line_str.startswith("data:"):
                     yield f"{line_str}\n\n".encode("utf-8")
                 elif line_str == "[DONE]":
                     yield b"data: [DONE]\n\n"
                 else:
-                    # Upstream send raw text or JSON chunk -> format as standard OpenAI chunk
+                    # If upstream sent non-SSE line, try wrapping it safely
                     try:
-                        # Test if line_str is already a valid JSON object
                         parsed = json.loads(line_str)
-                        if "choices" in parsed:
+                        if isinstance(parsed, dict) and ("choices" in parsed or "id" in parsed or "delta" in parsed):
                             yield f"data: {line_str}\n\n".encode("utf-8")
                         else:
                             chunk = {
