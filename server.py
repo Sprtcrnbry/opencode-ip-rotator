@@ -677,34 +677,45 @@ def get_realistic_headers() -> Dict[str, str]:
 async def stream_openai_response(response, model_name: str) -> AsyncGenerator[bytes, None]:
     with FlowContext():
         try:
-            # Synchronous iter_lines via thread pool executor or direct line iteration
             for line in response.iter_lines():
-                if not line:
+                if line is None:
                     continue
                 line_str = line.decode("utf-8", errors="replace").strip()
                 if not line_str:
                     continue
                 
+                # If the upstream already sends SSE data: prefix
                 if line_str.startswith("data:"):
                     yield f"{line_str}\n\n".encode("utf-8")
                 elif line_str == "[DONE]":
                     yield b"data: [DONE]\n\n"
                 else:
-                    chunk = {
-                        "id": f"chatcmpl-zen-stream-{int(time.time())}",
-                        "object": "chat.completion.chunk",
-                        "created": int(time.time()),
-                        "model": model_name,
-                        "choices": [
-                            {
-                                "index": 0,
-                                "delta": {"content": line_str},
-                                "finish_reason": None
+                    # Upstream send raw text or JSON chunk -> format as standard OpenAI chunk
+                    try:
+                        # Test if line_str is already a valid JSON object
+                        parsed = json.loads(line_str)
+                        if "choices" in parsed:
+                            yield f"data: {line_str}\n\n".encode("utf-8")
+                        else:
+                            chunk = {
+                                "id": f"chatcmpl-zen-stream-{int(time.time())}",
+                                "object": "chat.completion.chunk",
+                                "created": int(time.time()),
+                                "model": model_name,
+                                "choices": [{"index": 0, "delta": {"content": line_str}, "finish_reason": None}]
                             }
-                        ]
-                    }
-                    yield f"data: {json.dumps(chunk)}\n\n".encode("utf-8")
-                    await asyncio.sleep(0) # Yield control back to event loop
+                            yield f"data: {json.dumps(chunk)}\n\n".encode("utf-8")
+                    except Exception:
+                        chunk = {
+                            "id": f"chatcmpl-zen-stream-{int(time.time())}",
+                            "object": "chat.completion.chunk",
+                            "created": int(time.time()),
+                            "model": model_name,
+                            "choices": [{"index": 0, "delta": {"content": line_str}, "finish_reason": None}]
+                        }
+                        yield f"data: {json.dumps(chunk)}\n\n".encode("utf-8")
+                
+                await asyncio.sleep(0)
             
             yield b"data: [DONE]\n\n"
         except Exception as e:
@@ -779,10 +790,17 @@ async def list_models():
         }
 
 @app.post("/v1/chat/completions")
-async def chat_completions(req_data: ChatCompletionRequest, raw_request: Request):
+async def chat_completions(raw_request: Request):
     metrics["total_requests"] += 1
-    current_model = req_data.model
-    log.info(f"Received request for model '{current_model}' (Stream: {req_data.stream})")
+    
+    try:
+        payload = await raw_request.json()
+    except Exception:
+        payload = {}
+
+    current_model = payload.get("model", "deepseek-v4-flash-free")
+    is_stream = payload.get("stream", False)
+    log.info(f"Received request for model '{current_model}' (Stream: {is_stream} | Has Tools: {'tools' in payload})")
     
     headers = get_realistic_headers()
     for k, v in raw_request.headers.items():
@@ -790,19 +808,12 @@ async def chat_completions(req_data: ChatCompletionRequest, raw_request: Request
             headers[k] = v
 
     for attempt in range(1, MAX_RETRIES_ON_429 + 1):
-        payload = {
-            "model": current_model,
-            "messages": [m.dict() for m in req_data.messages],
-            "stream": req_data.stream
-        }
-
         try:
             with FlowContext():
                 from curl_cffi import requests as cffi_requests
                 import random
                 
                 time.sleep(random.uniform(0.1, 0.3))
-
                 proxies = get_next_outbound_proxy()
 
                 response = cffi_requests.post(
@@ -810,13 +821,13 @@ async def chat_completions(req_data: ChatCompletionRequest, raw_request: Request
                     json=payload,
                     headers=headers,
                     impersonate="chrome124",
-                    stream=req_data.stream,
+                    stream=is_stream,
                     proxies=proxies,
-                    timeout=60
+                    timeout=120
                 )
                 metrics["successful_requests"] += 1
                 
-                if req_data.stream:
+                if is_stream:
                     track_token_usage(current_model, prompt_tokens=100, completion_tokens=150)
                     return StreamingResponse(
                         stream_openai_response(response, current_model),
