@@ -678,58 +678,27 @@ async def stream_openai_response(response, model_name: str) -> AsyncGenerator[by
     loop = asyncio.get_event_loop()
     with FlowContext():
         try:
-            # Helper to fetch next line synchronously in thread executor to prevent blocking asyncio loop
-            def get_next_line(line_iter):
+            def get_next_chunk(iter_content):
                 try:
-                    return next(line_iter)
+                    return next(iter_content)
                 except StopIteration:
                     return None
 
-            line_iter = response.iter_lines()
+            # Stream raw bytes chunks directly from HTTP response (Do not split lines or strip whitespace/newlines)
+            chunk_iter = response.iter_content(chunk_size=4096)
             
             while True:
-                line = await loop.run_in_executor(None, get_next_line, line_iter)
-                if line is None:
+                chunk = await loop.run_in_executor(None, get_next_chunk, chunk_iter)
+                if chunk is None or not chunk:
                     break
                 
-                line_str = line.decode("utf-8", errors="replace").strip()
-                if not line_str:
-                    continue
-                
-                # Direct passthrough for standard SSE lines
-                if line_str.startswith("data:"):
-                    yield f"{line_str}\n\n".encode("utf-8")
-                elif line_str == "[DONE]":
-                    yield b"data: [DONE]\n\n"
-                else:
-                    # Raw JSON / text line handling
-                    try:
-                        parsed = json.loads(line_str)
-                        if isinstance(parsed, dict) and ("choices" in parsed or "id" in parsed or "delta" in parsed):
-                            yield f"data: {line_str}\n\n".encode("utf-8")
-                        else:
-                            chunk = {
-                                "id": f"chatcmpl-zen-stream-{int(time.time())}",
-                                "object": "chat.completion.chunk",
-                                "created": int(time.time()),
-                                "model": model_name,
-                                "choices": [{"index": 0, "delta": {"content": line_str}, "finish_reason": None}]
-                            }
-                            yield f"data: {json.dumps(chunk)}\n\n".encode("utf-8")
-                    except Exception:
-                        chunk = {
-                            "id": f"chatcmpl-zen-stream-{int(time.time())}",
-                            "object": "chat.completion.chunk",
-                            "created": int(time.time()),
-                            "model": model_name,
-                            "choices": [{"index": 0, "delta": {"content": line_str}, "finish_reason": None}]
-                        }
-                        yield f"data: {json.dumps(chunk)}\n\n".encode("utf-8")
+                # Raw chunk passthrough to client
+                yield chunk
 
-            yield b"data: [DONE]\n\n"
+            yield b"\ndata: [DONE]\n\n"
         except Exception as e:
             log.error(f"Stream exception caught: {e}")
-            yield b"data: [DONE]\n\n"
+            yield b"\ndata: [DONE]\n\n"
 
 @app.get("/dashboard", response_class=HTMLResponse)
 async def dashboard():
