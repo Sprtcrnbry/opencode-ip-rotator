@@ -21,6 +21,7 @@ PERIODIC_ROTATION_INTERVAL = int(os.environ.get("WARP_ROTATION_INTERVAL", "300")
 INITIAL_RETRY_DELAY = int(os.environ.get("WARP_RETRY_DELAY", "3"))
 MAX_RETRIES = int(os.environ.get("WARP_MAX_RETRIES", "5"))
 AUTO_RECYCLE_THRESHOLD = int(os.environ.get("AUTO_RECYCLE_THRESHOLD", "50"))
+CUSTOM_OUTBOUND_PROXY = os.environ.get("CUSTOM_OUTBOUND_PROXY", "").strip()
 
 logging.basicConfig(
     format="%(asctime)s [Rotator] %(levelname)s: %(message)s",
