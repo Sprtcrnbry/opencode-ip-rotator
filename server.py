@@ -72,7 +72,8 @@ def get_next_outbound_proxy() -> Optional[Dict[str, str]]:
         if custom_proxy:
             return {"http": custom_proxy, "https": custom_proxy}
         
-        return None
+# SQLite Database setup
+DB_FILE = Path(os.environ.get("METRICS_DB_PATH", "/app/data/metrics.db"))
 
 def init_db():
     """Initializes SQLite database and creates metrics & ip_history tables if not exists."""
