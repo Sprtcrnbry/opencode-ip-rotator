@@ -675,22 +675,34 @@ def get_realistic_headers() -> Dict[str, str]:
     }
 
 async def stream_openai_response(response, model_name: str) -> AsyncGenerator[bytes, None]:
+    loop = asyncio.get_event_loop()
     with FlowContext():
         try:
-            for line in response.iter_lines():
+            # Helper to fetch next line synchronously in thread executor to prevent blocking asyncio loop
+            def get_next_line(line_iter):
+                try:
+                    return next(line_iter)
+                except StopIteration:
+                    return None
+
+            line_iter = response.iter_lines()
+            
+            while True:
+                line = await loop.run_in_executor(None, get_next_line, line_iter)
                 if line is None:
-                    continue
+                    break
+                
                 line_str = line.decode("utf-8", errors="replace").strip()
                 if not line_str:
                     continue
                 
-                # Forward exact raw SSE line as-is if it starts with data:
+                # Direct passthrough for standard SSE lines
                 if line_str.startswith("data:"):
                     yield f"{line_str}\n\n".encode("utf-8")
                 elif line_str == "[DONE]":
                     yield b"data: [DONE]\n\n"
                 else:
-                    # If upstream sent non-SSE line, try wrapping it safely
+                    # Raw JSON / text line handling
                     try:
                         parsed = json.loads(line_str)
                         if isinstance(parsed, dict) and ("choices" in parsed or "id" in parsed or "delta" in parsed):
@@ -713,9 +725,7 @@ async def stream_openai_response(response, model_name: str) -> AsyncGenerator[by
                             "choices": [{"index": 0, "delta": {"content": line_str}, "finish_reason": None}]
                         }
                         yield f"data: {json.dumps(chunk)}\n\n".encode("utf-8")
-                
-                await asyncio.sleep(0)
-            
+
             yield b"data: [DONE]\n\n"
         except Exception as e:
             log.error(f"Stream exception caught: {e}")
