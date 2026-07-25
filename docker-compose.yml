@@ -8,11 +8,14 @@ services:
       - "8000:8000"
     volumes:
       - ./data:/app/data
+      - ./proxies.txt:/app/data/proxies.txt:ro
     restart: unless-stopped
     environment:
       - OPENCODE_ZEN_PORT=8000
       - OPENCODE_ZEN_HOST=0.0.0.0
       - OPENCODE_ZEN_TARGET_BASE=https://opencode.ai/zen/v1
+      - PROXY_LIST_FILE=/app/data/proxies.txt
+      - PROXY_LIST=${PROXY_LIST:-}
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
       interval: 30s
@@ -36,8 +39,11 @@ services:
       - WARP_CHECK_INTERVAL=15
       - WARP_ROTATION_INTERVAL=300
       - METRICS_DB_PATH=/app/data/metrics.db
+      - PROXY_LIST_FILE=/app/data/proxies.txt
+      - PROXY_LIST=${PROXY_LIST:-}
     volumes:
       - ./data:/app/data
+      - ./proxies.txt:/app/data/proxies.txt:ro
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8001/health"]
       interval: 30s

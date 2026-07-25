@@ -24,3 +24,7 @@ ENV/
 data/
 *.db
 
+# Cloned reference repos
+opencode-src/
+opencode-src-shallow/
+

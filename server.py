@@ -39,6 +39,8 @@ STREAM_CHUNK_SIZE = 4096
 MODEL_DISCOVERY_INTERVAL = 300
 DASHBOARD_REFRESH_INTERVAL = 3
 STARTUP_TIME = time.time()
+ENABLE_HTTP2 = os.environ.get("ENABLE_HTTP2", "false").lower() in ("true", "1", "yes")
+STREAM_TIMEOUT = 600
 
 # -----------------------------------------------------------------------------
 # JSON Structured Logging
@@ -245,8 +247,22 @@ def _get_session(endpoint: str):
         from curl_cffi.requests import Session as SessionType
     with _session_pool_lock:
         if endpoint not in _session_pool:
-            _session_pool[endpoint] = SessionType()
+            kwargs = {}
+            if not ENABLE_HTTP2:
+                from curl_cffi import CurlHttpVersion
+                kwargs["http_version"] = CurlHttpVersion.V1_1
+            _session_pool[endpoint] = SessionType(**kwargs)
         return _session_pool[endpoint]
+
+def create_fresh_session(is_stream: bool):
+    global SessionType
+    if SessionType is None:
+        from curl_cffi.requests import Session as SessionType
+    kwargs = {}
+    if not ENABLE_HTTP2:
+        from curl_cffi import CurlHttpVersion
+        kwargs["http_version"] = CurlHttpVersion.V1_1
+    return SessionType(**kwargs)
 
 def _close_all_sessions():
     with _session_pool_lock:
@@ -534,7 +550,11 @@ def get_realistic_headers() -> Dict[str, str]:
         "Sec-Fetch-Site": "same-origin",
     }
 
-async def stream_response(response, model_name: str) -> AsyncGenerator[bytes, None]:
+class EmptyStreamError(Exception):
+    """Raised when upstream returns an empty or truncated stream without valid content/tool calls."""
+    pass
+
+async def stream_response(response, model_name: str, session=None) -> AsyncGenerator[bytes, None]:
     loop = asyncio.get_event_loop()
     global active_flows_count
 
@@ -542,35 +562,95 @@ async def stream_response(response, model_name: str) -> AsyncGenerator[bytes, No
         active_flows_count += 1
         prom_active_flows.set(active_flows_count)
 
+    chunk_count = 0
+    last_raw_line = ""
+    buffered_lines = []
+    has_meaningful_content = False
+
     try:
-        def get_next_chunk(iter_content):
+        def get_next_line(iter_lines):
             try:
-                return next(iter_content)
+                return next(iter_lines)
             except StopIteration:
-                return None
+                return "STOP_ITERATION"
+            except Exception as exc:
+                log.error(f"[STREAM DEBUG] Upstream socket/connection error for '{model_name}': {type(exc).__name__}: {exc}")
+                return "SOCKET_ERROR"
 
-        chunk_iter = response.iter_content(chunk_size=STREAM_CHUNK_SIZE)
+        line_iter = response.iter_lines()
 
-        while True:
-            chunk = await loop.run_in_executor(None, get_next_chunk, chunk_iter)
-            if chunk is None or not chunk:
+        # Step 1: Buffer up to 10 initial lines or until we confirm non-empty content
+        while len(buffered_lines) < 10:
+            item = await loop.run_in_executor(None, get_next_line, line_iter)
+            if item in ("STOP_ITERATION", "SOCKET_ERROR"):
                 break
-            yield chunk
 
+            line = item
+            if line:
+                raw_text = line.decode("utf-8", errors="ignore").strip()
+                if raw_text and not raw_text.startswith(":"):
+                    buffered_lines.append(line)
+                    if "content" in raw_text or "tool_calls" in raw_text or "reasoning_content" in raw_text:
+                        # Check if it's not just an empty choices array
+                        if '"choices":[]' not in raw_text.replace(" ", ""):
+                            has_meaningful_content = True
+                            break
+
+        # If stream ended prematurely without producing any meaningful content or tool calls
+        if not has_meaningful_content and len(buffered_lines) < 4:
+            all_buffered = "".join([l.decode("utf-8", errors="ignore") for l in buffered_lines])
+            if '"choices":[]' in all_buffered.replace(" ", "") or len(buffered_lines) == 0:
+                log.warning(f"[STREAM RECOVERY] Upstream returned empty/truncated stream for '{model_name}'. Triggering IP rotation & raising EmptyStreamError.")
+                raise EmptyStreamError("Upstream returned empty response stream")
+
+        # Yield buffered initial lines
+        for b_line in buffered_lines:
+            chunk_count += 1
+            yield b_line + b"\n"
+
+        # Step 2: Continue streaming remaining lines
+        while True:
+            item = await loop.run_in_executor(None, get_next_line, line_iter)
+            if item == "STOP_ITERATION":
+                log.info(f"[STREAM DEBUG] Upstream reached natural StopIteration for '{model_name}'. Total lines: {chunk_count}")
+                break
+            if item == "SOCKET_ERROR":
+                log.warning(f"[STREAM DEBUG] Upstream connection aborted via socket error for '{model_name}'. Lines sent: {chunk_count}")
+                break
+
+            line = item
+            if line:
+                chunk_count += 1
+                try:
+                    last_raw_line = line.decode("utf-8", errors="ignore")
+                except Exception:
+                    pass
+                yield line + b"\n"
+            else:
+                yield b"\n"
+
+        log.info(f"Streaming completed successfully for model '{model_name}' ({chunk_count} lines sent).")
         yield b"\ndata: [DONE]\n\n"
+    except EmptyStreamError:
+        raise
     except GeneratorExit:
-        pass
+        log.warning(f"[STREAM DEBUG] Client (OpenCode) explicitly closed/aborted SSE connection prematurely for '{model_name}' after {chunk_count} lines.")
     except Exception as e:
-        log.error(f"Stream exception caught: {e}")
+        log.error(f"Stream exception caught for model '{model_name}': {type(e).__name__}: {e}", exc_info=True)
         yield b"\ndata: [DONE]\n\n"
     finally:
         with flow_lock:
             active_flows_count = max(0, active_flows_count - 1)
             prom_active_flows.set(active_flows_count)
+        if session:
+            try:
+                session.close()
+            except Exception:
+                pass
 
 @app.get("/dashboard", response_class=HTMLResponse)
-async def dashboard():
-    return _templates.TemplateResponse("dashboard.html", {"request": {}})
+async def dashboard(request: Request):
+    return _templates.TemplateResponse(request=request, name="dashboard.html")
 
 @app.get("/metrics-prometheus")
 async def metrics_prometheus():
@@ -589,7 +669,7 @@ async def manual_rotate(raw_request: Request):
             swap_warp_registration()
             return {"status": "success", "verified_ip": get_public_ip()}
         try:
-            resp = cffi_requests.post("http://warp-rotator:8001/rotate", timeout=5)
+            resp = cffi_requests.post("http://warp-rotator:8001/rotate", timeout=35)
             if resp.status_code == 200:
                 swap_warp_registration()
                 return resp.json()
@@ -733,7 +813,7 @@ async def chat_completions(raw_request: Request):
         try:
             await asyncio.sleep(random.uniform(0.1, 0.3))
             proxies = get_next_outbound_proxy()
-            session = _get_session("chat")
+            session = create_fresh_session(is_stream) if is_stream else _get_session("chat")
             response = session.post(
                 TARGET_ZEN_URL,
                 json=payload,
@@ -741,14 +821,14 @@ async def chat_completions(raw_request: Request):
                 impersonate="chrome124",
                 stream=is_stream,
                 proxies=proxies,
-                timeout=120
+                timeout=STREAM_TIMEOUT if is_stream else 120
             )
 
             if response.status_code == 429 or response.status_code >= 500:
                 metrics["rate_limited_requests"] += 1
                 prom_requests_rate_limited.labels(model=current_model).inc()
                 err_text = response.text.lower()
-                is_model_specific_limit = any(k in err_text for k in ["model_rate_limit", "quota_exceeded", "per_model_limit", "credit_balance", "insufficient_quota"])
+                is_model_specific_limit = any(k in err_text for k in ["model_rate_limit", "quota_exceeded", "per_model_limit", "credit_balance", "insufficient_quota", "freeusagelimiterror", "free_usage_limit"])
                 delay = compute_backoff_delay(attempt, INITIAL_BACKOFF)
 
                 if is_model_specific_limit:
@@ -770,12 +850,28 @@ async def chat_completions(raw_request: Request):
             prom_request_duration.labels(model=current_model, endpoint="chat_completions").observe(time.time() - start_time)
 
             if is_stream:
-                track_token_usage(current_model, prompt_tokens=100, completion_tokens=150)
-                return StreamingResponse(
-                    stream_response(response, current_model),
-                    media_type="text/event-stream",
-                    headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no", "Connection": "keep-alive"}
-                )
+                try:
+                    # Pre-verify that the response is not an empty stream before committing to StreamingResponse
+                    stream_gen = stream_response(response, current_model, session=session)
+                    metrics["successful_requests"] += 1
+                    prom_requests_success.labels(model=current_model).inc()
+                    prom_request_duration.labels(model=current_model, endpoint="chat_completions").observe(time.time() - start_time)
+                    track_token_usage(current_model, prompt_tokens=100, completion_tokens=150)
+                    return StreamingResponse(
+                        stream_gen,
+                        media_type="text/event-stream",
+                        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no", "Connection": "keep-alive"}
+                    )
+                except EmptyStreamError:
+                    log.warning(f"Empty stream detected for '{current_model}'. Rotating IP and retrying (Attempt {attempt}/{MAX_RETRIES_ON_429})...")
+                    t0 = time.monotonic()
+                    ok = rotate_warp(reason=f"Empty stream on {current_model}")
+                    record_warp_rotation(ok, (time.monotonic() - t0) * 1000)
+                    if ok:
+                        swap_warp_registration()
+                    delay = compute_backoff_delay(attempt, INITIAL_BACKOFF)
+                    await asyncio.sleep(delay)
+                    continue
             else:
                 with FlowContext():
                     try:
@@ -847,7 +943,7 @@ async def anthropic_messages(raw_request: Request):
         try:
             await asyncio.sleep(random.uniform(0.1, 0.3))
             proxies = get_next_outbound_proxy()
-            session = _get_session("anthropic")
+            session = create_fresh_session(is_stream) if is_stream else _get_session("anthropic")
             response = session.post(
                 TARGET_ZEN_ANTHROPIC_URL,
                 json=body,
@@ -855,7 +951,7 @@ async def anthropic_messages(raw_request: Request):
                 impersonate="chrome124",
                 stream=is_stream,
                 proxies=proxies,
-                timeout=120,
+                timeout=STREAM_TIMEOUT if is_stream else 120,
             )
 
             if response.status_code in (429, 500) or response.status_code >= 500:
@@ -877,7 +973,7 @@ async def anthropic_messages(raw_request: Request):
 
             if is_stream:
                 return StreamingResponse(
-                    stream_response(response, model_name),
+                    stream_response(response, model_name, session=session),
                     media_type="text/event-stream",
                     headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
                 )
@@ -934,7 +1030,7 @@ async def responses_endpoint(raw_request: Request):
         try:
             await asyncio.sleep(random.uniform(0.1, 0.3))
             proxies = get_next_outbound_proxy()
-            session = _get_session("responses")
+            session = create_fresh_session(is_stream) if is_stream else _get_session("responses")
             response = session.post(
                 TARGET_ZEN_RESPONSES_URL,
                 json=body,
@@ -942,7 +1038,7 @@ async def responses_endpoint(raw_request: Request):
                 impersonate="chrome124",
                 stream=is_stream,
                 proxies=proxies,
-                timeout=120,
+                timeout=STREAM_TIMEOUT if is_stream else 120,
             )
 
             if response.status_code == 429 or response.status_code >= 500:
@@ -964,7 +1060,7 @@ async def responses_endpoint(raw_request: Request):
 
             if is_stream:
                 return StreamingResponse(
-                    stream_response(response, model_name),
+                    stream_response(response, model_name, session=session),
                     media_type="text/event-stream",
                     headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
                 )

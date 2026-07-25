@@ -122,6 +122,32 @@ def test_responses_endpoint(model_name="deepseek-v4-flash-free"):
         log(f"FAILED responses request: {e}", "ERROR")
         return False
 
+def test_streaming_completion(model_name="deepseek-v4-flash-free"):
+    log(f"Testing POST /v1/chat/completions with stream=True (Model: {model_name})...")
+    payload = {
+        "model": model_name,
+        "messages": [{"role": "user", "content": "Count from 1 to 5."}],
+        "stream": True
+    }
+    try:
+        req = Request(
+            f"{PROXY_URL}/v1/chat/completions",
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json", "Authorization": "Bearer public"},
+            method="POST"
+        )
+        with urlopen(req, timeout=30) as resp:
+            if resp.status == 200:
+                chunks = 0
+                for line in resp:
+                    if line.strip():
+                        chunks += 1
+                log(f"SUCCESS: Stream completed cleanly with {chunks} stream data lines.", "OK")
+                return True
+    except Exception as e:
+        log(f"FAILED streaming completion request: {e}", "ERROR")
+        return False
+
 def main():
     print("=" * 60)
     print("    OpenCode IP Rotator & Proxy Integration Test (test.py)")
@@ -132,6 +158,7 @@ def main():
     
     if models:
         test_completion_request(models[0])
+        test_streaming_completion(models[0])
         test_messages_endpoint(models[0])
         test_responses_endpoint(models[0])
     

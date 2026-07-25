@@ -45,10 +45,22 @@ def install_dependencies():
 def check_warp_cli():
     log("Checking Cloudflare WARP CLI installation...")
     warp_path = shutil.which("warp-cli")
+    if not warp_path:
+        candidates = [
+            r"C:\Program Files\Cloudflare\Cloudflare WARP\warp-cli.exe",
+            r"C:\Program Files (x86)\Cloudflare\Cloudflare WARP\warp-cli.exe",
+            "/usr/bin/warp-cli",
+            "/usr/local/bin/warp-cli",
+            "/bin/warp-cli",
+        ]
+        for candidate in candidates:
+            if os.path.exists(candidate):
+                warp_path = candidate
+                break
     if warp_path:
         log(f"Cloudflare WARP CLI found at: {warp_path}")
     else:
-        log("warp-cli not found in PATH. Ensure Cloudflare WARP is installed if running locally.", "WARN")
+        log("warp-cli not found in PATH or standard installation locations. Ensure Cloudflare WARP is installed.", "WARN")
 
 def setup_opencode_config():
     log("Configuring OpenCode config (~/.config/opencode/opencode.jsonc)...")
