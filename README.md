@@ -15,11 +15,14 @@ A microservice-architected Cloudflare WARP IP rotator and proxy server for OpenC
 
 - **Guaranteed IP Diversity**: Uses `warp-cli registration delete & new` cycles to request a distinct public IP address on every rotation.
 - **Microservices Architecture**: Decoupled `proxy-server` (FastAPI) and `warp-rotator` (Cloudflare WARP daemon) services built with Docker Compose.
-- **Clean Management Dashboard**: Lightweight Web UI built with Tailwind CSS displaying active connections, current location, token statistics, and manual rotation controls.
+- **Clean Management Dashboard**: Lightweight Web UI displaying active connections, current location, token statistics, and manual rotation controls.
 - **SQLite Data Persistence**: Stores token consumption, model request counts, and historical IP rotation logs on disk.
 - **USD Savings Calculator**: Estimates cost savings per model based on prompt and completion token rates.
 - **Table Pagination**: Built-in 5-item pagination for model usage and IP rotation log tables.
-- **Active Flow Locking**: Protects active Server-Sent Events (SSE) streams from being interrupted during an IP rotation.
+- **Active Flow Locking**: Protects active SSE streams from being interrupted during IP rotation — `_active_flows_count` is held for the **full lifetime of the generator**, not just until `return`.
+- **Smart Rate Limit Detection**: Distinguishes IP-level blocks (triggers WARP rotation) from model-level quota limits (skips rotation to prevent TCP socket teardown).
+- **Anthropic API Compatibility**: Native `/v1/messages` endpoint for Claude clients and the Vercel AI SDK `@ai-sdk/anthropic` provider.
+- **Custom Proxy Pool Support**: Round-robin outbound proxy pool via `data/proxies.txt` or `PROXY_LIST` environment variable.
 
 ---
 
@@ -120,14 +123,18 @@ python manager.py
 
 ## Configuration
 
-To use the local proxy server within OpenCode, update your configuration file located at `~/.config/opencode/opencode.jsonc`:
+### OpenAI-Compatible Provider (Default)
+
+To use the local proxy server within OpenCode, update your configuration file at `~/.config/opencode/opencode.jsonc`:
 
 ```jsonc
 {
   "provider": {
     "opencode-zen-local": {
+      "npm": "@ai-sdk/openai-compatible",
       "options": {
-        "baseURL": "http://127.0.0.1:8000/v1"
+        "baseURL": "http://127.0.0.1:8000/v1",
+        "apiKey": "any"
       },
       "name": "OpenCode Zen Local Proxy"
     }
@@ -139,11 +146,53 @@ To use the local proxy server within OpenCode, update your configuration file lo
 
 ---
 
+### Anthropic API Provider
+
+The proxy exposes a native Anthropic-compatible `/v1/messages` endpoint. To use it with OpenCode's Anthropic provider:
+
+```jsonc
+{
+  "provider": {
+    "my-anthropic-proxy": {
+      "npm": "@ai-sdk/anthropic",
+      "options": {
+        "baseURL": "http://127.0.0.1:8000",
+        "apiKey": "any"
+      }
+    }
+  }
+}
+```
+
+> Requests sent to `/v1/messages` are translated to OpenAI format internally and routed through the same WARP-protected upstream.
+
+---
+
+### Custom Outbound Proxy Pool
+
+If you want to use your own HTTP/SOCKS5 proxies instead of (or in addition to) Cloudflare WARP:
+
+**Option 1 — File:** Create `data/proxies.txt` with one proxy per line:
+```
+http://user:pass@proxy1.example.com:8080
+socks5://proxy2.example.com:1080
+```
+
+**Option 2 — Environment variable:**
+```bash
+PROXY_LIST="http://proxy1:8080,socks5://proxy2:1080" docker compose up -d
+```
+
+The proxy pool rotates in round-robin order across all outbound requests.
+
+---
+
 ## API Endpoints Reference
 
 | Endpoint | Method | Description |
 | :--- | :--- | :--- |
 | `/v1/chat/completions` | `POST` | OpenAI-compatible chat completion endpoint with automatic retry and IP rotation. |
+| `/v1/messages` | `POST` | Anthropic-compatible endpoint (`/v1/messages`) for Claude clients and `@ai-sdk/anthropic`. |
 | `/v1/models` | `GET` | Returns list of currently discovered active free models. |
 | `/dashboard` | `GET` | Renders the HTML Web Management Dashboard. |
 | `/metrics` | `GET` | Returns structured JSON metrics including verified IP, uptime, and request counters. |

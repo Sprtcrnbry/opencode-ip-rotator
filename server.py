@@ -675,30 +675,45 @@ def get_realistic_headers() -> Dict[str, str]:
     }
 
 async def stream_openai_response(response, model_name: str) -> AsyncGenerator[bytes, None]:
+    """
+    Raw byte passthrough SSE stream generator.
+    CRITICAL: FlowContext is held for the ENTIRE duration of streaming so that
+    rotate_warp() in rotator.py sees _active_flows_count > 0 and skips IP rotation
+    while a response is still being streamed to the client.
+    """
     loop = asyncio.get_event_loop()
-    with FlowContext():
-        try:
-            def get_next_chunk(iter_content):
-                try:
-                    return next(iter_content)
-                except StopIteration:
-                    return None
+    global _active_flows_count
 
-            # Stream raw bytes chunks directly from HTTP response (Do not split lines or strip whitespace/newlines)
-            chunk_iter = response.iter_content(chunk_size=4096)
-            
-            while True:
-                chunk = await loop.run_in_executor(None, get_next_chunk, chunk_iter)
-                if chunk is None or not chunk:
-                    break
-                
-                # Raw chunk passthrough to client
-                yield chunk
+    # Manually increment flow counter — keeps it raised until generator is exhausted/closed
+    with _flow_lock:
+        _active_flows_count += 1
 
-            yield b"\ndata: [DONE]\n\n"
-        except Exception as e:
-            log.error(f"Stream exception caught: {e}")
-            yield b"\ndata: [DONE]\n\n"
+    try:
+        def get_next_chunk(iter_content):
+            try:
+                return next(iter_content)
+            except StopIteration:
+                return None
+
+        chunk_iter = response.iter_content(chunk_size=4096)
+
+        while True:
+            chunk = await loop.run_in_executor(None, get_next_chunk, chunk_iter)
+            if chunk is None or not chunk:
+                break
+            yield chunk
+
+        yield b"\ndata: [DONE]\n\n"
+    except GeneratorExit:
+        # Client disconnected — still need to decrement
+        pass
+    except Exception as e:
+        log.error(f"Stream exception caught: {e}")
+        yield b"\ndata: [DONE]\n\n"
+    finally:
+        # ALWAYS decrement when stream ends, regardless of how it ended
+        with _flow_lock:
+            _active_flows_count = max(0, _active_flows_count - 1)
 
 @app.get("/dashboard", response_class=HTMLResponse)
 async def dashboard():
@@ -787,59 +802,66 @@ async def chat_completions(raw_request: Request):
 
     for attempt in range(1, MAX_RETRIES_ON_429 + 1):
         try:
-            with FlowContext():
-                from curl_cffi import requests as cffi_requests
-                import random
-                
-                time.sleep(random.uniform(0.1, 0.3))
-                proxies = get_next_outbound_proxy()
+            from curl_cffi import requests as cffi_requests
+            import random
 
-                response = cffi_requests.post(
-                    TARGET_ZEN_URL,
-                    json=payload,
-                    headers=headers,
-                    impersonate="chrome124",
-                    stream=is_stream,
-                    proxies=proxies,
-                    timeout=120
-                )
-                
-                # Check HTTP status code for rate-limit or upstream error
-                if response.status_code == 429 or response.status_code >= 500:
-                    metrics["rate_limited_requests"] += 1
-                    err_text = response.text.lower()
-                    
-                    # Distinguish Model/Provider-level limits vs. IP-level blocks
-                    is_model_specific_limit = any(k in err_text for k in ["model_rate_limit", "quota_exceeded", "per_model_limit", "credit_balance"])
-                    
-                    import random
-                    delay = (INITIAL_BACKOFF * (2 ** (attempt - 1))) + random.uniform(0.5, 1.5)
-                    
-                    if is_model_specific_limit:
-                        log.warning(f"Model-level limit for '{current_model}'. Skipping IP rotation to prevent socket teardown. Retrying in {delay:.2f}s...")
-                        time.sleep(delay)
-                        continue
-                    else:
-                        log.warning(f"HTTP {response.status_code} (IP/Network block) for '{current_model}'. Triggering IP Rotation & Retrying in {delay:.2f}s...")
-                        rotate_warp(reason=f"HTTP {response.status_code} on {current_model}")
-                        time.sleep(delay)
-                        continue
+            time.sleep(random.uniform(0.1, 0.3))
+            proxies = get_next_outbound_proxy()
 
-                metrics["successful_requests"] += 1
-                
-                if is_stream:
-                    track_token_usage(current_model, prompt_tokens=100, completion_tokens=150)
-                    return StreamingResponse(
-                        stream_openai_response(response, current_model),
-                        media_type="text/event-stream"
-                    )
+            # FlowContext is NOT used here for streaming — the generator manages it internally
+            # For non-streaming we use it to block rotation during the entire request
+            response = cffi_requests.post(
+                TARGET_ZEN_URL,
+                json=payload,
+                headers=headers,
+                impersonate="chrome124",
+                stream=is_stream,
+                proxies=proxies,
+                timeout=120
+            )
+
+            # Check HTTP status code for rate-limit or upstream error
+            if response.status_code == 429 or response.status_code >= 500:
+                metrics["rate_limited_requests"] += 1
+                err_text = response.text.lower()
+
+                # Distinguish Model/Provider-level limits vs. IP-level blocks
+                is_model_specific_limit = any(k in err_text for k in ["model_rate_limit", "quota_exceeded", "per_model_limit", "credit_balance", "insufficient_quota"])
+
+                delay = (INITIAL_BACKOFF * (2 ** (attempt - 1))) + random.uniform(0.5, 1.5)
+
+                if is_model_specific_limit:
+                    log.warning(f"Model-level limit for '{current_model}'. Skipping IP rotation to prevent socket teardown. Retrying in {delay:.2f}s...")
+                    time.sleep(delay)
+                    continue
                 else:
+                    log.warning(f"HTTP {response.status_code} (IP/Network block) for '{current_model}'. Triggering IP Rotation & Retrying in {delay:.2f}s...")
+                    rotate_warp(reason=f"HTTP {response.status_code} on {current_model}")
+                    time.sleep(delay)
+                    continue
+
+            metrics["successful_requests"] += 1
+
+            if is_stream:
+                track_token_usage(current_model, prompt_tokens=100, completion_tokens=150)
+                # stream_openai_response manages FlowContext internally via finally block
+                return StreamingResponse(
+                    stream_openai_response(response, current_model),
+                    media_type="text/event-stream",
+                    headers={
+                        "Cache-Control": "no-cache",
+                        "X-Accel-Buffering": "no",
+                        "Connection": "keep-alive",
+                    }
+                )
+            else:
+                with FlowContext():
                     try:
                         res_json = response.json()
                         usage = res_json.get("usage", {})
                         track_token_usage(
-                            current_model, 
-                            prompt_tokens=usage.get("prompt_tokens", 50), 
+                            current_model,
+                            prompt_tokens=usage.get("prompt_tokens", 50),
                             completion_tokens=usage.get("completion_tokens", 100)
                         )
                         return JSONResponse(content=res_json)
