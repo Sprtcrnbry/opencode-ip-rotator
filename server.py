@@ -803,6 +803,18 @@ async def chat_completions(raw_request: Request):
                     proxies=proxies,
                     timeout=120
                 )
+                
+                # Check HTTP status code for rate-limit or upstream error
+                if response.status_code == 429 or response.status_code >= 500:
+                    metrics["rate_limited_requests"] += 1
+                    import random
+                    delay = (INITIAL_BACKOFF * (2 ** (attempt - 1))) + random.uniform(0.5, 1.5)
+                    log.warning(f"HTTP {response.status_code} returned for '{current_model}' (Attempt {attempt}/{MAX_RETRIES_ON_429}). Triggering IP Rotation & Retrying in {delay:.2f}s...")
+                    
+                    rotate_warp(reason=f"HTTP {response.status_code} on {current_model}")
+                    time.sleep(delay)
+                    continue
+
                 metrics["successful_requests"] += 1
                 
                 if is_stream:
