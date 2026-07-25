@@ -2,6 +2,7 @@ import asyncio
 import json
 import logging
 import os
+import signal
 import threading
 import time
 from typing import AsyncGenerator, Dict, List, Optional
@@ -565,9 +566,11 @@ PORT = int(os.environ.get("OPENCODE_ZEN_PORT", "8000"))
 HOST = os.environ.get("OPENCODE_ZEN_HOST", "127.0.0.1")
 TARGET_ZEN_BASE = os.environ.get("OPENCODE_ZEN_TARGET_BASE", "https://opencode.ai/zen/v1")
 TARGET_ZEN_URL = f"{TARGET_ZEN_BASE}/chat/completions"
+TARGET_ZEN_ANTHROPIC_URL = f"{TARGET_ZEN_BASE}/messages"
+TARGET_ZEN_RESPONSES_URL = f"{TARGET_ZEN_BASE}/responses"
 
-MAX_RETRIES_ON_429 = 3
-INITIAL_BACKOFF = 2
+MAX_RETRIES_ON_429 = int(os.environ.get("MAX_RETRIES_ON_429", "8"))
+INITIAL_BACKOFF = float(os.environ.get("INITIAL_BACKOFF", "1"))
 
 metrics = {
     "total_requests": 0,
@@ -590,9 +593,10 @@ discovered_models: List[Dict[str, str]] = DEFAULT_FREE_MODELS.copy()
 _discovery_lock = threading.Lock()
 
 logging.basicConfig(
-    format="%(asctime)s [Zen-Server] %(levelname)s: %(message)s",
+    format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
     level=logging.INFO,
     datefmt="%Y-%m-%d %H:%M:%S",
+    force=True,
 )
 log = logging.getLogger("zen_server")
 
@@ -662,7 +666,7 @@ def get_realistic_headers() -> Dict[str, str]:
         "Sec-Fetch-Site": "same-origin",
     }
 
-async def stream_openai_response(response, model_name: str) -> AsyncGenerator[bytes, None]:
+async def stream_response(response, model_name: str) -> AsyncGenerator[bytes, None]:
     """
     Raw byte passthrough SSE stream generator.
     CRITICAL: FlowContext is held for the ENTIRE duration of streaming so that
@@ -749,6 +753,15 @@ async def get_metrics():
         "ip_history": history
     }
 
+@app.get("/health")
+async def health():
+    return {
+        "status": "healthy",
+        "uptime_seconds": int(time.time() - metrics["start_time"]),
+        "active_flows": active_flows_count,
+        "total_rotations": rotation_count,
+    }
+
 @app.get("/v1/models")
 async def list_models():
     with _discovery_lock:
@@ -797,7 +810,7 @@ async def chat_completions(raw_request: Request):
                 TARGET_ZEN_URL,
                 json=payload,
                 headers=headers,
-                impersonate="chrome124",
+                impersonate="chrome127",
                 stream=is_stream,
                 proxies=proxies,
                 timeout=120
@@ -827,9 +840,9 @@ async def chat_completions(raw_request: Request):
 
             if is_stream:
                 track_token_usage(current_model, prompt_tokens=100, completion_tokens=150)
-                # stream_openai_response manages FlowContext internally via finally block
+                # stream_response manages FlowContext internally via finally block
                 return StreamingResponse(
-                    stream_openai_response(response, current_model),
+                    stream_response(response, current_model),
                     media_type="text/event-stream",
                     headers={
                         "Cache-Control": "no-cache",
@@ -865,101 +878,206 @@ async def chat_completions(raw_request: Request):
                         }
                         
         except Exception as e:
-            error_msg = str(e)
-            log.error(f"Target Connection Error: {e}")
-            time.sleep(1)
+            log.error(f"[Attempt {attempt}/{MAX_RETRIES_ON_429}] Connection error for model '{current_model}': {type(e).__name__}: {e}")
+            if attempt < MAX_RETRIES_ON_429:
+                time.sleep(min(2 ** attempt, 30))
             continue
 
-    raise HTTPException(status_code=429, detail="Rate limit persisted after multiple attempts.")
+    log.error(f"All {MAX_RETRIES_ON_429} attempts exhausted for model '{current_model}'. Returning 503.")
+    return JSONResponse(
+        status_code=503,
+        content={"error": {"message": f"Upstream unavailable after {MAX_RETRIES_ON_429} attempts. Please retry.", "type": "upstream_error", "code": 503}},
+        headers={"Retry-After": "10"}
+    )
 
 # -----------------------------------------------------------------------------
 # Anthropic API Compatibility Endpoint (/v1/messages)
 # -----------------------------------------------------------------------------
 @app.post("/v1/messages")
 async def anthropic_messages(raw_request: Request):
-    """Native Anthropic API compatibility endpoint for Claude / Vercel AI SDK Anthropic provider."""
+    """Native Anthropic API proxy — forwards to /zen/v1/messages without format conversion."""
+    metrics["total_requests"] += 1
+
     try:
         body = await raw_request.json()
     except Exception:
         body = {}
 
     model_name = body.get("model", "deepseek-v4-flash-free")
-    messages = body.get("messages", [])
-    stream = body.get("stream", False)
-    
-    # Translate Anthropic messages format to OpenAI format
-    openai_messages = []
-    system_prompt = body.get("system", "")
-    if system_prompt:
-        openai_messages.append({"role": "system", "content": system_prompt})
-        
-    for m in messages:
-        role = m.get("role", "user")
-        content = m.get("content", "")
-        if isinstance(content, list):
-            # Extract text parts
-            text_parts = [c.get("text", "") for c in content if isinstance(c, dict) and c.get("type") == "text"]
-            content = "\n".join(text_parts) if text_parts else str(content)
-        openai_messages.append({"role": role, "content": content})
+    is_stream = body.get("stream", False)
+    log.info(f"Received Anthropic-format request for model '{model_name}' (Stream: {is_stream})")
 
-    openai_payload = {
-        "model": model_name,
-        "messages": openai_messages,
-        "stream": stream
-    }
+    # Forward the client's x-api-key (used by Zen API for Anthropic auth)
+    client_api_key = raw_request.headers.get("x-api-key") or ""
+    if not client_api_key:
+        auth = raw_request.headers.get("authorization", "")
+        if auth.startswith("Bearer "):
+            client_api_key = auth[7:]
+
+    headers = get_realistic_headers()
+    headers["x-api-key"] = client_api_key or "public"
+
+    for k, v in raw_request.headers.items():
+        kl = k.lower()
+        if kl.startswith("x-opencode-") or kl.startswith("anthropic-"):
+            headers[k] = v
+
+    for attempt in range(1, MAX_RETRIES_ON_429 + 1):
+        try:
+            from curl_cffi import requests as cffi_requests
+            import random
+
+            time.sleep(random.uniform(0.1, 0.3))
+            proxies = get_next_outbound_proxy()
+
+            response = cffi_requests.post(
+                TARGET_ZEN_ANTHROPIC_URL,
+                json=body,
+                headers=headers,
+                impersonate="chrome127",
+                stream=is_stream,
+                proxies=proxies,
+                timeout=120,
+            )
+
+            if response.status_code in (429, 500) or response.status_code >= 500:
+                metrics["rate_limited_requests"] += 1
+                delay = (INITIAL_BACKOFF * (2 ** (attempt - 1))) + random.uniform(0.5, 1.5)
+                log.warning(f"HTTP {response.status_code} on '{model_name}'. Rotating IP & retrying in {delay:.2f}s...")
+                rotate_warp(reason=f"HTTP {response.status_code} on {model_name}")
+                time.sleep(delay)
+                continue
+
+            metrics["successful_requests"] += 1
+
+            if is_stream:
+                return StreamingResponse(
+                    stream_response(response, model_name),
+                    media_type="text/event-stream",
+                    headers={
+                        "Cache-Control": "no-cache",
+                        "X-Accel-Buffering": "no",
+                    },
+                )
+            else:
+                with FlowContext():
+                    try:
+                        res_json = response.json()
+                        usage = res_json.get("usage", {})
+                        track_token_usage(
+                            model_name,
+                            prompt_tokens=usage.get("input_tokens", 50),
+                            completion_tokens=usage.get("output_tokens", 100),
+                        )
+                        return JSONResponse(content=res_json)
+                    except Exception:
+                        track_token_usage(model_name, prompt_tokens=50, completion_tokens=100)
+                        return JSONResponse(content=response.text)
+
+        except Exception as e:
+            log.error(f"[Attempt {attempt}/{MAX_RETRIES_ON_429}] Anthropic endpoint error for model '{model_name}': {type(e).__name__}: {e}")
+            if attempt < MAX_RETRIES_ON_429:
+                time.sleep(min(2 ** attempt, 30))
+            continue
+
+    log.error(f"All {MAX_RETRIES_ON_429} attempts exhausted for Anthropic model '{model_name}'. Returning 503.")
+    return JSONResponse(
+        status_code=503,
+        content={"error": {"message": f"Upstream unavailable after {MAX_RETRIES_ON_429} attempts. Please retry.", "type": "upstream_error", "code": 503}},
+        headers={"Retry-After": "10"}
+    )
+
+@app.post("/v1/responses")
+async def responses_endpoint(raw_request: Request):
+    """Proxy for OpenAI Responses API (/zen/v1/responses)."""
+    metrics["total_requests"] += 1
+
+    try:
+        body = await raw_request.json()
+    except Exception:
+        body = {}
+
+    model_name = body.get("model", "deepseek-v4-flash-free")
+    is_stream = body.get("stream", False)
+    log.info(f"Received Responses API request for model '{model_name}' (Stream: {is_stream})")
 
     headers = get_realistic_headers()
     for k, v in raw_request.headers.items():
-        if k.lower().startswith("x-opencode-") or k.lower().startswith("anthropic-"):
+        if k.lower().startswith("x-opencode-"):
             headers[k] = v
 
-    try:
-        from curl_cffi import requests as cffi_requests
-        proxies = get_next_outbound_proxy()
-        response = cffi_requests.post(
-            TARGET_ZEN_URL,
-            json=openai_payload,
-            headers=headers,
-            impersonate="chrome124",
-            stream=stream,
-            proxies=proxies,
-            timeout=120
-        )
-        
-        if stream:
-            return StreamingResponse(
-                stream_openai_response(response, model_name),
-                media_type="text/event-stream"
+    for attempt in range(1, MAX_RETRIES_ON_429 + 1):
+        try:
+            from curl_cffi import requests as cffi_requests
+            import random
+
+            time.sleep(random.uniform(0.1, 0.3))
+            proxies = get_next_outbound_proxy()
+
+            response = cffi_requests.post(
+                TARGET_ZEN_RESPONSES_URL,
+                json=body,
+                headers=headers,
+                impersonate="chrome127",
+                stream=is_stream,
+                proxies=proxies,
+                timeout=120,
             )
-        else:
-            try:
-                res_json = response.json()
-                text_content = ""
-                if "choices" in res_json and len(res_json["choices"]) > 0:
-                    text_content = res_json["choices"][0].get("message", {}).get("content", "")
-                
-                anthropic_resp = {
-                    "id": f"msg_{int(time.time())}",
-                    "type": "message",
-                    "role": "assistant",
-                    "model": model_name,
-                    "content": [{"type": "text", "text": text_content}],
-                    "stop_reason": "end_turn",
-                    "stop_sequence": None,
-                    "usage": {"input_tokens": 50, "output_tokens": 100}
-                }
-                return JSONResponse(content=anthropic_resp)
-            except Exception:
-                return JSONResponse(content={"id": f"msg_{int(time.time())}", "type": "message", "role": "assistant", "content": [{"type": "text", "text": response.text}]})
-    except Exception as e:
-        log.error(f"Anthropic endpoint error: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+
+            if response.status_code in (429, 500) or response.status_code >= 500:
+                metrics["rate_limited_requests"] += 1
+                delay = (INITIAL_BACKOFF * (2 ** (attempt - 1))) + random.uniform(0.5, 1.5)
+                log.warning(f"HTTP {response.status_code} on '{model_name}'. Rotating IP & retrying in {delay:.2f}s...")
+                rotate_warp(reason=f"HTTP {response.status_code} on {model_name}")
+                time.sleep(delay)
+                continue
+
+            metrics["successful_requests"] += 1
+
+            if is_stream:
+                return StreamingResponse(
+                    stream_response(response, model_name),
+                    media_type="text/event-stream",
+                    headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+                )
+            else:
+                with FlowContext():
+                    try:
+                        res_json = response.json()
+                        return JSONResponse(content=res_json)
+                    except Exception:
+                        return JSONResponse(content=response.text)
+
+        except Exception as e:
+            log.error(f"[Attempt {attempt}/{MAX_RETRIES_ON_429}] Responses endpoint error for model '{model_name}': {type(e).__name__}: {e}")
+            if attempt < MAX_RETRIES_ON_429:
+                time.sleep(min(2 ** attempt, 30))
+            continue
+
+    log.error(f"All {MAX_RETRIES_ON_429} attempts exhausted for Responses model '{model_name}'. Returning 503.")
+    return JSONResponse(
+        status_code=503,
+        content={"error": {"message": f"Upstream unavailable after {MAX_RETRIES_ON_429} attempts. Please retry.", "type": "upstream_error", "code": 503}},
+        headers={"Retry-After": "10"}
+    )
 
 # Initialize SQLite database and load historical metrics
 init_db()
 model_usage_stats = load_metrics_from_db()
 
 threading.Thread(target=discover_models_task, daemon=True).start()
+
+_shutdown_requested = False
+
+def _handle_signal(signum, frame):
+    global _shutdown_requested
+    if _shutdown_requested:
+        return
+    _shutdown_requested = True
+    log.warning(f"Received signal {signum}, initiating graceful shutdown...")
+
+signal.signal(signal.SIGTERM, _handle_signal)
+signal.signal(signal.SIGINT, _handle_signal)
 
 if __name__ == "__main__":
     load_proxy_list()
