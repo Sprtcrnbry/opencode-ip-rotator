@@ -2,22 +2,60 @@ import asyncio
 import json
 import logging
 import os
+import random
 import signal
+import sqlite3
 import threading
 import time
+from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import AsyncGenerator, Dict, List, Optional
-from fastapi import FastAPI, Request, HTTPException
-from fastapi.responses import StreamingResponse, JSONResponse, HTMLResponse
-from pydantic import BaseModel, Field
-import uvicorn
-from urllib.request import Request as UrlRequest, urlopen
 from urllib.error import HTTPError, URLError
+from urllib.request import Request as UrlRequest, urlopen
 
+import uvicorn
+from fastapi import FastAPI, Request, HTTPException, Depends
+from fastapi.responses import StreamingResponse, JSONResponse, HTMLResponse, Response
+from fastapi.templating import Jinja2Templates
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, Field
+from prometheus_client import Counter, Gauge, Histogram, generate_latest, CONTENT_TYPE_LATEST
+
+from curl_cffi import requests as cffi_requests
 from rotator import rotate_warp, flow_lock, active_flows_count, get_public_ip, get_ip_location, rotation_count
 
-import sqlite3
-from pathlib import Path
+# -----------------------------------------------------------------------------
+# Constants
+# -----------------------------------------------------------------------------
+IP_HISTORY_LIMIT = 20
+PAGE_SIZE = 5
+BACKOFF_CAP = 30
+POLL_ATTEMPTS = 6
+WARP_ROTATION_ATTEMPTS = 4
+WARP_POST_ROTATION_SLEEP = 3
+DEFAULT_PROMPT_TOKENS = 50
+DEFAULT_COMPLETION_TOKENS = 100
+STREAM_CHUNK_SIZE = 4096
+MODEL_DISCOVERY_INTERVAL = 300
+DASHBOARD_REFRESH_INTERVAL = 3
+STARTUP_TIME = time.time()
 
+# -----------------------------------------------------------------------------
+# JSON Structured Logging
+# -----------------------------------------------------------------------------
+class JSONFormatter(logging.Formatter):
+    def format(self, record: logging.LogRecord) -> str:
+        log_entry = {
+            "timestamp": self.formatTime(record, self.datefmt or "%Y-%m-%dT%H:%M:%S"),
+            "level": record.levelname,
+            "logger": record.name,
+            "message": record.getMessage(),
+        }
+        if record.exc_info and record.exc_info[0]:
+            log_entry["exception"] = self.formatException(record.exc_info)
+        return json.dumps(log_entry)
+
+# -----------------------------------------------------------------------------
 # Proxy Pool / Custom Proxy List Support
 # -----------------------------------------------------------------------------
 PROXY_FILE = Path(os.environ.get("PROXY_LIST_FILE", "/app/data/proxies.txt"))
@@ -26,11 +64,8 @@ _proxy_index = 0
 _proxy_lock = threading.Lock()
 
 def load_proxy_list():
-    """Loads proxy addresses from proxies.txt or PROXY_LIST environment variable."""
     global _proxy_pool
     proxies = []
-    
-    # 1. Try reading from proxies.txt file
     if PROXY_FILE.exists():
         try:
             with open(PROXY_FILE, "r", encoding="utf-8") as f:
@@ -38,38 +73,74 @@ def load_proxy_list():
                 proxies.extend(lines)
         except Exception as e:
             log.error(f"Error reading proxies.txt: {e}")
-
-    # 2. Try environment variable PROXY_LIST (comma-separated)
     env_proxies = os.environ.get("PROXY_LIST", "").strip()
     if env_proxies:
         proxies.extend([p.strip() for p in env_proxies.split(",") if p.strip()])
-
-    _proxy_pool = list(dict.fromkeys(proxies)) # Unique proxy list
+    _proxy_pool = list(dict.fromkeys(proxies))
     if _proxy_pool:
         log.info(f"Loaded {len(_proxy_pool)} custom proxies into pool.")
 
 def get_next_outbound_proxy() -> Optional[Dict[str, str]]:
-    """Retrieves next proxy from pool using Round-Robin, or falls back to CUSTOM_OUTBOUND_PROXY."""
     global _proxy_index
     with _proxy_lock:
         if _proxy_pool:
             proxy_url = _proxy_pool[_proxy_index % len(_proxy_pool)]
             _proxy_index += 1
             return {"http": proxy_url, "https": proxy_url}
-        
         custom_proxy = os.environ.get("CUSTOM_OUTBOUND_PROXY", "").strip()
         if custom_proxy:
             return {"http": custom_proxy, "https": custom_proxy}
-        
-# SQLite Database setup
+
+# -----------------------------------------------------------------------------
+# SQLite — WAL mode + retry for concurrent safety
+# -----------------------------------------------------------------------------
 DB_FILE = Path(os.environ.get("METRICS_DB_PATH", "/app/data/metrics.db"))
+_db_lock = threading.Lock()
+
+def _get_conn():
+    conn = sqlite3.connect(str(DB_FILE), timeout=5)
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA synchronous=NORMAL")
+    return conn
+
+def _db_execute(statement: str, params=()):
+    for attempt in range(3):
+        try:
+            with _db_lock:
+                conn = _get_conn()
+                try:
+                    cursor = conn.cursor()
+                    cursor.execute(statement, params)
+                    conn.commit()
+                    return cursor
+                finally:
+                    conn.close()
+        except sqlite3.OperationalError as e:
+            if "busy" in str(e).lower() and attempt < 2:
+                time.sleep(0.1 * (attempt + 1))
+                continue
+            raise
+
+def _db_fetchall(statement: str, params=()) -> list:
+    for attempt in range(3):
+        try:
+            with _db_lock:
+                conn = _get_conn()
+                try:
+                    cursor = conn.cursor()
+                    cursor.execute(statement, params)
+                    return cursor.fetchall()
+                finally:
+                    conn.close()
+        except sqlite3.OperationalError as e:
+            if "busy" in str(e).lower() and attempt < 2:
+                time.sleep(0.1 * (attempt + 1))
+                continue
+            raise
 
 def init_db():
-    """Initializes SQLite database and creates metrics & ip_history tables if not exists."""
     DB_FILE.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(str(DB_FILE))
-    cursor = conn.cursor()
-    cursor.execute("""
+    _db_execute("""
         CREATE TABLE IF NOT EXISTS model_usage (
             model_name TEXT PRIMARY KEY,
             requests INTEGER DEFAULT 0,
@@ -80,7 +151,7 @@ def init_db():
             updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """)
-    cursor.execute("""
+    _db_execute("""
         CREATE TABLE IF NOT EXISTS ip_history (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             ip TEXT,
@@ -91,42 +162,39 @@ def init_db():
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """)
-    conn.commit()
-    conn.close()
+    _db_execute("""
+        CREATE TABLE IF NOT EXISTS warp_quality (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp TEXT,
+            success INTEGER,
+            latency_ms REAL,
+            old_ip TEXT,
+            new_ip TEXT
+        )
+    """)
 
 def log_ip_rotation_to_db(ip: str, country: str, flag: str, timestamp: str, reason: str):
-    """Saves IP rotation event into SQLite DB."""
     try:
-        conn = sqlite3.connect(str(DB_FILE))
-        cursor = conn.cursor()
-        cursor.execute(
+        _db_execute(
             "INSERT INTO ip_history (ip, country, flag, timestamp, reason) VALUES (?, ?, ?, ?, ?)",
             (ip, country, flag, timestamp, reason)
         )
-        conn.commit()
-        conn.close()
     except Exception as e:
         log.error(f"Failed to log IP rotation to DB: {e}")
 
 def load_ip_history_from_db() -> List[Dict[str, any]]:
-    """Fetches last 20 IP rotations from SQLite DB."""
     if not DB_FILE.exists():
         return []
     try:
-        conn = sqlite3.connect(str(DB_FILE))
-        cursor = conn.cursor()
-        cursor.execute("SELECT ip, country, flag, timestamp, reason FROM ip_history ORDER BY id DESC LIMIT 20")
-        rows = cursor.fetchall()
-        conn.close()
-        
+        rows = _db_fetchall(
+            "SELECT ip, country, flag, timestamp, reason FROM ip_history ORDER BY id DESC LIMIT ?",
+            (IP_HISTORY_LIMIT,)
+        )
         history = []
         for r in reversed(rows):
             history.append({
-                "ip": r[0],
-                "country": r[1],
-                "flag": r[2],
-                "timestamp": r[3],
-                "reason": r[4]
+                "ip": r[0], "country": r[1], "flag": r[2],
+                "timestamp": r[3], "reason": r[4]
             })
         return history
     except Exception as e:
@@ -134,23 +202,17 @@ def load_ip_history_from_db() -> List[Dict[str, any]]:
         return []
 
 def load_metrics_from_db() -> Dict[str, Dict[str, any]]:
-    """Loads historical usage metrics from SQLite DB."""
     if not DB_FILE.exists():
         return {}
     try:
-        conn = sqlite3.connect(str(DB_FILE))
-        cursor = conn.cursor()
-        cursor.execute("SELECT model_name, requests, prompt_tokens, completion_tokens, total_tokens, estimated_cost_usd FROM model_usage")
-        rows = cursor.fetchall()
-        conn.close()
-        
+        rows = _db_fetchall(
+            "SELECT model_name, requests, prompt_tokens, completion_tokens, total_tokens, estimated_cost_usd FROM model_usage"
+        )
         stats = {}
         for r in rows:
             stats[r[0]] = {
-                "requests": r[1],
-                "prompt_tokens": r[2],
-                "completion_tokens": r[3],
-                "total_tokens": r[4],
+                "requests": r[1], "prompt_tokens": r[2],
+                "completion_tokens": r[3], "total_tokens": r[4],
                 "estimated_cost_usd": r[5]
             }
         return stats
@@ -158,7 +220,97 @@ def load_metrics_from_db() -> Dict[str, Dict[str, any]]:
         log.error(f"Error loading metrics from DB: {e}")
         return {}
 
+# -----------------------------------------------------------------------------
+# Prometheus Metrics
+# -----------------------------------------------------------------------------
+prom_requests_total = Counter("proxy_requests_total", "Total proxied requests", ["model", "endpoint"])
+prom_requests_success = Counter("proxy_requests_success", "Successful proxied requests", ["model"])
+prom_requests_rate_limited = Counter("proxy_requests_rate_limited", "Rate-limited requests", ["model"])
+prom_rotation_count = Counter("proxy_rotations_total", "Total WARP rotations")
+prom_active_flows = Gauge("proxy_active_flows", "Currently active streaming flows")
+prom_request_duration = Histogram("proxy_request_duration_seconds", "Request duration", ["model", "endpoint"],
+                                   buckets=(0.1, 0.5, 1.0, 2.0, 5.0, 10.0, 30.0, 60.0, 120.0))
+prom_warp_health = Gauge("proxy_warp_health", "WARP health (1=healthy, 0=unhealthy)")
+
+# -----------------------------------------------------------------------------
+# curl_cffi Session Pool
+# -----------------------------------------------------------------------------
+_session_pool: Dict[str, "SessionType"] = {}
+_session_pool_lock = threading.Lock()
+SessionType = None  # resolved at first use
+
+def _get_session(endpoint: str):
+    global SessionType
+    if SessionType is None:
+        from curl_cffi.requests import Session as SessionType
+    with _session_pool_lock:
+        if endpoint not in _session_pool:
+            _session_pool[endpoint] = SessionType()
+        return _session_pool[endpoint]
+
+def _close_all_sessions():
+    with _session_pool_lock:
+        for ep, sess in _session_pool.items():
+            try:
+                sess.close()
+            except Exception:
+                pass
+        _session_pool.clear()
+
+_discovery_stop = threading.Event()
+
+# -----------------------------------------------------------------------------
+# Auth Dependency
+# -----------------------------------------------------------------------------
+ADMIN_TOKEN = os.environ.get("ADMIN_TOKEN", "").strip()
+
+async def require_admin(request: Request):
+    if not ADMIN_TOKEN:
+        return True
+    auth = request.headers.get("authorization", "")
+    if auth.startswith("Bearer ") and auth[7:] == ADMIN_TOKEN:
+        return True
+    raise HTTPException(status_code=403, detail="Forbidden")
+
+# -----------------------------------------------------------------------------
+# Request Queue (drains during rotation)
+# -----------------------------------------------------------------------------
+_rotation_in_progress = threading.Event()
+_request_drain_event = asyncio.Event()
+_request_drain_event.set()
+
+async def wait_for_rotation_drain():
+    if _rotation_in_progress.is_set():
+        await asyncio.wait_for(_request_drain_event.wait(), timeout=15)
+
+def signal_rotation_start():
+    _rotation_in_progress.set()
+    _request_drain_event.clear()
+
+def signal_rotation_done():
+    _rotation_in_progress.clear()
+    _request_drain_event.set()
+
+# -----------------------------------------------------------------------------
+# Dual-WARP (active/passive tracking)
+# -----------------------------------------------------------------------------
+_dual_warp = {
+    "active_ip": None,
+    "standby_ip": None,
+    "active_registration": "primary",
+}
+_dual_warp_lock = threading.Lock()
+
+def swap_warp_registration():
+    with _dual_warp_lock:
+        _dual_warp["active_registration"] = (
+            "standby" if _dual_warp["active_registration"] == "primary" else "primary"
+        )
+        return _dual_warp["active_registration"]
+
+# -----------------------------------------------------------------------------
 # Model pricing reference (USD per 1M tokens)
+# -----------------------------------------------------------------------------
 MODEL_PRICING = {
     "deepseek-v4-flash-free": {"input_per_1m": 0.15, "output_per_1m": 0.60},
     "mimo-v2.5-free": {"input_per_1m": 0.20, "output_per_1m": 0.80},
@@ -169,33 +321,29 @@ MODEL_PRICING = {
     "laguna-s-2.1-free": {"input_per_1m": 0.20, "output_per_1m": 0.70},
 }
 
+_model_usage_lock = threading.Lock()
+
 def track_token_usage(model_name: str, prompt_tokens: int = 0, completion_tokens: int = 0):
-    """Tracks request counts, consumed tokens, and persists to SQLite database."""
-    if model_name not in model_usage_stats:
-        model_usage_stats[model_name] = {
-            "requests": 0,
-            "prompt_tokens": 0,
-            "completion_tokens": 0,
-            "total_tokens": 0,
-            "estimated_cost_usd": 0.0
-        }
-    
+    global model_usage_stats
     pricing = MODEL_PRICING.get(model_name, {"input_per_1m": 0.20, "output_per_1m": 0.80})
     prompt_cost = (prompt_tokens / 1_000_000) * pricing["input_per_1m"]
     completion_cost = (completion_tokens / 1_000_000) * pricing["output_per_1m"]
     cost = prompt_cost + completion_cost
 
-    model_usage_stats[model_name]["requests"] += 1
-    model_usage_stats[model_name]["prompt_tokens"] += prompt_tokens
-    model_usage_stats[model_name]["completion_tokens"] += completion_tokens
-    model_usage_stats[model_name]["total_tokens"] += (prompt_tokens + completion_tokens)
-    model_usage_stats[model_name]["estimated_cost_usd"] += cost
+    with _model_usage_lock:
+        if model_name not in model_usage_stats:
+            model_usage_stats[model_name] = {
+                "requests": 0, "prompt_tokens": 0, "completion_tokens": 0,
+                "total_tokens": 0, "estimated_cost_usd": 0.0
+            }
+        model_usage_stats[model_name]["requests"] += 1
+        model_usage_stats[model_name]["prompt_tokens"] += prompt_tokens
+        model_usage_stats[model_name]["completion_tokens"] += completion_tokens
+        model_usage_stats[model_name]["total_tokens"] += (prompt_tokens + completion_tokens)
+        model_usage_stats[model_name]["estimated_cost_usd"] += cost
 
-    # Persist to SQLite
     try:
-        conn = sqlite3.connect(str(DB_FILE))
-        cursor = conn.cursor()
-        cursor.execute("""
+        _db_execute("""
             INSERT INTO model_usage (model_name, requests, prompt_tokens, completion_tokens, total_tokens, estimated_cost_usd)
             VALUES (?, ?, ?, ?, ?, ?)
             ON CONFLICT(model_name) DO UPDATE SET
@@ -205,361 +353,53 @@ def track_token_usage(model_name: str, prompt_tokens: int = 0, completion_tokens
                 total_tokens = total_tokens + excluded.total_tokens,
                 estimated_cost_usd = estimated_cost_usd + excluded.estimated_cost_usd,
                 updated_at = CURRENT_TIMESTAMP
-        """, (
-            model_name, 1, prompt_tokens, completion_tokens, prompt_tokens + completion_tokens, cost
-        ))
-        conn.commit()
-        conn.close()
+        """, (model_name, 1, prompt_tokens, completion_tokens, prompt_tokens + completion_tokens, cost))
     except Exception as e:
         log.error(f"Failed to persist metrics to SQLite: {e}")
 
 # -----------------------------------------------------------------------------
-# Feature 3: Minimalist White Dashboard (Tailwind CSS + shadcn/ui Design System)
+# WARP Quality Metrics
 # -----------------------------------------------------------------------------
-DASHBOARD_HTML = """
-<!DOCTYPE html>
-<html lang="en" class="h-full bg-slate-50/50">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>OpenCode IP Rotator</title>
-    <!-- Tailwind CSS CDN -->
-    <script src="https://cdn.tailwindcss.com"></script>
-    <link rel="preconnect" href="https://fonts.googleapis.com">
-    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
-    <script>
-        tailwind.config = {
-            theme: {
-                extend: {
-                    fontFamily: {
-                        sans: ['Inter', 'sans-serif'],
-                        mono: ['JetBrains Mono', 'monospace'],
-                    }
-                }
-            }
-        }
-    </script>
-</head>
-<body class="h-full text-slate-900 font-sans antialiased selection:bg-slate-900 selection:text-white">
-    <!-- Navbar -->
-    <header class="bg-white/80 backdrop-blur-md border-b border-slate-200/80 sticky top-0 z-50">
-        <div class="max-w-5xl mx-auto px-4 sm:px-6 h-14 flex items-center justify-between">
-            <div class="flex items-center space-x-3">
-                <div class="w-7 h-7 bg-slate-900 text-white rounded-md flex items-center justify-center font-semibold text-xs tracking-wider">
-                    OP
-                </div>
-                <div class="flex items-center space-x-2">
-                    <span class="font-semibold text-sm tracking-tight text-slate-900">opencode-ip-rotator</span>
-                    <span class="text-[10px] bg-slate-100 text-slate-600 font-mono font-medium px-2 py-0.5 rounded border border-slate-200">v3.0</span>
-                </div>
-            </div>
-            
-            <div class="flex items-center space-x-3">
-                <div class="flex items-center space-x-1.5 bg-emerald-50 text-emerald-700 border border-emerald-200/60 text-xs px-2.5 py-1 rounded-full font-medium">
-                    <span class="w-1.5 h-1.5 bg-emerald-500 rounded-full animate-pulse"></span>
-                    <span class="text-[11px]">Active</span>
-                </div>
-                <button id="rotate-btn" onclick="rotateNow()" class="inline-flex items-center justify-center bg-slate-900 hover:bg-slate-800 text-white text-xs font-medium h-8 px-3 rounded-md transition-all shadow-sm active:scale-95">
-                    Rotate IP
-                </button>
-            </div>
-        </div>
-    </header>
+warp_quality_stats = {
+    "total_attempts": 0, "successful_rotations": 0, "failed_rotations": 0,
+    "last_latency_ms": 0.0, "avg_latency_ms": 0.0
+}
+_warp_quality_lock = threading.Lock()
 
-    <!-- Main Workspace Container -->
-    <main class="max-w-5xl mx-auto px-4 sm:px-6 py-8 space-y-6">
-        
-        <!-- Metrics Cards Grid -->
-        <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3.5">
-            <!-- Verified Public IP -->
-            <div class="bg-white border border-slate-200/80 rounded-xl p-4 shadow-sm space-y-1">
-                <p class="text-[11px] font-medium text-slate-400 uppercase tracking-wider">Verified IP</p>
-                <div class="flex items-center space-x-2">
-                    <span id="flag" class="text-base">🌐</span>
-                    <span id="ip" class="text-base font-bold font-mono text-slate-900 tracking-tight">Loading...</span>
-                </div>
-                <p id="location" class="text-xs text-slate-500 font-medium truncate pt-0.5">Detecting location...</p>
-            </div>
-
-            <!-- Total Requests -->
-            <div class="bg-white border border-slate-200/80 rounded-xl p-4 shadow-sm space-y-1">
-                <p class="text-[11px] font-medium text-slate-400 uppercase tracking-wider">Total Calls</p>
-                <p id="requests" class="text-xl font-bold font-mono text-slate-900">0</p>
-                <p class="text-xs text-slate-400">Proxied AI completions</p>
-            </div>
-
-            <!-- Rotations & 429 Bypassed -->
-            <div class="bg-white border border-slate-200/80 rounded-xl p-4 shadow-sm space-y-1">
-                <p class="text-[11px] font-medium text-slate-400 uppercase tracking-wider">Rotations / 429s</p>
-                <div class="flex items-baseline space-x-1.5 font-mono">
-                    <span id="rotations" class="text-xl font-bold text-slate-900">0</span>
-                    <span class="text-slate-300 text-sm">/</span>
-                    <span id="ratelimits" class="text-base font-semibold text-amber-600">0</span>
-                </div>
-                <p class="text-xs text-slate-400">WARP cycles / Bypassed</p>
-            </div>
-
-            <!-- Total Saved Value -->
-            <div class="bg-emerald-50/40 border border-emerald-200/60 rounded-xl p-4 shadow-sm space-y-1">
-                <p class="text-[11px] font-medium text-emerald-700 uppercase tracking-wider">Est. Saved Value</p>
-                <p id="total-saved" class="text-xl font-bold font-mono text-emerald-600">$0.0000</p>
-                <p class="text-xs text-emerald-600/80">Equivalent OpenCode cost</p>
-            </div>
-        </div>
-
-        <!-- Model Usage & Cost Table -->
-        <div class="bg-white border border-slate-200/80 rounded-xl shadow-sm overflow-hidden">
-            <div class="px-5 py-3.5 border-b border-slate-100 flex justify-between items-center bg-slate-50/50">
-                <div>
-                    <h2 class="text-xs font-semibold text-slate-900 uppercase tracking-wider">Model Usage Breakdown</h2>
-                </div>
-                <span id="model-count-badge" class="bg-white text-slate-600 text-[11px] font-mono font-medium px-2 py-0.5 rounded border border-slate-200">0 Active</span>
-            </div>
-
-            <div class="overflow-x-auto">
-                <table class="w-full text-left text-xs">
-                    <thead class="bg-slate-50/60 text-slate-400 font-medium uppercase border-b border-slate-100 text-[10px] tracking-wider">
-                        <tr>
-                            <th class="px-5 py-2.5">Model</th>
-                            <th class="px-5 py-2.5">Requests</th>
-                            <th class="px-5 py-2.5">Prompt Tokens</th>
-                            <th class="px-5 py-2.5">Completion Tokens</th>
-                            <th class="px-5 py-2.5">Total Tokens</th>
-                            <th class="px-5 py-2.5 text-right">Saved USD</th>
-                        </tr>
-                    </thead>
-                    <tbody id="usage-table-body" class="divide-y divide-slate-100 font-mono text-slate-700">
-                        <tr>
-                            <td colspan="6" class="px-5 py-6 text-center text-slate-400 italic font-sans text-xs">No active completions logged yet. Send prompts from OpenCode to track live metrics.</td>
-                        </tr>
-                    </tbody>
-                </table>
-            </div>
-
-            <!-- Model Usage Pagination Footer -->
-            <div class="px-5 py-2.5 border-t border-slate-100 bg-slate-50/40 flex items-center justify-between text-xs text-slate-500 font-sans">
-                <span id="model-page-info">Page 1 of 1</span>
-                <div class="flex items-center space-x-1">
-                    <button id="model-prev-btn" onclick="changeModelPage(-1)" class="px-2 py-1 border border-slate-200 rounded text-[11px] bg-white hover:bg-slate-50 disabled:opacity-40 disabled:cursor-not-allowed">Previous</button>
-                    <button id="model-next-btn" onclick="changeModelPage(1)" class="px-2 py-1 border border-slate-200 rounded text-[11px] bg-white hover:bg-slate-50 disabled:opacity-40 disabled:cursor-not-allowed">Next</button>
-                </div>
-            </div>
-        </div>
-
-        <!-- IP Rotation Log Table -->
-        <div class="bg-white border border-slate-200/80 rounded-xl shadow-sm overflow-hidden">
-            <div class="px-5 py-3.5 border-b border-slate-100 bg-slate-50/50">
-                <h2 class="text-xs font-semibold text-slate-900 uppercase tracking-wider">IP Rotation Log</h2>
-            </div>
-            <div class="overflow-x-auto">
-                <table class="w-full text-left text-xs">
-                    <thead class="bg-slate-50/60 text-slate-400 font-medium uppercase border-b border-slate-100 text-[10px] tracking-wider">
-                        <tr>
-                            <th class="px-5 py-2.5">Time</th>
-                            <th class="px-5 py-2.5">Assigned IP</th>
-                            <th class="px-5 py-2.5">Country</th>
-                            <th class="px-5 py-2.5 text-right">Reason</th>
-                        </tr>
-                    </thead>
-                    <tbody id="ip-history-body" class="divide-y divide-slate-100 font-mono text-slate-700">
-                        <tr>
-                            <td colspan="4" class="px-5 py-6 text-center text-slate-400 italic font-sans text-xs">No rotation history recorded.</td>
-                        </tr>
-                    </tbody>
-                </table>
-            </div>
-
-            <!-- IP Rotation Pagination Footer -->
-            <div class="px-5 py-2.5 border-t border-slate-100 bg-slate-50/40 flex items-center justify-between text-xs text-slate-500 font-sans">
-                <span id="ip-page-info">Page 1 of 1</span>
-                <div class="flex items-center space-x-1">
-                    <button id="ip-prev-btn" onclick="changeIpPage(-1)" class="px-2 py-1 border border-slate-200 rounded text-[11px] bg-white hover:bg-slate-50 disabled:opacity-40 disabled:cursor-not-allowed">Previous</button>
-                    <button id="ip-next-btn" onclick="changeIpPage(1)" class="px-2 py-1 border border-slate-200 rounded text-[11px] bg-white hover:bg-slate-50 disabled:opacity-40 disabled:cursor-not-allowed">Next</button>
-                </div>
-            </div>
-        </div>
-    </main>
-
-    <script>
-        const PAGE_SIZE = 5;
-        let currentModelPage = 1;
-        let currentIpPage = 1;
-        let cachedModelKeys = [];
-        let cachedUsageData = {};
-        let cachedIpHistory = [];
-
-        function renderModelTable() {
-            const tableBody = document.getElementById('usage-table-body');
-            const totalPages = Math.max(1, Math.ceil(cachedModelKeys.length / PAGE_SIZE));
-            if (currentModelPage > totalPages) currentModelPage = totalPages;
-
-            const start = (currentModelPage - 1) * PAGE_SIZE;
-            const pageKeys = cachedModelKeys.slice(start, start + PAGE_SIZE);
-
-            if (pageKeys.length > 0) {
-                tableBody.innerHTML = pageKeys.map(model => {
-                    const item = cachedUsageData[model];
-                    const cost = item.estimated_cost_usd || 0;
-                    return `
-                        <tr class="hover:bg-slate-50/60 transition-colors">
-                            <td class="px-5 py-2.5 font-sans font-medium text-slate-900">${model}</td>
-                            <td class="px-5 py-2.5">${item.requests}</td>
-                            <td class="px-5 py-2.5 text-slate-400">${item.prompt_tokens.toLocaleString()}</td>
-                            <td class="px-5 py-2.5 text-slate-400">${item.completion_tokens.toLocaleString()}</td>
-                            <td class="px-5 py-2.5 font-bold text-slate-900">${item.total_tokens.toLocaleString()}</td>
-                            <td class="px-5 py-2.5 text-right font-bold text-emerald-600">$${cost.toFixed(4)}</td>
-                        </tr>
-                    `;
-                }).join('');
-            } else {
-                tableBody.innerHTML = `<tr><td colspan="6" class="px-5 py-6 text-center text-slate-400 italic font-sans text-xs">No active completions logged yet. Send prompts from OpenCode to track live metrics.</td></tr>`;
-            }
-
-            document.getElementById('model-page-info').innerText = `Page ${currentModelPage} of ${totalPages}`;
-            document.getElementById('model-prev-btn').disabled = (currentModelPage <= 1);
-            document.getElementById('model-next-btn').disabled = (currentModelPage >= totalPages);
-        }
-
-        function renderIpTable() {
-            const ipHistoryBody = document.getElementById('ip-history-body');
-            const reversedHistory = cachedIpHistory.slice().reverse();
-            const totalPages = Math.max(1, Math.ceil(reversedHistory.length / PAGE_SIZE));
-            if (currentIpPage > totalPages) currentIpPage = totalPages;
-
-            const start = (currentIpPage - 1) * PAGE_SIZE;
-            const pageItems = reversedHistory.slice(start, start + PAGE_SIZE);
-
-            if (pageItems.length > 0) {
-                ipHistoryBody.innerHTML = pageItems.map(h => `
-                    <tr class="hover:bg-slate-50/60 transition-colors">
-                        <td class="px-5 py-2.5 text-slate-400">${h.timestamp}</td>
-                        <td class="px-5 py-2.5 font-bold text-slate-900">${h.ip}</td>
-                        <td class="px-5 py-2.5 font-sans">${h.flag} ${h.country}</td>
-                        <td class="px-5 py-2.5 text-right text-slate-400 font-sans">${h.reason}</td>
-                    </tr>
-                `).join('');
-            } else {
-                ipHistoryBody.innerHTML = `<tr><td colspan="4" class="px-5 py-6 text-center text-slate-400 italic font-sans text-xs">No rotation history recorded.</td></tr>`;
-            }
-
-            document.getElementById('ip-page-info').innerText = `Page ${currentIpPage} of ${totalPages}`;
-            document.getElementById('ip-prev-btn').disabled = (currentIpPage <= 1);
-            document.getElementById('ip-next-btn').disabled = (currentIpPage >= totalPages);
-        }
-
-        function changeModelPage(delta) {
-            currentModelPage += delta;
-            renderModelTable();
-        }
-
-        function changeIpPage(delta) {
-            currentIpPage += delta;
-            renderIpTable();
-        }
-
-        async function fetchMetrics() {
-            try {
-                const res = await fetch('/metrics');
-                const data = await res.json();
-                
-                document.getElementById('ip').innerText = data.verified_public_ip || 'Disconnected';
-                
-                if (data.location) {
-                    document.getElementById('location').innerText = `${data.location.country || ''} ${data.location.city ? '(' + data.location.city + ')' : ''}`;
-                    if (data.location.flag) {
-                        document.getElementById('flag').innerText = data.location.flag;
-                    }
-                }
-
-                // Cache IP History & Render Page
-                cachedIpHistory = data.ip_history || [];
-                renderIpTable();
-
-                document.getElementById('rotations').innerText = data.total_rotations;
-                document.getElementById('requests').innerText = data.metrics.total_requests;
-                document.getElementById('ratelimits').innerText = data.metrics.rate_limited_requests;
-
-                const models = data.discovered_models || [];
-                document.getElementById('model-count-badge').innerText = `${models.length} Models`;
-
-                cachedUsageData = data.model_usage || {};
-                cachedModelKeys = Object.keys(cachedUsageData);
-
-                let grandTotalUsd = 0;
-                cachedModelKeys.forEach(m => { grandTotalUsd += (cachedUsageData[m].estimated_cost_usd || 0); });
-                document.getElementById('total-saved').innerText = `$${grandTotalUsd.toFixed(4)}`;
-
-                renderModelTable();
-            } catch (e) {}
-        }
-
-        async function rotateNow() {
-            const btn = document.getElementById('rotate-btn');
-            const originalText = btn.innerHTML;
-            btn.disabled = true;
-            btn.innerHTML = `
-                <svg class="animate-spin -ml-1 mr-1.5 h-3.5 w-3.5 text-white inline-block" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
-                    <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
-                    <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
-                </svg>
-                Rotating...
-            `;
-            showToast("⏳ Requesting guaranteed fresh WARP IP...", "info");
-
-            try {
-                const res = await fetch('/api/rotate', { method: 'POST' });
-                
-                let attempts = 0;
-                const pollInterval = setInterval(async () => {
-                    attempts++;
-                    await fetchMetrics();
-                    if (attempts >= 6) {
-                        clearInterval(pollInterval);
-                        btn.disabled = false;
-                        btn.innerHTML = originalText;
-                        showToast(`✅ Verified IP: ${document.getElementById('ip').innerText}`, "success");
-                    }
-                }, 1000);
-
-            } catch (e) {
-                btn.disabled = false;
-                btn.innerHTML = originalText;
-                showToast("❌ Failed to rotate IP", "error");
-            }
-        }
-
-        function showToast(message, type = "info") {
-            let toast = document.getElementById('custom-toast');
-            if (!toast) {
-                toast = document.createElement('div');
-                toast.id = 'custom-toast';
-                toast.className = 'fixed bottom-5 right-5 z-50 px-4 py-2.5 rounded-lg shadow-md border text-xs font-medium font-sans transition-all transform duration-200';
-                document.body.appendChild(toast);
-            }
-            
-            if (type === "success") {
-                toast.className = 'fixed bottom-5 right-5 z-50 px-4 py-2.5 rounded-lg shadow-md border text-xs font-medium font-sans transition-all transform duration-200 bg-slate-900 text-emerald-400 border-slate-800 opacity-100 translate-y-0';
-            } else if (type === "error") {
-                toast.className = 'fixed bottom-5 right-5 z-50 px-4 py-2.5 rounded-lg shadow-md border text-xs font-medium font-sans transition-all transform duration-200 bg-slate-900 text-rose-400 border-slate-800 opacity-100 translate-y-0';
-            } else {
-                toast.className = 'fixed bottom-5 right-5 z-50 px-4 py-2.5 rounded-lg shadow-md border text-xs font-medium font-sans transition-all transform duration-200 bg-slate-900 text-slate-200 border-slate-800 opacity-100 translate-y-0';
-            }
-            
-            toast.innerText = message;
-            setTimeout(() => {
-                toast.classList.add('opacity-0', 'translate-y-1');
-            }, 3500);
-        }
-
-        setInterval(fetchMetrics, 3000);
-        fetchMetrics();
-    </script>
-</body>
-</html>
-"""
+def record_warp_rotation(success: bool, latency_ms: float = 0, old_ip: str = "", new_ip: str = ""):
+    with _warp_quality_lock:
+        warp_quality_stats["total_attempts"] += 1
+        if success:
+            warp_quality_stats["successful_rotations"] += 1
+            warp_quality_stats["last_latency_ms"] = latency_ms
+            n = warp_quality_stats["successful_rotations"]
+            warp_quality_stats["avg_latency_ms"] = (
+                (warp_quality_stats["avg_latency_ms"] * (n - 1) + latency_ms) / n
+            )
+        else:
+            warp_quality_stats["failed_rotations"] += 1
+    try:
+        _db_execute(
+            "INSERT INTO warp_quality (timestamp, success, latency_ms, old_ip, new_ip) VALUES (?, ?, ?, ?, ?)",
+            (time.strftime("%Y-%m-%d %H:%M:%S"), 1 if success else 0, latency_ms, old_ip, new_ip)
+        )
+    except Exception:
+        pass
 
 # -----------------------------------------------------------------------------
+# Backoff helper
+# -----------------------------------------------------------------------------
+def compute_backoff_delay(attempt: int, base: float = 1.0, cap: int = BACKOFF_CAP) -> float:
+    return min(base * (2 ** (attempt - 1)), cap) + random.uniform(0.5, 1.5)
+
+# -----------------------------------------------------------------------------
+# Jinja2 Templates
+# -----------------------------------------------------------------------------
+_templates = Jinja2Templates(directory=Path(__file__).parent / "templates")
+
+# -----------------------------------------------------------------------------
+model_usage_stats: Dict[str, Dict[str, float]] = {}
+
 # Configuration & Dynamic Discovery
 # -----------------------------------------------------------------------------
 PORT = int(os.environ.get("OPENCODE_ZEN_PORT", "8000"))
@@ -592,19 +432,45 @@ DEFAULT_FREE_MODELS = [
 discovered_models: List[Dict[str, str]] = DEFAULT_FREE_MODELS.copy()
 _discovery_lock = threading.Lock()
 
-logging.basicConfig(
-    format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
-    level=logging.INFO,
-    datefmt="%Y-%m-%d %H:%M:%S",
-    force=True,
-)
+LOG_FORMAT = os.environ.get("LOG_FORMAT", "text").lower()
+
+if LOG_FORMAT == "json":
+    _handler = logging.StreamHandler()
+    _handler.setFormatter(JSONFormatter())
+    logging.basicConfig(level=logging.INFO, handlers=[_handler], force=True)
+else:
+    logging.basicConfig(
+        format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
+        level=logging.INFO,
+        datefmt="%Y-%m-%d %H:%M:%S",
+        force=True,
+    )
 log = logging.getLogger("zen_server")
 
-app = FastAPI(title="OpenCode Zen v3.0 Ultra Resilient Proxy")
+@asynccontextmanager
+async def lifespan(application: FastAPI):
+    global model_usage_stats
+    init_db()
+    model_usage_stats = load_metrics_from_db()
+    _discovery_stop.clear()
+    threading.Thread(target=discover_models_task, daemon=True).start()
+    yield
+    _close_all_sessions()
+    _discovery_stop.set()
+
+app = FastAPI(title="OpenCode Zen v3.0 Ultra Resilient Proxy", lifespan=lifespan)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 def discover_models_task():
     global discovered_models
-    while True:
+    while not _discovery_stop.is_set():
         try:
             req = UrlRequest(
                 f"{TARGET_ZEN_BASE}/models",
@@ -627,19 +493,21 @@ def discover_models_task():
                         log.info(f"Auto-Discovery refreshed: {len(discovered_models)} active model(s) fetched.")
         except Exception as e:
             log.debug(f"Auto-Discovery fallback active: {e}")
-        time.sleep(300)
+        _discovery_stop.wait(300)
 
 class FlowContext:
     def __enter__(self):
         global active_flows_count
         with flow_lock:
             active_flows_count += 1
+            prom_active_flows.set(active_flows_count)
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
         global active_flows_count
         with flow_lock:
             active_flows_count = max(0, active_flows_count - 1)
+            prom_active_flows.set(active_flows_count)
 
 class ChatMessage(BaseModel):
     role: str
@@ -667,17 +535,12 @@ def get_realistic_headers() -> Dict[str, str]:
     }
 
 async def stream_response(response, model_name: str) -> AsyncGenerator[bytes, None]:
-    """
-    Raw byte passthrough SSE stream generator.
-    CRITICAL: FlowContext is held for the ENTIRE duration of streaming so that
-    rotate_warp() in rotator.py sees active_flows_count > 0 and skips IP rotation
-    while a response is still being streamed to the client.
-    """
     loop = asyncio.get_event_loop()
     global active_flows_count
 
     with flow_lock:
         active_flows_count += 1
+        prom_active_flows.set(active_flows_count)
 
     try:
         def get_next_chunk(iter_content):
@@ -686,7 +549,7 @@ async def stream_response(response, model_name: str) -> AsyncGenerator[bytes, No
             except StopIteration:
                 return None
 
-        chunk_iter = response.iter_content(chunk_size=4096)
+        chunk_iter = response.iter_content(chunk_size=STREAM_CHUNK_SIZE)
 
         while True:
             chunk = await loop.run_in_executor(None, get_next_chunk, chunk_iter)
@@ -703,26 +566,38 @@ async def stream_response(response, model_name: str) -> AsyncGenerator[bytes, No
     finally:
         with flow_lock:
             active_flows_count = max(0, active_flows_count - 1)
+            prom_active_flows.set(active_flows_count)
 
 @app.get("/dashboard", response_class=HTMLResponse)
 async def dashboard():
-    return HTMLResponse(content=DASHBOARD_HTML)
+    return _templates.TemplateResponse("dashboard.html", {"request": {}})
+
+@app.get("/metrics-prometheus")
+async def metrics_prometheus():
+    return Response(content=generate_latest(), media_type=CONTENT_TYPE_LATEST)
 
 @app.post("/api/rotate")
-async def manual_rotate():
-    """Triggers IP rotation via local rotator or microservice container."""
+async def manual_rotate(raw_request: Request):
+    origin = raw_request.headers.get("origin", "") or raw_request.headers.get("referer", "")
+    if origin and "opencode" not in origin and "localhost" not in origin and "127.0.0.1" not in origin:
+        log.warning(f"Cross-origin rotate attempt blocked: {origin}")
+        raise HTTPException(status_code=403, detail="Cross-origin rotation blocked")
+    signal_rotation_start()
     try:
-        rotate_warp(reason="Manual Web Dashboard Trigger")
-        return {"status": "success"}
-    except Exception:
+        result = rotate_warp(reason="Manual Web Dashboard Trigger")
+        if result:
+            swap_warp_registration()
+            return {"status": "success", "verified_ip": get_public_ip()}
         try:
-            from curl_cffi import requests as cffi_requests
             resp = cffi_requests.post("http://warp-rotator:8001/rotate", timeout=5)
             if resp.status_code == 200:
+                swap_warp_registration()
                 return resp.json()
         except Exception:
             pass
-    return {"status": "triggered"}
+        return {"status": "queued", "message": "Rotation queued or already in progress"}
+    finally:
+        signal_rotation_done()
 
 @app.get("/metrics")
 async def get_metrics():
@@ -749,7 +624,6 @@ async def get_metrics():
 
     def fetch_rotator_status():
         try:
-            from curl_cffi import requests as cffi_requests
             r = cffi_requests.get("http://warp-rotator:8001/status", impersonate="chrome124", timeout=4)
             if r.status_code == 200:
                 return r.json()
@@ -793,16 +667,29 @@ async def get_metrics():
         "active_flows": active_flows_count,
         "discovered_models": discovered_models,
         "model_usage": model_usage_stats,
-        "ip_history": rotator_history
+        "ip_history": rotator_history,
+        "warp_quality": dict(warp_quality_stats),
+        "dual_warp": dict(_dual_warp),
+        "rotation_in_progress": _rotation_in_progress.is_set()
     }
 
 @app.get("/health")
 async def health():
+    ip = get_public_ip()
+    prom_warp_health.set(1 if ip and ip != "Disconnected" else 0)
+    db_ok = False
+    try:
+        _db_execute("SELECT 1")
+        db_ok = True
+    except Exception:
+        pass
     return {
-        "status": "healthy",
+        "status": "healthy" if db_ok else "degraded",
+        "database": "connected" if db_ok else "unreachable",
         "uptime_seconds": int(time.time() - metrics["start_time"]),
         "active_flows": active_flows_count,
         "total_rotations": rotation_count,
+        "warp_quality": dict(warp_quality_stats),
     }
 
 @app.get("/v1/models")
@@ -824,7 +711,10 @@ async def list_models():
 @app.post("/v1/chat/completions")
 async def chat_completions(raw_request: Request):
     metrics["total_requests"] += 1
-    
+    prom_requests_total.labels(model="chat", endpoint="chat_completions").inc()
+    await wait_for_rotation_drain()
+
+    start_time = time.time()
     try:
         payload = await raw_request.json()
     except Exception:
@@ -833,7 +723,7 @@ async def chat_completions(raw_request: Request):
     current_model = payload.get("model", "deepseek-v4-flash-free")
     is_stream = payload.get("stream", False)
     log.info(f"Received request for model '{current_model}' (Stream: {is_stream} | Has Tools: {'tools' in payload})")
-    
+
     headers = get_realistic_headers()
     for k, v in raw_request.headers.items():
         if k.lower().startswith("x-opencode-"):
@@ -841,15 +731,10 @@ async def chat_completions(raw_request: Request):
 
     for attempt in range(1, MAX_RETRIES_ON_429 + 1):
         try:
-            from curl_cffi import requests as cffi_requests
-            import random
-
-            time.sleep(random.uniform(0.1, 0.3))
+            await asyncio.sleep(random.uniform(0.1, 0.3))
             proxies = get_next_outbound_proxy()
-
-            # FlowContext is NOT used here for streaming — the generator manages it internally
-            # For non-streaming we use it to block rotation during the entire request
-            response = cffi_requests.post(
+            session = _get_session("chat")
+            response = session.post(
                 TARGET_ZEN_URL,
                 json=payload,
                 headers=headers,
@@ -859,71 +744,63 @@ async def chat_completions(raw_request: Request):
                 timeout=120
             )
 
-            # Check HTTP status code for rate-limit or upstream error
             if response.status_code == 429 or response.status_code >= 500:
                 metrics["rate_limited_requests"] += 1
+                prom_requests_rate_limited.labels(model=current_model).inc()
                 err_text = response.text.lower()
-
-                # Distinguish Model/Provider-level limits vs. IP-level blocks
                 is_model_specific_limit = any(k in err_text for k in ["model_rate_limit", "quota_exceeded", "per_model_limit", "credit_balance", "insufficient_quota"])
-
-                delay = (INITIAL_BACKOFF * (2 ** (attempt - 1))) + random.uniform(0.5, 1.5)
+                delay = compute_backoff_delay(attempt, INITIAL_BACKOFF)
 
                 if is_model_specific_limit:
-                    log.warning(f"Model-level limit for '{current_model}'. Skipping IP rotation to prevent socket teardown. Retrying in {delay:.2f}s...")
-                    time.sleep(delay)
+                    log.warning(f"Model-level limit for '{current_model}'. Skipping IP rotation. Retrying in {delay:.2f}s...")
+                    await asyncio.sleep(delay)
                     continue
                 else:
-                    log.warning(f"HTTP {response.status_code} (IP/Network block) for '{current_model}'. Triggering IP Rotation & Retrying in {delay:.2f}s...")
-                    rotate_warp(reason=f"HTTP {response.status_code} on {current_model}")
-                    time.sleep(delay)
+                    log.warning(f"HTTP {response.status_code} (IP block) for '{current_model}'. Rotating IP & retrying in {delay:.2f}s...")
+                    t0 = time.monotonic()
+                    ok = rotate_warp(reason=f"HTTP {response.status_code} on {current_model}")
+                    record_warp_rotation(ok, (time.monotonic() - t0) * 1000)
+                    if ok:
+                        swap_warp_registration()
+                    await asyncio.sleep(delay)
                     continue
 
             metrics["successful_requests"] += 1
+            prom_requests_success.labels(model=current_model).inc()
+            prom_request_duration.labels(model=current_model, endpoint="chat_completions").observe(time.time() - start_time)
 
             if is_stream:
                 track_token_usage(current_model, prompt_tokens=100, completion_tokens=150)
-                # stream_response manages FlowContext internally via finally block
                 return StreamingResponse(
                     stream_response(response, current_model),
                     media_type="text/event-stream",
-                    headers={
-                        "Cache-Control": "no-cache",
-                        "X-Accel-Buffering": "no",
-                        "Connection": "keep-alive",
-                    }
+                    headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no", "Connection": "keep-alive"}
                 )
             else:
                 with FlowContext():
                     try:
-                        res_json = response.json()
+                        res_json = await asyncio.to_thread(response.json)
                         usage = res_json.get("usage", {})
                         track_token_usage(
                             current_model,
-                            prompt_tokens=usage.get("prompt_tokens", 50),
-                            completion_tokens=usage.get("completion_tokens", 100)
+                            prompt_tokens=usage.get("prompt_tokens", DEFAULT_PROMPT_TOKENS),
+                            completion_tokens=usage.get("completion_tokens", DEFAULT_COMPLETION_TOKENS)
                         )
                         return JSONResponse(content=res_json)
                     except Exception:
-                        track_token_usage(current_model, prompt_tokens=50, completion_tokens=100)
+                        track_token_usage(current_model, prompt_tokens=DEFAULT_PROMPT_TOKENS, completion_tokens=DEFAULT_COMPLETION_TOKENS)
                         return {
                             "id": f"chatcmpl-zen-resp-{int(time.time())}",
                             "object": "chat.completion",
                             "created": int(time.time()),
                             "model": current_model,
-                            "choices": [
-                                {
-                                    "index": 0,
-                                    "message": {"role": "assistant", "content": response.text},
-                                    "finish_reason": "stop"
-                                }
-                            ]
+                            "choices": [{"index": 0, "message": {"role": "assistant", "content": response.text}, "finish_reason": "stop"}]
                         }
-                        
+
         except Exception as e:
             log.error(f"[Attempt {attempt}/{MAX_RETRIES_ON_429}] Connection error for model '{current_model}': {type(e).__name__}: {e}")
             if attempt < MAX_RETRIES_ON_429:
-                time.sleep(min(2 ** attempt, 30))
+                await asyncio.sleep(min(2 ** attempt, BACKOFF_CAP))
             continue
 
     log.error(f"All {MAX_RETRIES_ON_429} attempts exhausted for model '{current_model}'. Returning 503.")
@@ -938,9 +815,11 @@ async def chat_completions(raw_request: Request):
 # -----------------------------------------------------------------------------
 @app.post("/v1/messages")
 async def anthropic_messages(raw_request: Request):
-    """Native Anthropic API proxy — forwards to /zen/v1/messages without format conversion."""
     metrics["total_requests"] += 1
+    prom_requests_total.labels(model="messages", endpoint="anthropic_messages").inc()
+    await wait_for_rotation_drain()
 
+    start_time = time.time()
     try:
         body = await raw_request.json()
     except Exception:
@@ -950,7 +829,6 @@ async def anthropic_messages(raw_request: Request):
     is_stream = body.get("stream", False)
     log.info(f"Received Anthropic-format request for model '{model_name}' (Stream: {is_stream})")
 
-    # Forward the client's x-api-key (used by Zen API for Anthropic auth)
     client_api_key = raw_request.headers.get("x-api-key") or ""
     if not client_api_key:
         auth = raw_request.headers.get("authorization", "")
@@ -967,13 +845,10 @@ async def anthropic_messages(raw_request: Request):
 
     for attempt in range(1, MAX_RETRIES_ON_429 + 1):
         try:
-            from curl_cffi import requests as cffi_requests
-            import random
-
-            time.sleep(random.uniform(0.1, 0.3))
+            await asyncio.sleep(random.uniform(0.1, 0.3))
             proxies = get_next_outbound_proxy()
-
-            response = cffi_requests.post(
+            session = _get_session("anthropic")
+            response = session.post(
                 TARGET_ZEN_ANTHROPIC_URL,
                 json=body,
                 headers=headers,
@@ -985,42 +860,46 @@ async def anthropic_messages(raw_request: Request):
 
             if response.status_code in (429, 500) or response.status_code >= 500:
                 metrics["rate_limited_requests"] += 1
-                delay = (INITIAL_BACKOFF * (2 ** (attempt - 1))) + random.uniform(0.5, 1.5)
+                prom_requests_rate_limited.labels(model=model_name).inc()
+                delay = compute_backoff_delay(attempt, INITIAL_BACKOFF)
                 log.warning(f"HTTP {response.status_code} on '{model_name}'. Rotating IP & retrying in {delay:.2f}s...")
-                rotate_warp(reason=f"HTTP {response.status_code} on {model_name}")
-                time.sleep(delay)
+                t0 = time.monotonic()
+                ok = rotate_warp(reason=f"HTTP {response.status_code} on {model_name}")
+                record_warp_rotation(ok, (time.monotonic() - t0) * 1000)
+                if ok:
+                    swap_warp_registration()
+                await asyncio.sleep(delay)
                 continue
 
             metrics["successful_requests"] += 1
+            prom_requests_success.labels(model=model_name).inc()
+            prom_request_duration.labels(model=model_name, endpoint="anthropic_messages").observe(time.time() - start_time)
 
             if is_stream:
                 return StreamingResponse(
                     stream_response(response, model_name),
                     media_type="text/event-stream",
-                    headers={
-                        "Cache-Control": "no-cache",
-                        "X-Accel-Buffering": "no",
-                    },
+                    headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
                 )
             else:
                 with FlowContext():
                     try:
-                        res_json = response.json()
+                        res_json = await asyncio.to_thread(response.json)
                         usage = res_json.get("usage", {})
                         track_token_usage(
                             model_name,
-                            prompt_tokens=usage.get("input_tokens", 50),
-                            completion_tokens=usage.get("output_tokens", 100),
+                            prompt_tokens=usage.get("input_tokens", DEFAULT_PROMPT_TOKENS),
+                            completion_tokens=usage.get("output_tokens", DEFAULT_COMPLETION_TOKENS),
                         )
                         return JSONResponse(content=res_json)
                     except Exception:
-                        track_token_usage(model_name, prompt_tokens=50, completion_tokens=100)
+                        track_token_usage(model_name, prompt_tokens=DEFAULT_PROMPT_TOKENS, completion_tokens=DEFAULT_COMPLETION_TOKENS)
                         return JSONResponse(content=response.text)
 
         except Exception as e:
             log.error(f"[Attempt {attempt}/{MAX_RETRIES_ON_429}] Anthropic endpoint error for model '{model_name}': {type(e).__name__}: {e}")
             if attempt < MAX_RETRIES_ON_429:
-                time.sleep(min(2 ** attempt, 30))
+                await asyncio.sleep(min(2 ** attempt, BACKOFF_CAP))
             continue
 
     log.error(f"All {MAX_RETRIES_ON_429} attempts exhausted for Anthropic model '{model_name}'. Returning 503.")
@@ -1032,9 +911,11 @@ async def anthropic_messages(raw_request: Request):
 
 @app.post("/v1/responses")
 async def responses_endpoint(raw_request: Request):
-    """Proxy for OpenAI Responses API (/zen/v1/responses)."""
     metrics["total_requests"] += 1
+    prom_requests_total.labels(model="responses", endpoint="responses").inc()
+    await wait_for_rotation_drain()
 
+    start_time = time.time()
     try:
         body = await raw_request.json()
     except Exception:
@@ -1051,13 +932,10 @@ async def responses_endpoint(raw_request: Request):
 
     for attempt in range(1, MAX_RETRIES_ON_429 + 1):
         try:
-            from curl_cffi import requests as cffi_requests
-            import random
-
-            time.sleep(random.uniform(0.1, 0.3))
+            await asyncio.sleep(random.uniform(0.1, 0.3))
             proxies = get_next_outbound_proxy()
-
-            response = cffi_requests.post(
+            session = _get_session("responses")
+            response = session.post(
                 TARGET_ZEN_RESPONSES_URL,
                 json=body,
                 headers=headers,
@@ -1067,15 +945,22 @@ async def responses_endpoint(raw_request: Request):
                 timeout=120,
             )
 
-            if response.status_code in (429, 500) or response.status_code >= 500:
+            if response.status_code == 429 or response.status_code >= 500:
                 metrics["rate_limited_requests"] += 1
-                delay = (INITIAL_BACKOFF * (2 ** (attempt - 1))) + random.uniform(0.5, 1.5)
+                prom_requests_rate_limited.labels(model=model_name).inc()
+                delay = compute_backoff_delay(attempt, INITIAL_BACKOFF)
                 log.warning(f"HTTP {response.status_code} on '{model_name}'. Rotating IP & retrying in {delay:.2f}s...")
-                rotate_warp(reason=f"HTTP {response.status_code} on {model_name}")
-                time.sleep(delay)
+                t0 = time.monotonic()
+                ok = rotate_warp(reason=f"HTTP {response.status_code} on {model_name}")
+                record_warp_rotation(ok, (time.monotonic() - t0) * 1000)
+                if ok:
+                    swap_warp_registration()
+                await asyncio.sleep(delay)
                 continue
 
             metrics["successful_requests"] += 1
+            prom_requests_success.labels(model=model_name).inc()
+            prom_request_duration.labels(model=model_name, endpoint="responses").observe(time.time() - start_time)
 
             if is_stream:
                 return StreamingResponse(
@@ -1086,7 +971,7 @@ async def responses_endpoint(raw_request: Request):
             else:
                 with FlowContext():
                     try:
-                        res_json = response.json()
+                        res_json = await asyncio.to_thread(response.json)
                         return JSONResponse(content=res_json)
                     except Exception:
                         return JSONResponse(content=response.text)
@@ -1094,7 +979,7 @@ async def responses_endpoint(raw_request: Request):
         except Exception as e:
             log.error(f"[Attempt {attempt}/{MAX_RETRIES_ON_429}] Responses endpoint error for model '{model_name}': {type(e).__name__}: {e}")
             if attempt < MAX_RETRIES_ON_429:
-                time.sleep(min(2 ** attempt, 30))
+                await asyncio.sleep(min(2 ** attempt, BACKOFF_CAP))
             continue
 
     log.error(f"All {MAX_RETRIES_ON_429} attempts exhausted for Responses model '{model_name}'. Returning 503.")
@@ -1104,23 +989,21 @@ async def responses_endpoint(raw_request: Request):
         headers={"Retry-After": "10"}
     )
 
-# Initialize SQLite database and load historical metrics
-init_db()
-model_usage_stats = load_metrics_from_db()
+# Global exception handler for standard error format
+@app.exception_handler(Exception)
+async def global_exception_handler(request: Request, exc: Exception):
+    log.error(f"Unhandled error on {request.method} {request.url.path}: {exc}")
+    return JSONResponse(
+        status_code=500,
+        content={"error": {"message": "Internal server error", "type": "internal_error", "code": 500}},
+    )
 
-threading.Thread(target=discover_models_task, daemon=True).start()
-
-_shutdown_requested = False
-
-def _handle_signal(signum, frame):
-    global _shutdown_requested
-    if _shutdown_requested:
-        return
-    _shutdown_requested = True
-    log.warning(f"Received signal {signum}, initiating graceful shutdown...")
-
-signal.signal(signal.SIGTERM, _handle_signal)
-signal.signal(signal.SIGINT, _handle_signal)
+@app.exception_handler(HTTPException)
+async def http_exception_handler(request: Request, exc: HTTPException):
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={"error": {"message": exc.detail, "type": "http_error", "code": exc.status_code}},
+    )
 
 if __name__ == "__main__":
     load_proxy_list()

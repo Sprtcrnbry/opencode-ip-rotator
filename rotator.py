@@ -2,6 +2,8 @@ import ctypes
 import json
 import logging
 import os
+import signal
+import sqlite3
 import subprocess
 import sys
 import threading
@@ -23,11 +25,29 @@ MAX_RETRIES = int(os.environ.get("WARP_MAX_RETRIES", "5"))
 AUTO_RECYCLE_THRESHOLD = int(os.environ.get("AUTO_RECYCLE_THRESHOLD", "50"))
 CUSTOM_OUTBOUND_PROXY = os.environ.get("CUSTOM_OUTBOUND_PROXY", "").strip()
 
-logging.basicConfig(
-    format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
-    level=logging.INFO,
-    datefmt="%Y-%m-%d %H:%M:%S",
-)
+class JSONFormatter(logging.Formatter):
+    def format(self, record: logging.LogRecord) -> str:
+        log_entry = {
+            "timestamp": self.formatTime(record, self.datefmt or "%Y-%m-%dT%H:%M:%S"),
+            "level": record.levelname,
+            "logger": record.name,
+            "message": record.getMessage(),
+        }
+        if record.exc_info and record.exc_info[0]:
+            log_entry["exception"] = self.formatException(record.exc_info)
+        return json.dumps(log_entry)
+
+LOG_FORMAT = os.environ.get("LOG_FORMAT", "text").lower()
+if LOG_FORMAT == "json":
+    _handler = logging.StreamHandler()
+    _handler.setFormatter(JSONFormatter())
+    logging.basicConfig(level=logging.INFO, handlers=[_handler])
+else:
+    logging.basicConfig(
+        format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
+        level=logging.INFO,
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
 log = logging.getLogger("rotator")
 
 rotation_lock = threading.Lock()
@@ -146,8 +166,6 @@ def rotate_warp(reason: str = "Triggered") -> bool:
                                 ip_history.pop(0)
 
                             try:
-                                import sqlite3
-                                from pathlib import Path
                                 db_path = Path(os.environ.get("METRICS_DB_PATH", "/app/data/metrics.db"))
                                 if db_path.exists():
                                     conn = sqlite3.connect(str(db_path))
@@ -252,6 +270,12 @@ def start_rotator_http_server():
     except Exception as e:
         log.error(f"Failed to start rotator HTTP listener: {e}")
 
+def _cleanup_warp():
+    log.info("Disconnecting WARP and cleaning up...")
+    subprocess.run(["warp-cli", "--accept-tos", "disconnect"], capture_output=True, text=True, timeout=10, check=False)
+    subprocess.run(["warp-cli", "--accept-tos", "registration", "delete"], capture_output=True, text=True, timeout=10, check=False)
+    log.info("WARP cleanup complete.")
+
 def main() -> None:
     elevate()
     global _current_ip
@@ -259,6 +283,16 @@ def main() -> None:
     log.info(f"Starting IP Rotator Node... Initial Verified Public IP: {_current_ip}")
 
     stop_event = threading.Event()
+
+    def _handle_signal(signum, frame):
+        log.warning(f"Received signal {signum}, shutting down rotator...")
+        stop_event.set()
+        _cleanup_warp()
+        sys.exit(0)
+
+    signal.signal(signal.SIGTERM, _handle_signal)
+    signal.signal(signal.SIGINT, _handle_signal)
+
     health_thread = threading.Thread(target=health_check_loop, args=(CHECK_ENDPOINT, CHECK_INTERVAL, INITIAL_RETRY_DELAY, MAX_RETRIES, stop_event), daemon=True)
     periodic_thread = threading.Thread(target=periodic_rotation_loop, args=(PERIODIC_ROTATION_INTERVAL, stop_event), daemon=True)
     http_thread = threading.Thread(target=start_rotator_http_server, daemon=True)
@@ -273,6 +307,7 @@ def main() -> None:
     except KeyboardInterrupt:
         log.info("Shutting down Rotator...")
         stop_event.set()
+        _cleanup_warp()
 
 if __name__ == "__main__":
     main()

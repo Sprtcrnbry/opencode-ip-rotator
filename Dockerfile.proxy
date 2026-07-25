@@ -9,9 +9,10 @@ RUN apt-get update && apt-get install -y curl && rm -rf /var/lib/apt/lists/*
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy server code and rotator helper for metrics import
+# Copy server code, rotator helper, and dashboard template
 COPY server.py .
 COPY rotator.py .
+COPY templates/ ./templates/
 
 EXPOSE 8000
 
