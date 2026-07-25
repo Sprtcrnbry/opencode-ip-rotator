@@ -727,30 +727,73 @@ async def manual_rotate():
 @app.get("/metrics")
 async def get_metrics():
     uptime = int(time.time() - metrics["start_time"])
-    ip = get_public_ip()
-    location = get_ip_location(ip) if ip else {"country": "Unknown", "flag": "🌐"}
-    
-    # Load persistent IP history from SQLite Database
-    history = load_ip_history_from_db()
-    if not history:
+
+    # Always ensure full historical stats from SQLite DB are included
+    db_usage = load_metrics_from_db()
+    for m_name, m_data in db_usage.items():
+        if m_name not in model_usage_stats:
+            model_usage_stats[m_name] = m_data
+        else:
+            # Sync highest values or keep memory in sync with DB
+            model_usage_stats[m_name]["requests"] = max(model_usage_stats[m_name]["requests"], m_data["requests"])
+            model_usage_stats[m_name]["prompt_tokens"] = max(model_usage_stats[m_name]["prompt_tokens"], m_data["prompt_tokens"])
+            model_usage_stats[m_name]["completion_tokens"] = max(model_usage_stats[m_name]["completion_tokens"], m_data["completion_tokens"])
+            model_usage_stats[m_name]["total_tokens"] = max(model_usage_stats[m_name]["total_tokens"], m_data["total_tokens"])
+            model_usage_stats[m_name]["estimated_cost_usd"] = max(model_usage_stats[m_name]["estimated_cost_usd"], m_data["estimated_cost_usd"])
+
+    # Fetch live data from warp-rotator microservice (offloaded to executor — blocking call)
+    rotator_ip = None
+    rotator_location = None
+    rotator_rotations = rotation_count
+    rotator_history = []
+
+    def fetch_rotator_status():
         try:
             from curl_cffi import requests as cffi_requests
-            r = cffi_requests.get("http://warp-rotator:8001/status", timeout=2)
+            r = cffi_requests.get("http://warp-rotator:8001/status", impersonate="chrome124", timeout=4)
             if r.status_code == 200:
-                history = r.json().get("history", [])
-        except Exception:
-            pass
+                return r.json()
+        except Exception as e:
+            log.debug(f"warp-rotator status fetch error: {e}")
+        return None
+
+    loop = asyncio.get_event_loop()
+    rdata = await loop.run_in_executor(None, fetch_rotator_status)
+
+    if rdata:
+        rotator_ip = rdata.get("current_ip")
+        rotator_rotations = rdata.get("rotations", rotation_count)
+        rotator_history = rdata.get("history", [])
+        if rotator_ip:
+            def fetch_location():
+                return get_ip_location(rotator_ip)
+            rotator_location = await loop.run_in_executor(None, fetch_location)
+
+    # Fallback: local IP lookup
+    if not rotator_ip:
+        def fetch_local_ip():
+            ip = get_public_ip()
+            loc = get_ip_location(ip) if ip else {"country": "Unknown", "flag": "🌐"}
+            return ip, loc
+        rotator_ip, rotator_location = await loop.run_in_executor(None, fetch_local_ip)
+
+    # Fallback: SQLite history
+    if not rotator_history:
+        rotator_history = load_ip_history_from_db()
+
+    if not rotator_location:
+        rotator_location = {"country": "Unknown", "flag": "🌐"}
 
     return {
         "uptime_seconds": uptime,
-        "verified_public_ip": ip,
-        "location": location,
-        "total_rotations": rotation_count,
+        "verified_public_ip": rotator_ip,
+        "location": rotator_location,
+        "total_rotations": rotator_rotations,
         "metrics": metrics,
         "active_flows": active_flows_count,
         "discovered_models": discovered_models,
         "model_usage": model_usage_stats,
-        "ip_history": history
+        "ip_history": rotator_history
     }
 
 @app.get("/health")
