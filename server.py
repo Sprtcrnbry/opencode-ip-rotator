@@ -2,7 +2,6 @@ import asyncio
 import json
 import logging
 import os
-import sys
 import threading
 import time
 from typing import AsyncGenerator, Dict, List, Optional
@@ -13,21 +12,10 @@ import uvicorn
 from urllib.request import Request as UrlRequest, urlopen
 from urllib.error import HTTPError, URLError
 
-from rotator import rotate_warp, _flow_lock, _active_flows_count, get_public_ip, get_ip_location, rotation_count
+from rotator import rotate_warp, flow_lock, active_flows_count, get_public_ip, get_ip_location, rotation_count
 
 import sqlite3
 from pathlib import Path
-
-# Model pricing reference (USD per 1M tokens)
-MODEL_PRICING = {
-    "deepseek-v4-flash-free": {"input_per_1m": 0.15, "output_per_1m": 0.60},
-    "mimo-v2.5-free": {"input_per_1m": 0.20, "output_per_1m": 0.80},
-    "qwen3.6-plus-free": {"input_per_1m": 0.40, "output_per_1m": 1.20},
-    "minimax-m3-free": {"input_per_1m": 0.30, "output_per_1m": 1.00},
-    "nemotron-3-ultra-free": {"input_per_1m": 0.25, "output_per_1m": 0.90},
-    "ling-3.0-flash-free": {"input_per_1m": 0.15, "output_per_1m": 0.50},
-    "laguna-s-2.1-free": {"input_per_1m": 0.20, "output_per_1m": 0.70},
-}
 
 # Proxy Pool / Custom Proxy List Support
 # -----------------------------------------------------------------------------
@@ -639,15 +627,15 @@ def discover_models_task():
 
 class FlowContext:
     def __enter__(self):
-        global _active_flows_count
-        with _flow_lock:
-            _active_flows_count += 1
+        global active_flows_count
+        with flow_lock:
+            active_flows_count += 1
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
-        global _active_flows_count
-        with _flow_lock:
-            _active_flows_count = max(0, _active_flows_count - 1)
+        global active_flows_count
+        with flow_lock:
+            active_flows_count = max(0, active_flows_count - 1)
 
 class ChatMessage(BaseModel):
     role: str
@@ -678,15 +666,14 @@ async def stream_openai_response(response, model_name: str) -> AsyncGenerator[by
     """
     Raw byte passthrough SSE stream generator.
     CRITICAL: FlowContext is held for the ENTIRE duration of streaming so that
-    rotate_warp() in rotator.py sees _active_flows_count > 0 and skips IP rotation
+    rotate_warp() in rotator.py sees active_flows_count > 0 and skips IP rotation
     while a response is still being streamed to the client.
     """
     loop = asyncio.get_event_loop()
-    global _active_flows_count
+    global active_flows_count
 
-    # Manually increment flow counter — keeps it raised until generator is exhausted/closed
-    with _flow_lock:
-        _active_flows_count += 1
+    with flow_lock:
+        active_flows_count += 1
 
     try:
         def get_next_chunk(iter_content):
@@ -705,15 +692,13 @@ async def stream_openai_response(response, model_name: str) -> AsyncGenerator[by
 
         yield b"\ndata: [DONE]\n\n"
     except GeneratorExit:
-        # Client disconnected — still need to decrement
         pass
     except Exception as e:
         log.error(f"Stream exception caught: {e}")
         yield b"\ndata: [DONE]\n\n"
     finally:
-        # ALWAYS decrement when stream ends, regardless of how it ended
-        with _flow_lock:
-            _active_flows_count = max(0, _active_flows_count - 1)
+        with flow_lock:
+            active_flows_count = max(0, active_flows_count - 1)
 
 @app.get("/dashboard", response_class=HTMLResponse)
 async def dashboard():
@@ -721,18 +706,16 @@ async def dashboard():
 
 @app.post("/api/rotate")
 async def manual_rotate():
-    """Triggers IP rotation across microservice containers."""
+    """Triggers IP rotation via local rotator or microservice container."""
     try:
-        from curl_cffi import requests as cffi_requests
-        resp = cffi_requests.post("http://warp-rotator:8001/rotate", timeout=15)
-        if resp.status_code == 200:
-            return resp.json()
-    except Exception as e:
-        log.error(f"Microservice rotation trigger error: {e}")
-        # Fallback to local
+        rotate_warp(reason="Manual Web Dashboard Trigger")
+        return {"status": "success"}
+    except Exception:
         try:
-            rotate_warp(reason="Manual Web Dashboard Trigger")
-            return {"status": "success"}
+            from curl_cffi import requests as cffi_requests
+            resp = cffi_requests.post("http://warp-rotator:8001/rotate", timeout=5)
+            if resp.status_code == 200:
+                return resp.json()
         except Exception:
             pass
     return {"status": "triggered"}
@@ -748,7 +731,7 @@ async def get_metrics():
     if not history:
         try:
             from curl_cffi import requests as cffi_requests
-            r = cffi_requests.get("http://warp-rotator:8001/status", timeout=3)
+            r = cffi_requests.get("http://warp-rotator:8001/status", timeout=2)
             if r.status_code == 200:
                 history = r.json().get("history", [])
         except Exception:
@@ -760,7 +743,7 @@ async def get_metrics():
         "location": location,
         "total_rotations": rotation_count,
         "metrics": metrics,
-        "active_flows": _active_flows_count,
+        "active_flows": active_flows_count,
         "discovered_models": discovered_models,
         "model_usage": model_usage_stats,
         "ip_history": history
@@ -979,7 +962,6 @@ model_usage_stats = load_metrics_from_db()
 threading.Thread(target=discover_models_task, daemon=True).start()
 
 if __name__ == "__main__":
-    init_db()
     load_proxy_list()
     log.info(f"Starting OpenCode IP Proxy Server on {HOST}:{PORT}...")
     uvicorn.run(app, host=HOST, port=PORT)

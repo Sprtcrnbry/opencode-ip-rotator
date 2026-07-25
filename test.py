@@ -1,10 +1,10 @@
 import json
-import sys
+import os
 import time
 from urllib.request import Request, urlopen
 from urllib.error import HTTPError, URLError
 
-PROXY_URL = "http://127.0.0.1:8000"
+PROXY_URL = os.environ.get("PROXY_URL", "http://127.0.0.1:8000")
 
 def log(msg, status="INFO"):
     print(f"[{status}] {msg}")

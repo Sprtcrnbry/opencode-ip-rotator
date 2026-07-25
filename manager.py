@@ -19,5 +19,5 @@ def recreate_container():
     print(" New container environment spawned successfully.")
 
 if __name__ == "__main__":
-    print("Container Manager Script Ready. Run 'python container_manager.py' to force refresh container.")
+    print("Container Manager Script Ready. Run 'python manager.py' to force refresh container.")
     recreate_container()

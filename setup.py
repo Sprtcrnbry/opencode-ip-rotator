@@ -59,9 +59,9 @@ def setup_opencode_config():
     if OPENCODE_CONFIG_FILE.exists():
         try:
             content = OPENCODE_CONFIG_FILE.read_text(encoding="utf-8")
-            # Strip comments if present for JSON parsing
-            lines = [line for line in content.splitlines() if not line.strip().startswith("//")]
-            config_data = json.loads("\n".join(lines))
+            import re
+            stripped = re.sub(r'//.*|/\*.*?\*/', '', content, flags=re.DOTALL)
+            config_data = json.loads(stripped)
         except Exception as e:
             log(f"Existing config parsing warning ({e}). Backing up existing config...", "WARN")
             backup_path = OPENCODE_CONFIG_FILE.with_suffix(".jsonc.bak")

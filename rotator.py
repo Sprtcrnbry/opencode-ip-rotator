@@ -30,9 +30,9 @@ logging.basicConfig(
 )
 log = logging.getLogger("rotator")
 
-_rotation_lock = threading.Lock()
-_active_flows_count = 0
-_flow_lock = threading.Lock()
+rotation_lock = threading.Lock()
+active_flows_count = 0
+flow_lock = threading.Lock()
 _current_ip: Optional[str] = None
 rotation_count = 0
 
@@ -55,7 +55,7 @@ def get_public_ip() -> Optional[str]:
         except Exception:
             return None
 
-ip_history: List[Dict[str, any]] = []
+ip_history: List[Dict[str, Any]] = []
 
 def get_ip_location(ip: str) -> Dict[str, str]:
     """Fetches country, flag emoji, and location details for a given IP."""
@@ -102,86 +102,80 @@ def elevate() -> None:
 # -----------------------------------------------------------------------------
 def rotate_warp(reason: str = "Triggered") -> bool:
     global _current_ip, rotation_count
-    with _rotation_lock:
-        with _flow_lock:
-            if _active_flows_count > 0:
-                log.info(f"IP rotation skipped — {_active_flows_count} active flow(s) in progress.")
+    with rotation_lock:
+        with flow_lock:
+            if active_flows_count > 0:
+                log.info(f"IP rotation skipped — {active_flows_count} active flow(s) in progress.")
                 return False
 
-        old_ip = _current_ip or get_public_ip()
-        log.info(f"Initiating guaranteed IP rotation... (Reason: {reason} | Current IP: {old_ip})")
-        
-        max_attempts = 4
-        for attempt in range(1, max_attempts + 1):
-            try:
-                log.info(f"Rotation attempt {attempt}/{max_attempts}...")
-                # 1. Disconnect current tunnel
-                subprocess.run(["warp-cli", "--accept-tos", "disconnect"], capture_output=True, text=True, timeout=10, check=False)
-                time.sleep(1)
-                
-                # 2. Hard-reset registration identity (Forces Cloudflare Edge to issue a brand new IP)
-                subprocess.run(["warp-cli", "--accept-tos", "registration", "delete"], capture_output=True, text=True, timeout=10, check=False)
-                time.sleep(1)
-                subprocess.run(["warp-cli", "--accept-tos", "registration", "new"], capture_output=True, text=True, timeout=10, check=False)
-                time.sleep(1)
-                
-                # 3. Connect to fresh WARP node
-                res = subprocess.run(["warp-cli", "--accept-tos", "connect"], capture_output=True, text=True, timeout=10, check=False)
-                
-                if res.returncode == 0:
-                    time.sleep(3)
-                    new_ip = get_public_ip()
-                    
-                    # 4. Verify IP diversity (Must be strictly different from old_ip)
-                    if new_ip and new_ip != old_ip:
-                        _current_ip = new_ip
-                        rotation_count += 1
-                        loc = get_ip_location(new_ip)
-                        
-                        # Track IP history log
-                        timestamp_str = time.strftime("%H:%M:%S", time.localtime())
-                        ip_history.append({
-                            "ip": new_ip,
-                            "country": loc.get("country", "Unknown"),
-                            "flag": loc.get("flag", "🌐"),
-                            "timestamp": timestamp_str,
-                            "reason": reason
-                        })
-                        if len(ip_history) > 20:
-                            ip_history.pop(0)
+            old_ip = _current_ip or get_public_ip()
+            log.info(f"Initiating guaranteed IP rotation... (Reason: {reason} | Current IP: {old_ip})")
 
-                        # Persist IP rotation event to SQLite Database
-                        try:
-                            import sqlite3
-                            from pathlib import Path
-                            db_path = Path(os.environ.get("METRICS_DB_PATH", "/app/data/metrics.db"))
-                            if db_path.exists():
-                                conn = sqlite3.connect(str(db_path))
-                                cursor = conn.cursor()
-                                cursor.execute(
-                                    "INSERT INTO ip_history (ip, country, flag, timestamp, reason) VALUES (?, ?, ?, ?, ?)",
-                                    (new_ip, loc.get("country", "Unknown"), loc.get("flag", "🌐"), timestamp_str, reason)
-                                )
-                                conn.commit()
-                                conn.close()
-                        except Exception as err:
-                            log.error(f"Failed to write IP rotation to SQLite DB: {err}")
+            max_attempts = 4
+            for attempt in range(1, max_attempts + 1):
+                try:
+                    log.info(f"Rotation attempt {attempt}/{max_attempts}...")
+                    subprocess.run(["warp-cli", "--accept-tos", "disconnect"], capture_output=True, text=True, timeout=10, check=False)
+                    time.sleep(1)
 
-                        log.info(f"Guaranteed IP rotation successful! New Verified IP: {new_ip} {loc.get('flag')} ({loc.get('country')}) (Total Rotations: {rotation_count})")
-                        
-                        if rotation_count >= AUTO_RECYCLE_THRESHOLD:
-                            log.warning(f"Auto-recycle threshold reached ({rotation_count}/{AUTO_RECYCLE_THRESHOLD}). Triggering container refresh...")
-                            trigger_container_recycle()
+                    subprocess.run(["warp-cli", "--accept-tos", "registration", "delete"], capture_output=True, text=True, timeout=10, check=False)
+                    time.sleep(1)
+                    subprocess.run(["warp-cli", "--accept-tos", "registration", "new"], capture_output=True, text=True, timeout=10, check=False)
+                    time.sleep(1)
 
-                        return True
-                    else:
-                        log.warning(f"Attempt {attempt}: Assigned IP ({new_ip}) was identical to old IP ({old_ip}). Retrying fresh registration...")
-            except Exception as e:
-                log.error(f"Error during rotation attempt {attempt}: {e}")
-                time.sleep(1)
+                    res = subprocess.run(["warp-cli", "--accept-tos", "connect"], capture_output=True, text=True, timeout=10, check=False)
 
-        log.error(f"Failed to obtain a different IP address after {max_attempts} attempts.")
-        return False
+                    if res.returncode == 0:
+                        time.sleep(3)
+                        new_ip = get_public_ip()
+
+                        if new_ip and new_ip != old_ip:
+                            _current_ip = new_ip
+                            rotation_count += 1
+                            loc = get_ip_location(new_ip)
+
+                            timestamp_str = time.strftime("%H:%M:%S", time.localtime())
+                            ip_history.append({
+                                "ip": new_ip,
+                                "country": loc.get("country", "Unknown"),
+                                "flag": loc.get("flag", "🌐"),
+                                "timestamp": timestamp_str,
+                                "reason": reason
+                            })
+                            if len(ip_history) > 20:
+                                ip_history.pop(0)
+
+                            try:
+                                import sqlite3
+                                from pathlib import Path
+                                db_path = Path(os.environ.get("METRICS_DB_PATH", "/app/data/metrics.db"))
+                                if db_path.exists():
+                                    conn = sqlite3.connect(str(db_path))
+                                    cursor = conn.cursor()
+                                    cursor.execute(
+                                        "INSERT INTO ip_history (ip, country, flag, timestamp, reason) VALUES (?, ?, ?, ?, ?)",
+                                        (new_ip, loc.get("country", "Unknown"), loc.get("flag", "🌐"), timestamp_str, reason)
+                                    )
+                                    conn.commit()
+                                    conn.close()
+                            except Exception as err:
+                                log.error(f"Failed to write IP rotation to SQLite DB: {err}")
+
+                            log.info(f"Guaranteed IP rotation successful! New Verified IP: {new_ip} {loc.get('flag')} ({loc.get('country')}) (Total Rotations: {rotation_count})")
+
+                            if rotation_count >= AUTO_RECYCLE_THRESHOLD:
+                                log.warning(f"Auto-recycle threshold reached ({rotation_count}/{AUTO_RECYCLE_THRESHOLD}). Triggering container refresh...")
+                                trigger_container_recycle()
+
+                            return True
+                        else:
+                            log.warning(f"Attempt {attempt}: Assigned IP ({new_ip}) was identical to old IP ({old_ip}). Retrying fresh registration...")
+                except Exception as e:
+                    log.error(f"Error during rotation attempt {attempt}: {e}")
+                    time.sleep(1)
+
+            log.error(f"Failed to obtain a different IP address after {max_attempts} attempts.")
+            return False
 
 def trigger_container_recycle():
     """Triggers self-destruction/recycle script if inside container."""
@@ -218,8 +212,8 @@ def health_check_loop(endpoint: str, interval: int, initial_delay: int, max_retr
                     log.error(f"Maximum retry attempts ({max_retries}) reached. Pausing health check for 30s.")
                     time.sleep(30)
                     retry_count = 0
-        except Exception:
-            pass
+        except Exception as e:
+            log.debug(f"Health check error: {e}")
 
         stop_event.wait(interval)
 
