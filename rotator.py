@@ -24,7 +24,7 @@ AUTO_RECYCLE_THRESHOLD = int(os.environ.get("AUTO_RECYCLE_THRESHOLD", "50"))
 CUSTOM_OUTBOUND_PROXY = os.environ.get("CUSTOM_OUTBOUND_PROXY", "").strip()
 
 logging.basicConfig(
-    format="%(asctime)s [Rotator] %(levelname)s: %(message)s",
+    format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
     level=logging.INFO,
     datefmt="%Y-%m-%d %H:%M:%S",
 )
@@ -235,6 +235,10 @@ def start_rotator_http_server():
         
         rotator_app = FastAPI()
         
+        @rotator_app.get("/health")
+        def http_health():
+            return {"status": "healthy", "current_ip": _current_ip, "rotations": rotation_count}
+
         @rotator_app.post("/rotate")
         def http_rotate():
             success = rotate_warp(reason="Remote HTTP Dashboard Trigger")

@@ -1,8 +1,5 @@
 import subprocess
-import time
 import sys
-
-CONTAINER_NAME = "opencode_ephemeral_runner"
 
 def recreate_container():
     print("==================================================")

@@ -64,6 +64,64 @@ def test_completion_request(model_name="deepseek-v4-flash-free"):
         log(f"FAILED completion request: {e}", "ERROR")
         return False
 
+def test_messages_endpoint(model_name="deepseek-v4-flash-free"):
+    log(f"Testing POST /v1/messages (Anthropic format, Model: {model_name})...")
+    payload = {
+        "model": model_name,
+        "messages": [{"role": "user", "content": "Say hello in 3 words."}],
+        "stream": False,
+        "max_tokens": 100,
+    }
+    try:
+        req = Request(
+            f"{PROXY_URL}/v1/messages",
+            data=json.dumps(payload).encode("utf-8"),
+            headers={
+                "Content-Type": "application/json",
+                "x-api-key": "public",
+                "anthropic-version": "2023-06-01",
+            },
+            method="POST",
+        )
+        with urlopen(req, timeout=30) as resp:
+            if resp.status == 200:
+                data = json.loads(resp.read().decode("utf-8"))
+                content = ""
+                if "content" in data:
+                    blocks = data["content"]
+                    if blocks and isinstance(blocks, list):
+                        content = blocks[0].get("text", "")
+                log(f"SUCCESS: Anthropic Response -> '{content.strip()}'", "OK")
+                return True
+    except Exception as e:
+        log(f"FAILED messages request: {e}", "ERROR")
+        return False
+
+def test_responses_endpoint(model_name="deepseek-v4-flash-free"):
+    log(f"Testing POST /v1/responses (Responses API, Model: {model_name})...")
+    payload = {
+        "model": model_name,
+        "input": "Say hello in 3 words.",
+    }
+    try:
+        req = Request(
+            f"{PROXY_URL}/v1/responses",
+            data=json.dumps(payload).encode("utf-8"),
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": "Bearer public",
+            },
+            method="POST",
+        )
+        with urlopen(req, timeout=30) as resp:
+            if resp.status == 200:
+                data = json.loads(resp.read().decode("utf-8"))
+                log(f"SUCCESS: Responses API got status 200", "OK")
+                return True
+    except Exception as e:
+        log(f"FAILED responses request: {e}", "ERROR")
+        return False
+
 def main():
     print("=" * 60)
     print("    OpenCode IP Rotator & Proxy Integration Test (test.py)")
@@ -74,6 +132,8 @@ def main():
     
     if models:
         test_completion_request(models[0])
+        test_messages_endpoint(models[0])
+        test_responses_endpoint(models[0])
     
     print("=" * 60)
     print(" All Diagnostic Tests Completed!")
