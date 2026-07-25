@@ -807,13 +807,23 @@ async def chat_completions(raw_request: Request):
                 # Check HTTP status code for rate-limit or upstream error
                 if response.status_code == 429 or response.status_code >= 500:
                     metrics["rate_limited_requests"] += 1
+                    err_text = response.text.lower()
+                    
+                    # Distinguish Model/Provider-level limits vs. IP-level blocks
+                    is_model_specific_limit = any(k in err_text for k in ["model_rate_limit", "quota_exceeded", "per_model_limit", "credit_balance"])
+                    
                     import random
                     delay = (INITIAL_BACKOFF * (2 ** (attempt - 1))) + random.uniform(0.5, 1.5)
-                    log.warning(f"HTTP {response.status_code} returned for '{current_model}' (Attempt {attempt}/{MAX_RETRIES_ON_429}). Triggering IP Rotation & Retrying in {delay:.2f}s...")
                     
-                    rotate_warp(reason=f"HTTP {response.status_code} on {current_model}")
-                    time.sleep(delay)
-                    continue
+                    if is_model_specific_limit:
+                        log.warning(f"Model-level limit for '{current_model}'. Skipping IP rotation to prevent socket teardown. Retrying in {delay:.2f}s...")
+                        time.sleep(delay)
+                        continue
+                    else:
+                        log.warning(f"HTTP {response.status_code} (IP/Network block) for '{current_model}'. Triggering IP Rotation & Retrying in {delay:.2f}s...")
+                        rotate_warp(reason=f"HTTP {response.status_code} on {current_model}")
+                        time.sleep(delay)
+                        continue
 
                 metrics["successful_requests"] += 1
                 
@@ -851,21 +861,94 @@ async def chat_completions(raw_request: Request):
                         
         except Exception as e:
             error_msg = str(e)
-            if "429" in error_msg or (hasattr(e, "response") and getattr(e.response, "status_code", 0) == 429):
-                metrics["rate_limited_requests"] += 1
-                import random
-                delay = (INITIAL_BACKOFF * (2 ** (attempt - 1))) + random.uniform(0.5, 1.5)
-                log.warning(f"HTTP 429 encountered for '{current_model}' (Attempt {attempt}/{MAX_RETRIES_ON_429}). Triggering IP Rotation & Retrying in {delay:.2f}s...")
-                
-                rotate_warp(reason=f"HTTP 429 on {current_model}")
-                time.sleep(delay)
-                continue
-            else:
-                log.error(f"Target Connection Error: {e}")
-                time.sleep(1)
-                continue
+            log.error(f"Target Connection Error: {e}")
+            time.sleep(1)
+            continue
 
-    raise HTTPException(status_code=429, detail="Rate limit persisted after multiple IP rotations.")
+    raise HTTPException(status_code=429, detail="Rate limit persisted after multiple attempts.")
+
+# -----------------------------------------------------------------------------
+# Anthropic API Compatibility Endpoint (/v1/messages)
+# -----------------------------------------------------------------------------
+@app.post("/v1/messages")
+async def anthropic_messages(raw_request: Request):
+    """Native Anthropic API compatibility endpoint for Claude / Vercel AI SDK Anthropic provider."""
+    try:
+        body = await raw_request.json()
+    except Exception:
+        body = {}
+
+    model_name = body.get("model", "deepseek-v4-flash-free")
+    messages = body.get("messages", [])
+    stream = body.get("stream", False)
+    
+    # Translate Anthropic messages format to OpenAI format
+    openai_messages = []
+    system_prompt = body.get("system", "")
+    if system_prompt:
+        openai_messages.append({"role": "system", "content": system_prompt})
+        
+    for m in messages:
+        role = m.get("role", "user")
+        content = m.get("content", "")
+        if isinstance(content, list):
+            # Extract text parts
+            text_parts = [c.get("text", "") for c in content if isinstance(c, dict) and c.get("type") == "text"]
+            content = "\n".join(text_parts) if text_parts else str(content)
+        openai_messages.append({"role": role, "content": content})
+
+    openai_payload = {
+        "model": model_name,
+        "messages": openai_messages,
+        "stream": stream
+    }
+
+    headers = get_realistic_headers()
+    for k, v in raw_request.headers.items():
+        if k.lower().startswith("x-opencode-") or k.lower().startswith("anthropic-"):
+            headers[k] = v
+
+    try:
+        from curl_cffi import requests as cffi_requests
+        proxies = get_next_outbound_proxy()
+        response = cffi_requests.post(
+            TARGET_ZEN_URL,
+            json=openai_payload,
+            headers=headers,
+            impersonate="chrome124",
+            stream=stream,
+            proxies=proxies,
+            timeout=120
+        )
+        
+        if stream:
+            return StreamingResponse(
+                stream_openai_response(response, model_name),
+                media_type="text/event-stream"
+            )
+        else:
+            try:
+                res_json = response.json()
+                text_content = ""
+                if "choices" in res_json and len(res_json["choices"]) > 0:
+                    text_content = res_json["choices"][0].get("message", {}).get("content", "")
+                
+                anthropic_resp = {
+                    "id": f"msg_{int(time.time())}",
+                    "type": "message",
+                    "role": "assistant",
+                    "model": model_name,
+                    "content": [{"type": "text", "text": text_content}],
+                    "stop_reason": "end_turn",
+                    "stop_sequence": None,
+                    "usage": {"input_tokens": 50, "output_tokens": 100}
+                }
+                return JSONResponse(content=anthropic_resp)
+            except Exception:
+                return JSONResponse(content={"id": f"msg_{int(time.time())}", "type": "message", "role": "assistant", "content": [{"type": "text", "text": response.text}]})
+    except Exception as e:
+        log.error(f"Anthropic endpoint error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 # Initialize SQLite database and load historical metrics
 init_db()
