@@ -83,14 +83,6 @@ Running the project in Docker isolates the execution environment, preventing loc
 docker compose up -d --build
 ```
 
-Before using the manual rotation API, configure an administrator token in the environment running Compose:
-
-```bash
-ADMIN_TOKEN="replace-with-a-long-random-value" docker compose up -d --build
-```
-
-Call `POST /api/rotate` with `Authorization: Bearer <ADMIN_TOKEN>`. When no token is configured, manual rotation is intentionally disabled.
-
 #### Access Web Dashboard
 Open your browser and navigate to:
 `http://127.0.0.1:8000/dashboard`
@@ -217,13 +209,12 @@ The proxy pool rotates in round-robin order across all outbound requests.
 | `WARP_CHECK_INTERVAL` | `15` | Health check interval in seconds. |
 | `WARP_ROTATION_INTERVAL` | `300` | Periodic IP rotation interval in seconds. |
 | `AUTO_RECYCLE_THRESHOLD` | `50` | Maximum rotations before triggering container environment refresh. |
-| `ADMIN_TOKEN` | *(required for manual rotation)* | Bearer token required by `POST /api/rotate`. |
 | `CORS_ALLOW_ORIGINS` | `http://127.0.0.1:8000,http://localhost:8000` | Comma-separated browser origins allowed to call the proxy. |
 | `WARP_ROTATOR_URL` | `http://127.0.0.1:8001` | Internal rotator endpoint. Do not expose port 8001 publicly. |
 
 ### Rate-limit behavior
 
-The proxy preserves upstream `429` responses, including `Retry-After`, and does not treat them as a signal to bypass account, model, provider, or subscription limits. WARP is used only for an explicitly authorized manual network operation. In Docker, the proxy shares the rotator's network namespace so the egress path being checked is the path used for upstream requests.
+The proxy preserves upstream `429` responses, including `Retry-After`, and does not treat them as a signal to bypass account, model, provider, or subscription limits. The dashboard can trigger manual WARP rotation. In Docker, the proxy shares the rotator's network namespace so the egress path being checked is the path used for upstream requests.
 
 ---
 

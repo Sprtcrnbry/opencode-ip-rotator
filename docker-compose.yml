@@ -21,8 +21,8 @@ services:
       - PROXY_LIST_FILE=/app/data/proxies.txt
       - PROXY_LIST=${PROXY_LIST:-}
       - WARP_ROTATOR_URL=http://127.0.0.1:8001
-      - ADMIN_TOKEN=${ADMIN_TOKEN:-}
       - CORS_ALLOW_ORIGINS=${CORS_ALLOW_ORIGINS:-http://127.0.0.1:8000,http://localhost:8000}
+      - LOG_LEVEL=DEBUG
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
       interval: 30s

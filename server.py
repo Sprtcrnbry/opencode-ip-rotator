@@ -15,7 +15,7 @@ from urllib.error import HTTPError, URLError
 from urllib.request import Request as UrlRequest, urlopen
 
 import uvicorn
-from fastapi import FastAPI, Request, HTTPException, Depends
+from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import StreamingResponse, JSONResponse, HTMLResponse, Response
 from fastapi.templating import Jinja2Templates
 from fastapi.middleware.cors import CORSMiddleware
@@ -303,19 +303,6 @@ def _close_all_sessions():
 _discovery_stop = threading.Event()
 
 # -----------------------------------------------------------------------------
-# Auth Dependency
-# -----------------------------------------------------------------------------
-ADMIN_TOKEN = os.environ.get("ADMIN_TOKEN", "").strip()
-
-async def require_admin(request: Request):
-    if not ADMIN_TOKEN:
-        raise HTTPException(status_code=503, detail="ADMIN_TOKEN must be configured before manual rotation is enabled")
-    auth = request.headers.get("authorization", "")
-    if auth.startswith("Bearer ") and auth[7:] == ADMIN_TOKEN:
-        return True
-    raise HTTPException(status_code=403, detail="Forbidden")
-
-# -----------------------------------------------------------------------------
 # Request Queue (drains during rotation)
 # -----------------------------------------------------------------------------
 _rotation_in_progress = threading.Event()
@@ -482,15 +469,17 @@ discovered_models: List[Dict[str, str]] = DEFAULT_FREE_MODELS.copy()
 _discovery_lock = threading.Lock()
 
 LOG_FORMAT = os.environ.get("LOG_FORMAT", "text").lower()
+LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
+LOG_LEVEL_VALUE = getattr(logging, LOG_LEVEL, logging.INFO)
 
 if LOG_FORMAT == "json":
     _handler = logging.StreamHandler()
     _handler.setFormatter(JSONFormatter())
-    logging.basicConfig(level=logging.INFO, handlers=[_handler], force=True)
+    logging.basicConfig(level=LOG_LEVEL_VALUE, handlers=[_handler], force=True)
 else:
     logging.basicConfig(
         format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
-        level=logging.INFO,
+        level=LOG_LEVEL_VALUE,
         datefmt="%Y-%m-%d %H:%M:%S",
         force=True,
     )
@@ -578,16 +567,62 @@ def get_realistic_headers() -> Dict[str, str]:
     }
 
 
+SAFE_UPSTREAM_HEADERS = {
+    "content-type",
+    "retry-after",
+    "x-request-id",
+    "x-ratelimit-limit",
+    "x-ratelimit-remaining",
+    "x-ratelimit-reset",
+    "cf-ray",
+}
+SENSITIVE_LOG_KEYS = {"authorization", "api_key", "apikey", "token", "password", "secret"}
+
+
+def redact_for_log(value):
+    if isinstance(value, dict):
+        return {
+            key: "[redacted]"
+            if any(marker in key.lower().replace("-", "_") for marker in SENSITIVE_LOG_KEYS)
+            else redact_for_log(item)
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [redact_for_log(item) for item in value]
+    if isinstance(value, str) and len(value) > 1000:
+        return value[:1000] + "...[truncated]"
+    return value
+
+
+def log_upstream_response(response, model_name: str, endpoint: str, attempt: int, uses_proxy: bool) -> None:
+    headers = {
+        key: value
+        for key, value in response.headers.items()
+        if key.lower() in SAFE_UPSTREAM_HEADERS
+    }
+    log.debug(
+        "Upstream response model=%s endpoint=%s attempt=%s status=%s uses_proxy=%s headers=%s",
+        model_name,
+        endpoint,
+        attempt,
+        response.status_code,
+        uses_proxy,
+        headers,
+    )
+
+
 def upstream_rate_limit_response(response, model_name: str) -> JSONResponse:
     category, retry_seconds, payload = classify_upstream_429(response)
     headers = {"X-Rate-Limit-Reason": category}
     if retry_seconds is not None:
         headers["Retry-After"] = str(retry_seconds)
     log.warning(
-        "Upstream 429 for model '%s' classified as %s (retry_after=%s); not rotating egress.",
+        "Upstream 429 for model '%s' classified as %s (retry_after=%s); headers=%s payload=%s",
         model_name,
         category,
         retry_seconds,
+        {key: value for key, value in response.headers.items() if key.lower() in SAFE_UPSTREAM_HEADERS},
+        redact_for_log(payload),
     )
     return JSONResponse(status_code=429, content=payload, headers=headers)
 
@@ -725,7 +760,7 @@ async def metrics_prometheus():
     return Response(content=generate_latest(), media_type=CONTENT_TYPE_LATEST)
 
 @app.post("/api/rotate")
-async def manual_rotate(_: bool = Depends(require_admin)):
+async def manual_rotate():
     signal_rotation_start()
     try:
         started = time.monotonic()
@@ -883,6 +918,7 @@ async def chat_completions(raw_request: Request):
                 proxies=proxies,
                 timeout=STREAM_TIMEOUT if is_stream else 120
             )
+            log_upstream_response(response, current_model, "chat_completions", attempt, proxies is not None)
 
             if response.status_code == 429:
                 metrics["rate_limited_requests"] += 1
@@ -998,6 +1034,7 @@ async def anthropic_messages(raw_request: Request):
                 proxies=proxies,
                 timeout=STREAM_TIMEOUT if is_stream else 120,
             )
+            log_upstream_response(response, model_name, "messages", attempt, proxies is not None)
 
             if response.status_code == 429:
                 metrics["rate_limited_requests"] += 1
@@ -1083,6 +1120,7 @@ async def responses_endpoint(raw_request: Request):
                 proxies=proxies,
                 timeout=STREAM_TIMEOUT if is_stream else 120,
             )
+            log_upstream_response(response, model_name, "responses", attempt, proxies is not None)
 
             if response.status_code == 429:
                 metrics["rate_limited_requests"] += 1
