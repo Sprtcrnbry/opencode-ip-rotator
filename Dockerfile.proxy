@@ -19,6 +19,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy server code, rotator helper, and dashboard template
 COPY server.py .
+COPY rate_limits.py .
 COPY rotator.py .
 COPY templates/ ./templates/
 

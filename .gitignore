@@ -10,6 +10,7 @@ __pycache__/
 env/
 venv/
 ENV/
+.env
 
 # Logs & Temp files
 *.log
@@ -23,8 +24,8 @@ ENV/
 # Data & SQLite DB
 data/
 *.db
+proxies.txt
 
 # Cloned reference repos
 opencode-src/
 opencode-src-shallow/
-

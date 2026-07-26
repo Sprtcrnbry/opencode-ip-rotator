@@ -13,14 +13,14 @@ A microservice-architected Cloudflare WARP IP rotator and proxy server for OpenC
 
 ## Key Features
 
-- **Guaranteed IP Diversity**: Uses `warp-cli registration delete & new` cycles to request a distinct public IP address on every rotation.
+- **Verified Shared Egress**: The proxy and WARP service share one network namespace, so the observed egress path is the path used for upstream requests.
 - **Microservices Architecture**: Decoupled `proxy-server` (FastAPI) and `warp-rotator` (Cloudflare WARP daemon) services built with Docker Compose.
 - **Clean Management Dashboard**: Lightweight Web UI displaying active connections, current location, token statistics, and manual rotation controls.
 - **SQLite Data Persistence**: Stores token consumption, model request counts, and historical IP rotation logs on disk.
 - **USD Savings Calculator**: Estimates cost savings per model based on prompt and completion token rates.
 - **Table Pagination**: Built-in 5-item pagination for model usage and IP rotation log tables.
 - **Active Flow Locking**: Protects active SSE streams from being interrupted during IP rotation — `_active_flows_count` is held for the **full lifetime of the generator**, not just until `return`.
-- **Smart Rate Limit Detection**: Distinguishes IP-level blocks (triggers WARP rotation) from model-level quota limits (skips rotation to prevent TCP socket teardown).
+- **Rate-limit Preservation**: Returns upstream 429 details and `Retry-After` without attempting to bypass model, account, provider, or subscription limits.
 - **Anthropic API Compatibility**: Native `/v1/messages` endpoint for Claude clients and the Vercel AI SDK `@ai-sdk/anthropic` provider.
 - **Custom Proxy Pool Support**: Round-robin outbound proxy pool via `data/proxies.txt` or `PROXY_LIST` environment variable.
 
@@ -42,7 +42,7 @@ A microservice-architected Cloudflare WARP IP rotator and proxy server for OpenC
 ### Core Architecture Components
 
 1. **Proxy Server (`server.py`):** An OpenAI-compatible API proxy server running on `http://127.0.0.1:8000/v1`. It processes requests, forwards headers dynamically, handles streaming SSE responses, and presents a Web Management Dashboard.
-2. **Rotator Module (`rotator.py`):** Monitors network traffic and status codes. Upon encountering an HTTP 429 response, it triggers an automated `warp-cli` disconnect/reconnect cycle, verifies public IP changes using external validation endpoints, and retries the failed request.
+2. **Rotator Module (`rotator.py`):** Owns the WARP network namespace and exposes a private health/rotation control endpoint. Manual rotation is authenticated; upstream 429 responses are not used as a rotation trigger.
 3. **Container Manager (`manager.py`):** Provides automated ephemeral container lifecycle management. Triggers container self-destruction and re-creation once a defined rotation threshold is reached to ensure fresh hardware identifiers (`machine-id`).
 
 ---
@@ -82,6 +82,14 @@ Running the project in Docker isolates the execution environment, preventing loc
 ```bash
 docker compose up -d --build
 ```
+
+Before using the manual rotation API, configure an administrator token in the environment running Compose:
+
+```bash
+ADMIN_TOKEN="replace-with-a-long-random-value" docker compose up -d --build
+```
+
+Call `POST /api/rotate` with `Authorization: Bearer <ADMIN_TOKEN>`. When no token is configured, manual rotation is intentionally disabled.
 
 #### Access Web Dashboard
 Open your browser and navigate to:
@@ -209,6 +217,13 @@ The proxy pool rotates in round-robin order across all outbound requests.
 | `WARP_CHECK_INTERVAL` | `15` | Health check interval in seconds. |
 | `WARP_ROTATION_INTERVAL` | `300` | Periodic IP rotation interval in seconds. |
 | `AUTO_RECYCLE_THRESHOLD` | `50` | Maximum rotations before triggering container environment refresh. |
+| `ADMIN_TOKEN` | *(required for manual rotation)* | Bearer token required by `POST /api/rotate`. |
+| `CORS_ALLOW_ORIGINS` | `http://127.0.0.1:8000,http://localhost:8000` | Comma-separated browser origins allowed to call the proxy. |
+| `WARP_ROTATOR_URL` | `http://127.0.0.1:8001` | Internal rotator endpoint. Do not expose port 8001 publicly. |
+
+### Rate-limit behavior
+
+The proxy preserves upstream `429` responses, including `Retry-After`, and does not treat them as a signal to bypass account, model, provider, or subscription limits. WARP is used only for an explicitly authorized manual network operation. In Docker, the proxy shares the rotator's network namespace so the egress path being checked is the path used for upstream requests.
 
 ---
 

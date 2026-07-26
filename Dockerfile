@@ -39,6 +39,7 @@ WORKDIR /app
 # Copy rotator script and zen server
 COPY rotator.py /app/rotator.py
 COPY server.py /app/server.py
+COPY rate_limits.py /app/rate_limits.py
 
 # Entrypoint script to handle DBus, WARP service, Zen Server and Rotator
 RUN echo '#!/bin/bash\n\
