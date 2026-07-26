@@ -101,10 +101,31 @@ active_flows_count = 0
 flow_lock = threading.Lock()
 _current_ip: Optional[str] = None
 rotation_count = 0
+FLOW_LEASE_DB_PATH = Path(os.environ.get("METRICS_DB_PATH", "/app/data/metrics.db"))
 
 # -----------------------------------------------------------------------------
 # Helpers
 # -----------------------------------------------------------------------------
+def has_active_flow_leases() -> bool:
+    """Read proxy-owned stream leases from the shared metrics database."""
+    if not FLOW_LEASE_DB_PATH.exists():
+        return False
+    try:
+        conn = sqlite3.connect(str(FLOW_LEASE_DB_PATH), timeout=5)
+        try:
+            conn.execute("DELETE FROM active_flow_leases WHERE expires_at <= ?", (time.time(),))
+            row = conn.execute("SELECT 1 FROM active_flow_leases LIMIT 1").fetchone()
+            return row is not None
+        finally:
+            conn.close()
+    except sqlite3.OperationalError as exc:
+        # During proxy startup the table may not exist yet; never turn a DB
+        # read race into an unguarded rotation.
+        if "no such table" not in str(exc).lower():
+            log.warning("Unable to inspect active stream leases: %s", exc)
+        return True
+
+
 def get_public_ip() -> Optional[str]:
     """Fetches current public IP using Chrome TLS impersonation."""
     try:
@@ -205,8 +226,8 @@ def rotate_warp(reason: str = "Triggered") -> bool:
     global _current_ip, rotation_count
     with rotation_lock:
         with flow_lock:
-            if active_flows_count > 0:
-                log.info(f"IP rotation skipped — {active_flows_count} active flow(s) in progress.")
+            if active_flows_count > 0 or has_active_flow_leases():
+                log.info("IP rotation skipped — an active streaming flow lease is in progress.")
                 return False
 
             old_ip = _current_ip or get_public_ip()
@@ -375,6 +396,9 @@ def periodic_rotation_loop(interval: int, stop_event: threading.Event) -> None:
     while not stop_event.is_set():
         if stop_event.wait(interval):
             break
+        if has_active_flow_leases():
+            log.info("Scheduled IP rotation deferred — an active streaming flow lease is in progress.")
+            continue
         rotate_warp(reason="Scheduled Interval")
 
 def start_rotator_http_server():

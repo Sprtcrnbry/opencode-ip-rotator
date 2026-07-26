@@ -7,6 +7,7 @@ import signal
 import sqlite3
 import threading
 import time
+import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import AsyncGenerator, Dict, List, Optional
@@ -22,7 +23,8 @@ from pydantic import BaseModel, Field
 from prometheus_client import Counter, Gauge, Histogram, generate_latest, CONTENT_TYPE_LATEST
 
 from curl_cffi import requests as cffi_requests
-from rotator import rotate_warp, flow_lock, active_flows_count, get_public_ip, get_ip_location, rotation_count
+from rate_limits import classify_upstream_429
+from rotator import flow_lock, active_flows_count, get_public_ip, get_ip_location, rotation_count
 
 # -----------------------------------------------------------------------------
 # Constants
@@ -41,6 +43,8 @@ DASHBOARD_REFRESH_INTERVAL = 3
 STARTUP_TIME = time.time()
 ENABLE_HTTP2 = os.environ.get("ENABLE_HTTP2", "false").lower() in ("true", "1", "yes")
 STREAM_TIMEOUT = 600
+FLOW_LEASE_TTL_SECONDS = int(os.environ.get("FLOW_LEASE_TTL_SECONDS", "90"))
+FLOW_LEASE_HEARTBEAT_SECONDS = int(os.environ.get("FLOW_LEASE_HEARTBEAT_SECONDS", "15"))
 
 # -----------------------------------------------------------------------------
 # JSON Structured Logging
@@ -174,6 +178,29 @@ def init_db():
             new_ip TEXT
         )
     """)
+    _db_execute("""
+        CREATE TABLE IF NOT EXISTS active_flow_leases (
+            lease_id TEXT PRIMARY KEY,
+            expires_at REAL NOT NULL
+        )
+    """)
+
+
+def acquire_flow_lease() -> str:
+    lease_id = uuid.uuid4().hex
+    touch_flow_lease(lease_id)
+    return lease_id
+
+
+def touch_flow_lease(lease_id: str) -> None:
+    _db_execute(
+        "INSERT OR REPLACE INTO active_flow_leases (lease_id, expires_at) VALUES (?, ?)",
+        (lease_id, time.time() + FLOW_LEASE_TTL_SECONDS),
+    )
+
+
+def release_flow_lease(lease_id: str) -> None:
+    _db_execute("DELETE FROM active_flow_leases WHERE lease_id = ?", (lease_id,))
 
 def log_ip_rotation_to_db(ip: str, country: str, flag: str, timestamp: str, reason: str):
     try:
@@ -282,7 +309,7 @@ ADMIN_TOKEN = os.environ.get("ADMIN_TOKEN", "").strip()
 
 async def require_admin(request: Request):
     if not ADMIN_TOKEN:
-        return True
+        raise HTTPException(status_code=503, detail="ADMIN_TOKEN must be configured before manual rotation is enabled")
     auth = request.headers.get("authorization", "")
     if auth.startswith("Bearer ") and auth[7:] == ADMIN_TOKEN:
         return True
@@ -427,6 +454,12 @@ TARGET_ZEN_RESPONSES_URL = f"{TARGET_ZEN_BASE}/responses"
 
 MAX_RETRIES_ON_429 = int(os.environ.get("MAX_RETRIES_ON_429", "8"))
 INITIAL_BACKOFF = float(os.environ.get("INITIAL_BACKOFF", "1"))
+WARP_ROTATOR_URL = os.environ.get("WARP_ROTATOR_URL", "http://127.0.0.1:8001").rstrip("/")
+CORS_ALLOW_ORIGINS = [
+    origin.strip()
+    for origin in os.environ.get("CORS_ALLOW_ORIGINS", "http://127.0.0.1:8000,http://localhost:8000").split(",")
+    if origin.strip()
+]
 
 metrics = {
     "total_requests": 0,
@@ -478,8 +511,8 @@ app = FastAPI(title="OpenCode Zen v3.0 Ultra Resilient Proxy", lifespan=lifespan
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
+    allow_origins=CORS_ALLOW_ORIGINS,
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -541,14 +574,35 @@ def get_realistic_headers() -> Dict[str, str]:
         "Content-Type": "application/json",
         "Authorization": "Bearer public",
         "Accept": "application/json, text/event-stream, */*",
-        "Accept-Language": "en-US,en;q=0.9",
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
-        "Origin": "https://opencode.ai",
-        "Referer": "https://opencode.ai/",
-        "Sec-Fetch-Dest": "empty",
-        "Sec-Fetch-Mode": "cors",
-        "Sec-Fetch-Site": "same-origin",
+        "User-Agent": "OpenCode-IP-Rotator/1.0",
     }
+
+
+def upstream_rate_limit_response(response, model_name: str) -> JSONResponse:
+    category, retry_seconds, payload = classify_upstream_429(response)
+    headers = {"X-Rate-Limit-Reason": category}
+    if retry_seconds is not None:
+        headers["Retry-After"] = str(retry_seconds)
+    log.warning(
+        "Upstream 429 for model '%s' classified as %s (retry_after=%s); not rotating egress.",
+        model_name,
+        category,
+        retry_seconds,
+    )
+    return JSONResponse(status_code=429, content=payload, headers=headers)
+
+
+def rotate_egress(reason: str) -> tuple[bool, Optional[str]]:
+    """Request rotation from the service that owns the shared WARP namespace."""
+    try:
+        response = cffi_requests.post(f"{WARP_ROTATOR_URL}/rotate", timeout=35)
+        data = response.json() if response.headers.get("content-type", "").startswith("application/json") else {}
+        if response.status_code == 200 and data.get("status") == "success":
+            return True, data.get("verified_ip")
+        return False, None
+    except Exception as exc:
+        log.warning("Rotator request failed: %s", exc)
+        return False, None
 
 class EmptyStreamError(Exception):
     """Raised when upstream returns an empty or truncated stream without valid content/tool calls."""
@@ -561,6 +615,17 @@ async def stream_response(response, model_name: str, session=None) -> AsyncGener
     with flow_lock:
         active_flows_count += 1
         prom_active_flows.set(active_flows_count)
+    lease_id = await asyncio.to_thread(acquire_flow_lease)
+
+    async def keep_flow_lease_alive():
+        try:
+            while True:
+                await asyncio.sleep(FLOW_LEASE_HEARTBEAT_SECONDS)
+                await asyncio.to_thread(touch_flow_lease, lease_id)
+        except asyncio.CancelledError:
+            return
+
+    lease_heartbeat = asyncio.create_task(keep_flow_lease_alive())
 
     chunk_count = 0
     last_raw_line = ""
@@ -639,6 +704,9 @@ async def stream_response(response, model_name: str, session=None) -> AsyncGener
         log.error(f"Stream exception caught for model '{model_name}': {type(e).__name__}: {e}", exc_info=True)
         yield b"\ndata: [DONE]\n\n"
     finally:
+        lease_heartbeat.cancel()
+        await asyncio.gather(lease_heartbeat, return_exceptions=True)
+        await asyncio.to_thread(release_flow_lease, lease_id)
         with flow_lock:
             active_flows_count = max(0, active_flows_count - 1)
             prom_active_flows.set(active_flows_count)
@@ -657,25 +725,16 @@ async def metrics_prometheus():
     return Response(content=generate_latest(), media_type=CONTENT_TYPE_LATEST)
 
 @app.post("/api/rotate")
-async def manual_rotate(raw_request: Request):
-    origin = raw_request.headers.get("origin", "") or raw_request.headers.get("referer", "")
-    if origin and "opencode" not in origin and "localhost" not in origin and "127.0.0.1" not in origin:
-        log.warning(f"Cross-origin rotate attempt blocked: {origin}")
-        raise HTTPException(status_code=403, detail="Cross-origin rotation blocked")
+async def manual_rotate(_: bool = Depends(require_admin)):
     signal_rotation_start()
     try:
-        result = rotate_warp(reason="Manual Web Dashboard Trigger")
+        started = time.monotonic()
+        result, verified_ip = await asyncio.to_thread(rotate_egress, "Manual API trigger")
+        record_warp_rotation(result, (time.monotonic() - started) * 1000, new_ip=verified_ip or "")
         if result:
             swap_warp_registration()
-            return {"status": "success", "verified_ip": get_public_ip()}
-        try:
-            resp = cffi_requests.post("http://warp-rotator:8001/rotate", timeout=35)
-            if resp.status_code == 200:
-                swap_warp_registration()
-                return resp.json()
-        except Exception:
-            pass
-        return {"status": "queued", "message": "Rotation queued or already in progress"}
+            return {"status": "success", "verified_ip": verified_ip}
+        raise HTTPException(status_code=503, detail="WARP rotator did not complete the requested rotation")
     finally:
         signal_rotation_done()
 
@@ -704,7 +763,7 @@ async def get_metrics():
 
     def fetch_rotator_status():
         try:
-            r = cffi_requests.get("http://warp-rotator:8001/status", impersonate="chrome124", timeout=4)
+            r = cffi_requests.get(f"{WARP_ROTATOR_URL}/status", impersonate="chrome124", timeout=4)
             if r.status_code == 200:
                 return r.json()
         except Exception as e:
@@ -741,6 +800,7 @@ async def get_metrics():
     return {
         "uptime_seconds": uptime,
         "verified_public_ip": rotator_ip,
+        "egress_verification_scope": "shared proxy and WARP network namespace",
         "location": rotator_location,
         "total_rotations": rotator_rotations,
         "metrics": metrics,
@@ -824,26 +884,16 @@ async def chat_completions(raw_request: Request):
                 timeout=STREAM_TIMEOUT if is_stream else 120
             )
 
-            if response.status_code == 429 or response.status_code >= 500:
+            if response.status_code == 429:
                 metrics["rate_limited_requests"] += 1
                 prom_requests_rate_limited.labels(model=current_model).inc()
-                err_text = response.text.lower()
-                is_model_specific_limit = any(k in err_text for k in ["model_rate_limit", "quota_exceeded", "per_model_limit", "credit_balance", "insufficient_quota", "freeusagelimiterror", "free_usage_limit"])
-                delay = compute_backoff_delay(attempt, INITIAL_BACKOFF)
+                return upstream_rate_limit_response(response, current_model)
 
-                if is_model_specific_limit:
-                    log.warning(f"Model-level limit for '{current_model}'. Skipping IP rotation. Retrying in {delay:.2f}s...")
-                    await asyncio.sleep(delay)
-                    continue
-                else:
-                    log.warning(f"HTTP {response.status_code} (IP block) for '{current_model}'. Rotating IP & retrying in {delay:.2f}s...")
-                    t0 = time.monotonic()
-                    ok = rotate_warp(reason=f"HTTP {response.status_code} on {current_model}")
-                    record_warp_rotation(ok, (time.monotonic() - t0) * 1000)
-                    if ok:
-                        swap_warp_registration()
-                    await asyncio.sleep(delay)
-                    continue
+            if response.status_code >= 500:
+                delay = compute_backoff_delay(attempt, INITIAL_BACKOFF)
+                log.warning("Upstream HTTP %s for '%s'; retrying without egress rotation in %.2fs.", response.status_code, current_model, delay)
+                await asyncio.sleep(delay)
+                continue
 
             metrics["successful_requests"] += 1
             prom_requests_success.labels(model=current_model).inc()
@@ -863,12 +913,7 @@ async def chat_completions(raw_request: Request):
                         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no", "Connection": "keep-alive"}
                     )
                 except EmptyStreamError:
-                    log.warning(f"Empty stream detected for '{current_model}'. Rotating IP and retrying (Attempt {attempt}/{MAX_RETRIES_ON_429})...")
-                    t0 = time.monotonic()
-                    ok = rotate_warp(reason=f"Empty stream on {current_model}")
-                    record_warp_rotation(ok, (time.monotonic() - t0) * 1000)
-                    if ok:
-                        swap_warp_registration()
+                    log.warning("Empty stream for '%s'; retrying without egress rotation (%s/%s).", current_model, attempt, MAX_RETRIES_ON_429)
                     delay = compute_backoff_delay(attempt, INITIAL_BACKOFF)
                     await asyncio.sleep(delay)
                     continue
@@ -954,16 +999,14 @@ async def anthropic_messages(raw_request: Request):
                 timeout=STREAM_TIMEOUT if is_stream else 120,
             )
 
-            if response.status_code in (429, 500) or response.status_code >= 500:
+            if response.status_code == 429:
                 metrics["rate_limited_requests"] += 1
                 prom_requests_rate_limited.labels(model=model_name).inc()
+                return upstream_rate_limit_response(response, model_name)
+
+            if response.status_code >= 500:
                 delay = compute_backoff_delay(attempt, INITIAL_BACKOFF)
-                log.warning(f"HTTP {response.status_code} on '{model_name}'. Rotating IP & retrying in {delay:.2f}s...")
-                t0 = time.monotonic()
-                ok = rotate_warp(reason=f"HTTP {response.status_code} on {model_name}")
-                record_warp_rotation(ok, (time.monotonic() - t0) * 1000)
-                if ok:
-                    swap_warp_registration()
+                log.warning("Upstream HTTP %s for '%s'; retrying without egress rotation in %.2fs.", response.status_code, model_name, delay)
                 await asyncio.sleep(delay)
                 continue
 
@@ -1041,16 +1084,14 @@ async def responses_endpoint(raw_request: Request):
                 timeout=STREAM_TIMEOUT if is_stream else 120,
             )
 
-            if response.status_code == 429 or response.status_code >= 500:
+            if response.status_code == 429:
                 metrics["rate_limited_requests"] += 1
                 prom_requests_rate_limited.labels(model=model_name).inc()
+                return upstream_rate_limit_response(response, model_name)
+
+            if response.status_code >= 500:
                 delay = compute_backoff_delay(attempt, INITIAL_BACKOFF)
-                log.warning(f"HTTP {response.status_code} on '{model_name}'. Rotating IP & retrying in {delay:.2f}s...")
-                t0 = time.monotonic()
-                ok = rotate_warp(reason=f"HTTP {response.status_code} on {model_name}")
-                record_warp_rotation(ok, (time.monotonic() - t0) * 1000)
-                if ok:
-                    swap_warp_registration()
+                log.warning("Upstream HTTP %s for '%s'; retrying without egress rotation in %.2fs.", response.status_code, model_name, delay)
                 await asyncio.sleep(delay)
                 continue
 
