@@ -830,35 +830,47 @@ async def stream_response(response, model_name: str, session=None) -> AsyncGener
             yield b_line + b"\n"
 
         # Step 2: Continue streaming remaining lines
-        while True:
-            item = await loop.run_in_executor(None, get_next_line, line_iter)
-            if item == "STOP_ITERATION":
-                log.info(f"[STREAM DEBUG] Upstream reached natural StopIteration for '{model_name}'. Total lines: {chunk_count}")
-                break
-            if item == "SOCKET_ERROR":
-                log.warning(f"[STREAM DEBUG] Upstream connection aborted via socket error for '{model_name}'. Lines sent: {chunk_count}")
+        seen_done = False
+        for b_line in buffered_lines:
+            raw_text = b_line.decode("utf-8", errors="ignore").strip()
+            if raw_text == "data: [DONE]" or raw_text.startswith("data: [DONE]"):
+                seen_done = True
                 break
 
-            line = item
-            if line:
-                chunk_count += 1
-                try:
-                    last_raw_line = line.decode("utf-8", errors="ignore")
-                except Exception:
-                    pass
-                yield line + b"\n"
-            else:
-                yield b"\n"
+        if not seen_done:
+            while True:
+                item = await loop.run_in_executor(None, get_next_line, line_iter)
+                if item == "STOP_ITERATION":
+                    log.info(f"[STREAM DEBUG] Upstream reached natural StopIteration for '{model_name}'. Total lines: {chunk_count}")
+                    break
+                if item == "SOCKET_ERROR":
+                    log.warning(f"[STREAM DEBUG] Upstream connection aborted via socket error for '{model_name}'. Lines sent: {chunk_count}")
+                    break
 
+                line = item
+                if line:
+                    chunk_count += 1
+                    raw_text = line.decode("utf-8", errors="ignore").strip()
+                    if raw_text == "data: [DONE]" or raw_text.startswith("data: [DONE]"):
+                        seen_done = True
+                        yield b"data: [DONE]\n\n"
+                        # Standard SSE terminates on [DONE]; break immediately to ignore trailing upstream metadata
+                        break
+                    yield line + b"\n"
+                else:
+                    yield b"\n"
+
+        if not seen_done:
+            yield b"data: [DONE]\n\n"
         log.info(f"Streaming completed successfully for model '{model_name}' ({chunk_count} lines sent).")
-        yield b"\ndata: [DONE]\n\n"
     except EmptyStreamError:
         raise
     except GeneratorExit:
-        log.warning(f"[STREAM DEBUG] Client (OpenCode) explicitly closed/aborted SSE connection prematurely for '{model_name}' after {chunk_count} lines.")
+        log.warning(f"[STREAM DEBUG] Client explicitly closed/aborted SSE connection for '{model_name}' after {chunk_count} lines.")
     except Exception as e:
         log.error(f"Stream exception caught for model '{model_name}': {type(e).__name__}: {e}", exc_info=True)
-        yield b"\ndata: [DONE]\n\n"
+        if not seen_done:
+            yield b"data: [DONE]\n\n"
     finally:
         lease_heartbeat.cancel()
         await asyncio.gather(lease_heartbeat, return_exceptions=True)
@@ -1058,6 +1070,16 @@ async def chat_completions(raw_request: Request):
                 await asyncio.sleep(delay)
                 continue
 
+            if response.status_code != 200:
+                try:
+                    res_json = response.json()
+                    return JSONResponse(status_code=response.status_code, content=res_json)
+                except Exception:
+                    return JSONResponse(
+                        status_code=response.status_code,
+                        content={"error": {"message": response.text or f"Upstream returned HTTP {response.status_code}", "type": "upstream_error", "code": response.status_code}}
+                    )
+
             metrics["successful_requests"] += 1
             prom_requests_success.labels(model=current_model).inc()
             prom_request_duration.labels(model=current_model, endpoint="chat_completions").observe(time.time() - start_time)
@@ -1066,9 +1088,6 @@ async def chat_completions(raw_request: Request):
                 try:
                     # Pre-verify that the response is not an empty stream before committing to StreamingResponse
                     stream_gen = stream_response(response, current_model, session=session)
-                    metrics["successful_requests"] += 1
-                    prom_requests_success.labels(model=current_model).inc()
-                    prom_request_duration.labels(model=current_model, endpoint="chat_completions").observe(time.time() - start_time)
                     track_token_usage(current_model, prompt_tokens=100, completion_tokens=150)
                     return StreamingResponse(
                         stream_gen,
@@ -1093,13 +1112,13 @@ async def chat_completions(raw_request: Request):
                         return JSONResponse(content=res_json)
                     except Exception:
                         track_token_usage(current_model, prompt_tokens=DEFAULT_PROMPT_TOKENS, completion_tokens=DEFAULT_COMPLETION_TOKENS)
-                        return {
+                        return JSONResponse(content={
                             "id": f"chatcmpl-zen-resp-{int(time.time())}",
                             "object": "chat.completion",
                             "created": int(time.time()),
                             "model": current_model,
                             "choices": [{"index": 0, "message": {"role": "assistant", "content": response.text}, "finish_reason": "stop"}]
-                        }
+                        })
 
         except Exception as e:
             log.error(f"[Attempt {attempt}/{MAX_RETRIES_ON_429}] Connection error for model '{current_model}': {type(e).__name__}: {e}")
@@ -1184,6 +1203,16 @@ async def anthropic_messages(raw_request: Request):
                 await asyncio.sleep(delay)
                 continue
 
+            if response.status_code != 200:
+                try:
+                    res_json = response.json()
+                    return JSONResponse(status_code=response.status_code, content=res_json)
+                except Exception:
+                    return JSONResponse(
+                        status_code=response.status_code,
+                        content={"error": {"type": "upstream_error", "message": response.text or f"HTTP {response.status_code}"}}
+                    )
+
             metrics["successful_requests"] += 1
             prom_requests_success.labels(model=model_name).inc()
             prom_request_duration.labels(model=model_name, endpoint="anthropic_messages").observe(time.time() - start_time)
@@ -1207,7 +1236,15 @@ async def anthropic_messages(raw_request: Request):
                         return JSONResponse(content=res_json)
                     except Exception:
                         track_token_usage(model_name, prompt_tokens=DEFAULT_PROMPT_TOKENS, completion_tokens=DEFAULT_COMPLETION_TOKENS)
-                        return JSONResponse(content=response.text)
+                        return JSONResponse(content={
+                            "id": f"msg-zen-{uuid.uuid4().hex[:12]}",
+                            "type": "message",
+                            "role": "assistant",
+                            "content": [{"type": "text", "text": response.text}],
+                            "model": model_name,
+                            "stop_reason": "end_turn",
+                            "usage": {"input_tokens": DEFAULT_PROMPT_TOKENS, "output_tokens": DEFAULT_COMPLETION_TOKENS}
+                        })
 
         except Exception as e:
             log.error(f"[Attempt {attempt}/{MAX_RETRIES_ON_429}] Anthropic endpoint error for model '{model_name}': {type(e).__name__}: {e}")
@@ -1222,6 +1259,9 @@ async def anthropic_messages(raw_request: Request):
         headers={"Retry-After": "10"}
     )
 
+# -----------------------------------------------------------------------------
+# OpenAI Responses API Endpoint (/v1/responses)
+# -----------------------------------------------------------------------------
 @app.post("/v1/responses")
 async def responses_endpoint(raw_request: Request):
     metrics["total_requests"] += 1
@@ -1276,6 +1316,16 @@ async def responses_endpoint(raw_request: Request):
                 await asyncio.sleep(delay)
                 continue
 
+            if response.status_code != 200:
+                try:
+                    res_json = response.json()
+                    return JSONResponse(status_code=response.status_code, content=res_json)
+                except Exception:
+                    return JSONResponse(
+                        status_code=response.status_code,
+                        content={"error": {"type": "upstream_error", "message": response.text or f"HTTP {response.status_code}"}}
+                    )
+
             metrics["successful_requests"] += 1
             prom_requests_success.labels(model=model_name).inc()
             prom_request_duration.labels(model=model_name, endpoint="responses").observe(time.time() - start_time)
@@ -1292,7 +1342,11 @@ async def responses_endpoint(raw_request: Request):
                         res_json = await asyncio.to_thread(response.json)
                         return JSONResponse(content=res_json)
                     except Exception:
-                        return JSONResponse(content=response.text)
+                        return JSONResponse(content={
+                            "id": f"resp-zen-{uuid.uuid4().hex[:12]}",
+                            "model": model_name,
+                            "output": response.text
+                        })
 
         except Exception as e:
             log.error(f"[Attempt {attempt}/{MAX_RETRIES_ON_429}] Responses endpoint error for model '{model_name}': {type(e).__name__}: {e}")
