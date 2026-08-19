@@ -8,6 +8,7 @@ import sqlite3
 import threading
 import time
 import uuid
+import ipaddress
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import AsyncGenerator, Dict, List, Optional
@@ -565,6 +566,50 @@ def get_realistic_headers() -> Dict[str, str]:
         "Accept": "application/json, text/event-stream, */*",
         "User-Agent": "OpenCode-IP-Rotator/1.0",
     }
+# Opencode CLI fingerprint (keep UA in sync with opencode releases).
+OPENCODE_UA = "opencode/latest/1.18.18/cli"
+
+
+def _is_loopback_ip(value: str) -> bool:
+    try:
+        return ipaddress.ip_address(value).is_loopback
+    except ValueError:
+        return False
+
+
+def build_opencode_headers(raw_request: Request) -> Dict[str, str]:
+    """Official opencode CLI fingerprint so Zen's free-tier limiter stops 429-ing.
+    Mirrors 9router custom-server buildHeaders(): always-fresh ses_/req_ ids +
+    project + client + UA. x-real-ip is forwarded best-effort but loopback is
+    dropped (127.0.0.1/::1 would collapse every local user into one shared bucket)."""
+    headers = get_realistic_headers()
+    headers["User-Agent"] = OPENCODE_UA
+    headers["x-opencode-client"] = "desktop"
+    headers["x-opencode-project"] = "/opencode"
+    # Fresh session + request ids every call (matches 9router buildHeaders): each
+    # upstream request gets its own bucket, no cross-request rate-limit collision.
+    headers["x-opencode-session"] = f"ses_{uuid.uuid4().hex}"
+    headers["x-opencode-request"] = f"req_{uuid.uuid4().hex}"
+
+    real_ip = raw_request.headers.get("x-real-ip")
+    if real_ip and not _is_loopback_ip(real_ip.strip()):
+        headers["x-real-ip"] = real_ip.strip()
+
+    # Preserve other downstream opencode/anthropic metadata headers.
+    for k, v in raw_request.headers.items():
+        kl = k.lower()
+        if kl.startswith("x-opencode-"):
+            if kl in (
+                "x-opencode-session",
+                "x-opencode-request",
+                "x-opencode-project",
+                "x-opencode-client",
+            ):
+                continue
+            headers[k] = v
+        elif kl.startswith("anthropic-"):
+            headers[k] = v
+    return headers
 
 
 SAFE_UPSTREAM_HEADERS = {
@@ -899,10 +944,7 @@ async def chat_completions(raw_request: Request):
     is_stream = payload.get("stream", False)
     log.info(f"Received request for model '{current_model}' (Stream: {is_stream} | Has Tools: {'tools' in payload})")
 
-    headers = get_realistic_headers()
-    for k, v in raw_request.headers.items():
-        if k.lower().startswith("x-opencode-"):
-            headers[k] = v
+    headers = build_opencode_headers(raw_request)
 
     for attempt in range(1, MAX_RETRIES_ON_429 + 1):
         try:
@@ -1012,13 +1054,8 @@ async def anthropic_messages(raw_request: Request):
         if auth.startswith("Bearer "):
             client_api_key = auth[7:]
 
-    headers = get_realistic_headers()
+    headers = build_opencode_headers(raw_request)
     headers["x-api-key"] = client_api_key or "public"
-
-    for k, v in raw_request.headers.items():
-        kl = k.lower()
-        if kl.startswith("x-opencode-") or kl.startswith("anthropic-"):
-            headers[k] = v
 
     for attempt in range(1, MAX_RETRIES_ON_429 + 1):
         try:
@@ -1101,10 +1138,7 @@ async def responses_endpoint(raw_request: Request):
     is_stream = body.get("stream", False)
     log.info(f"Received Responses API request for model '{model_name}' (Stream: {is_stream})")
 
-    headers = get_realistic_headers()
-    for k, v in raw_request.headers.items():
-        if k.lower().startswith("x-opencode-"):
-            headers[k] = v
+    headers = build_opencode_headers(raw_request)
 
     for attempt in range(1, MAX_RETRIES_ON_429 + 1):
         try:
