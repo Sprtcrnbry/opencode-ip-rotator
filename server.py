@@ -11,7 +11,7 @@ import uuid
 import ipaddress
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import AsyncGenerator, Dict, List, Optional
+from typing import Any, AsyncGenerator, Dict, List, Optional
 from urllib.error import HTTPError, URLError
 from urllib.request import Request as UrlRequest, urlopen
 
@@ -21,7 +21,7 @@ from fastapi.responses import StreamingResponse, JSONResponse, HTMLResponse, Res
 from fastapi.templating import Jinja2Templates
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
-from prometheus_client import Counter, Gauge, Histogram, generate_latest, CONTENT_TYPE_LATEST
+from prometheus_client import Counter, Gauge, Histogram, REGISTRY, generate_latest, CONTENT_TYPE_LATEST
 
 from curl_cffi import requests as cffi_requests
 from rate_limits import classify_upstream_429
@@ -253,14 +253,23 @@ def load_metrics_from_db() -> Dict[str, Dict[str, any]]:
 # -----------------------------------------------------------------------------
 # Prometheus Metrics
 # -----------------------------------------------------------------------------
-prom_requests_total = Counter("proxy_requests_total", "Total proxied requests", ["model", "endpoint"])
-prom_requests_success = Counter("proxy_requests_success", "Successful proxied requests", ["model"])
-prom_requests_rate_limited = Counter("proxy_requests_rate_limited", "Rate-limited requests", ["model"])
-prom_rotation_count = Counter("proxy_rotations_total", "Total WARP rotations")
-prom_active_flows = Gauge("proxy_active_flows", "Currently active streaming flows")
-prom_request_duration = Histogram("proxy_request_duration_seconds", "Request duration", ["model", "endpoint"],
-                                   buckets=(0.1, 0.5, 1.0, 2.0, 5.0, 10.0, 30.0, 60.0, 120.0))
-prom_warp_health = Gauge("proxy_warp_health", "WARP health (1=healthy, 0=unhealthy)")
+try:
+    prom_requests_total = Counter("proxy_requests_total", "Total proxied requests", ["model", "endpoint"])
+    prom_requests_success = Counter("proxy_requests_success", "Successful proxied requests", ["model"])
+    prom_requests_rate_limited = Counter("proxy_requests_rate_limited", "Rate-limited requests", ["model"])
+    prom_rotation_count = Counter("proxy_rotations_total", "Total WARP rotations")
+    prom_active_flows = Gauge("proxy_active_flows", "Currently active streaming flows")
+    prom_request_duration = Histogram("proxy_request_duration_seconds", "Request duration", ["model", "endpoint"],
+                                       buckets=(0.1, 0.5, 1.0, 2.0, 5.0, 10.0, 30.0, 60.0, 120.0))
+    prom_warp_health = Gauge("proxy_warp_health", "WARP health (1=healthy, 0=unhealthy)")
+except ValueError:
+    prom_requests_total = getattr(REGISTRY, "_names_to_collectors", {}).get("proxy_requests_total")
+    prom_requests_success = getattr(REGISTRY, "_names_to_collectors", {}).get("proxy_requests_success")
+    prom_requests_rate_limited = getattr(REGISTRY, "_names_to_collectors", {}).get("proxy_requests_rate_limited")
+    prom_rotation_count = getattr(REGISTRY, "_names_to_collectors", {}).get("proxy_rotations_total")
+    prom_active_flows = getattr(REGISTRY, "_names_to_collectors", {}).get("proxy_active_flows")
+    prom_request_duration = getattr(REGISTRY, "_names_to_collectors", {}).get("proxy_request_duration_seconds")
+    prom_warp_health = getattr(REGISTRY, "_names_to_collectors", {}).get("proxy_warp_health")
 
 # -----------------------------------------------------------------------------
 # curl_cffi Session Pool
