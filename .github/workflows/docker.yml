@@ -30,7 +30,7 @@ jobs:
         id: meta
         uses: docker/metadata-action@v5
         with:
-          images: ghcr.io/${{ github.repository }}
+          images: ghcr.io/sprtcrnbry/opencode-ip-rotator
           tags: |
             type=raw,value=latest,enable={{is_default_branch}}
             type=sha
@@ -52,6 +52,6 @@ jobs:
           context: .
           file: Dockerfile.warp
           push: true
-          tags: ghcr.io/${{ github.repository }}:warp
+          tags: ghcr.io/sprtcrnbry/opencode-ip-rotator:warp
           cache-from: type=gha
           cache-to: type=gha,mode=max
