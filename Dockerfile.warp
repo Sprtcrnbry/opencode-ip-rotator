@@ -1,22 +1,19 @@
-FROM ubuntu:22.04
+FROM python:3.11-slim
 
 ENV DEBIAN_FRONTEND=noninteractive
 ENV WARP_LOG_LEVEL=info
 
-RUN apt-get update && apt-get install -y \
+# Base utils. warp-svc needs dbus + iptables; rotator.py shells out to warp-cli.
+# `sudo`/`net-tools`/`iproute2` are not required by the entrypoint.
+RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
     gnupg \
     lsb-release \
-    sudo \
-    python3 \
-    python3-pip \
     iptables \
     dbus \
-    net-tools \
-    iproute2 \
     && rm -rf /var/lib/apt/lists/*
 
-RUN pip3 install curl_cffi "fastapi" "uvicorn[standard]"
+RUN pip3 install curl_cffi
 
 RUN curl -fsSL https://pkg.cloudflareclient.com/pubkey.gpg | gpg --yes --dearmor --output /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg \
     && echo "deb [signed-by=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg] https://pkg.cloudflareclient.com/ $(lsb_release -cs) main" | tee /etc/apt/sources.list.d/cloudflare-client.list \
