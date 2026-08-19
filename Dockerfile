@@ -30,20 +30,19 @@ ENV WARP_LOG_LEVEL=info \
     DEBIAN_FRONTEND=noninteractive
 WORKDIR /app
 
-# Install iptables, dbus, and cloudflare-warp while purging setup tools
+# Install iptables, dbus, and cloudflare-warp
 RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
     gnupg \
     lsb-release \
     iptables \
     dbus \
+    ca-certificates \
     && curl -fsSL https://pkg.cloudflareclient.com/pubkey.gpg | gpg --yes --dearmor --output /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg \
     && echo "deb [signed-by=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg] https://pkg.cloudflareclient.com/ $(lsb_release -cs) main" | tee /etc/apt/sources.list.d/cloudflare-client.list \
     && apt-get update \
-    && apt-get install -y --no-install-recommends cloudflare-warp \
-    && apt-get purge -y gnupg lsb-release \
-    && apt-get autoremove -y \
-    && rm -rf /var/lib/apt/lists/* /var/cache/apt/*
+    && apt-get install -y cloudflare-warp \
+    && rm -rf /var/lib/apt/lists/*
 
 # rotator.py imports fastapi/uvicorn/curl_cffi for the :8001 listener
 RUN pip3 install --no-cache-dir curl_cffi "fastapi" "uvicorn[standard]"

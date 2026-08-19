@@ -97,7 +97,7 @@ jobs:
           fi
           echo "proxy smoketest ok"
 
-      - name: Verify rotator HTTP listener deps in warp image
+      - name: Verify rotator HTTP listener deps and warp-cli in warp image
         run: |
           docker run --rm --entrypoint '' ghcr.io/sprtcrnbry/opencode-ip-rotator:warp \
-            python3 -c "import fastapi, uvicorn, curl_cffi; print('rotator HTTP deps ok')"
+            sh -c "which warp-cli && warp-cli --version && python3 -c \"import fastapi, uvicorn, curl_cffi; print('rotator HTTP deps ok')\""
