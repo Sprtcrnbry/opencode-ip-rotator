@@ -78,9 +78,13 @@ Running the project in Docker isolates the execution environment, preventing loc
 - Docker Engine 20.10+
 - Docker Compose v2+
 
-#### Build and Launch
+#### Pull and Launch
+
+Images publish to GHCR on every push to `master` (see *Deploy from GitHub Container Registry* below). Log in once, then start — no local build required:
+
 ```bash
-docker compose up -d --build
+docker login ghcr.io
+docker compose up -d
 ```
 
 #### Access Web Dashboard
@@ -222,15 +226,13 @@ Every push to `master` publishes prebuilt images to GHCR (no local build needed)
 - `ghcr.io/sprtcrnbry/opencode-ip-rotator:latest` — proxy server (`Dockerfile.proxy`)
 - `ghcr.io/sprtcrnbry/opencode-ip-rotator:warp` — WARP rotator (`Dockerfile.warp`)
 
-Log in once, then pull and run:
+Log in once, then run. The default `docker-compose.yml` already references the
+published images, so no local build is needed:
 
 ```bash
 docker login ghcr.io -u Sprtcrnbry
-docker pull ghcr.io/sprtcrnbry/opencode-ip-rotator:latest
-docker compose -f docker-compose.ghcr.yml up -d
+docker compose up -d
 ```
-
-`docker-compose.ghcr.yml` references the published images instead of building locally.
 First run still needs `proxies.txt` (see Configuration); WARP registration happens
 inside the rotator container on startup.
 

@@ -1,8 +1,6 @@
 services:
   proxy-server:
-    build:
-      context: .
-      dockerfile: Dockerfile.proxy
+    image: ghcr.io/sprtcrnbry/opencode-ip-rotator:latest
     container_name: opencode_proxy_server
     # Shares the WARP network namespace. This makes the proxy's own outbound
     # requests use the same egress path that the rotator verifies.
@@ -31,9 +29,7 @@ services:
       start_period: 10s
 
   warp-rotator:
-    build:
-      context: .
-      dockerfile: Dockerfile.warp
+    image: ghcr.io/sprtcrnbry/opencode-ip-rotator:warp
     container_name: opencode_warp_rotator
     ports:
       - "8000:8000"
