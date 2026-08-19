@@ -1004,9 +1004,10 @@ async def chat_completions(raw_request: Request):
     headers = build_opencode_headers(raw_request)
 
     for attempt in range(1, MAX_RETRIES_ON_429 + 1):
+        session = None
         try:
             proxies = get_next_outbound_proxy()
-            session = _get_session("chat")
+            session = create_fresh_session(is_stream)
             response = session.post(
                 TARGET_ZEN_URL,
                 json=payload,
@@ -1054,7 +1055,6 @@ async def chat_completions(raw_request: Request):
 
             if is_stream:
                 try:
-                    # Pre-verify that the response is not an empty stream before committing to StreamingResponse
                     stream_gen = stream_response(response, current_model, session=session)
                     track_token_usage(current_model, prompt_tokens=100, completion_tokens=150)
                     return StreamingResponse(
@@ -1087,8 +1087,19 @@ async def chat_completions(raw_request: Request):
                             "model": current_model,
                             "choices": [{"index": 0, "message": {"role": "assistant", "content": response.text}, "finish_reason": "stop"}]
                         })
+                    finally:
+                        if session:
+                            try:
+                                session.close()
+                            except Exception:
+                                pass
 
         except Exception as e:
+            if session:
+                try:
+                    session.close()
+                except Exception:
+                    pass
             log.error(f"[Attempt {attempt}/{MAX_RETRIES_ON_429}] Connection error for model '{current_model}': {type(e).__name__}: {e}")
             if attempt < MAX_RETRIES_ON_429:
                 await asyncio.sleep(min(2 ** attempt, BACKOFF_CAP))
@@ -1135,9 +1146,10 @@ async def anthropic_messages(raw_request: Request):
     headers["x-api-key"] = effective_api_key
 
     for attempt in range(1, MAX_RETRIES_ON_429 + 1):
+        session = None
         try:
             proxies = get_next_outbound_proxy()
-            session = _get_session("anthropic")
+            session = create_fresh_session(is_stream)
             response = session.post(
                 TARGET_ZEN_ANTHROPIC_URL,
                 json=body,
@@ -1212,8 +1224,19 @@ async def anthropic_messages(raw_request: Request):
                             "stop_reason": "end_turn",
                             "usage": {"input_tokens": DEFAULT_PROMPT_TOKENS, "output_tokens": DEFAULT_COMPLETION_TOKENS}
                         })
+                    finally:
+                        if session:
+                            try:
+                                session.close()
+                            except Exception:
+                                pass
 
         except Exception as e:
+            if session:
+                try:
+                    session.close()
+                except Exception:
+                    pass
             log.error(f"[Attempt {attempt}/{MAX_RETRIES_ON_429}] Anthropic endpoint error for model '{model_name}': {type(e).__name__}: {e}")
             if attempt < MAX_RETRIES_ON_429:
                 await asyncio.sleep(min(2 ** attempt, BACKOFF_CAP))
@@ -1248,9 +1271,10 @@ async def responses_endpoint(raw_request: Request):
     headers = build_opencode_headers(raw_request)
 
     for attempt in range(1, MAX_RETRIES_ON_429 + 1):
+        session = None
         try:
             proxies = get_next_outbound_proxy()
-            session = _get_session("responses")
+            session = create_fresh_session(is_stream)
             response = session.post(
                 TARGET_ZEN_RESPONSES_URL,
                 json=body,
@@ -1313,8 +1337,19 @@ async def responses_endpoint(raw_request: Request):
                             "model": model_name,
                             "output": response.text
                         })
+                    finally:
+                        if session:
+                            try:
+                                session.close()
+                            except Exception:
+                                pass
 
         except Exception as e:
+            if session:
+                try:
+                    session.close()
+                except Exception:
+                    pass
             log.error(f"[Attempt {attempt}/{MAX_RETRIES_ON_429}] Responses endpoint error for model '{model_name}': {type(e).__name__}: {e}")
             if attempt < MAX_RETRIES_ON_429:
                 await asyncio.sleep(min(2 ** attempt, BACKOFF_CAP))
