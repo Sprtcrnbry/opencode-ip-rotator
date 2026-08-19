@@ -481,6 +481,7 @@ DEFAULT_FREE_MODELS = [
 discovered_models: List[Dict[str, Any]] = DEFAULT_FREE_MODELS.copy()
 _discovery_lock = threading.Lock()
 _cached_rotator_status = {"time": 0.0, "data": None}
+_cached_verified_ip: Optional[str] = None
 
 LOG_FORMAT = os.environ.get("LOG_FORMAT", "text").lower()
 LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
