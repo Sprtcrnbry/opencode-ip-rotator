@@ -127,6 +127,12 @@ python manager.py
 
 ## Configuration
 
+### API Key Requirement
+
+Always configure your client or SDK to use **`public`** as the API key (e.g. `Authorization: Bearer public` or `x-api-key: public`). The proxy uses this key to interface with upstream public free-tier models.
+
+---
+
 ### OpenAI-Compatible Provider (Default)
 
 To use the local proxy server within OpenCode, update your configuration file at `~/.config/opencode/opencode.jsonc`:
@@ -138,7 +144,7 @@ To use the local proxy server within OpenCode, update your configuration file at
       "npm": "@ai-sdk/openai-compatible",
       "options": {
         "baseURL": "http://127.0.0.1:8000/v1",
-        "apiKey": "any"
+        "apiKey": "public"
       },
       "name": "OpenCode Zen Local Proxy"
     }
@@ -161,7 +167,7 @@ The proxy exposes a native Anthropic-compatible `/v1/messages` endpoint. To use 
       "npm": "@ai-sdk/anthropic",
       "options": {
         "baseURL": "http://127.0.0.1:8000",
-        "apiKey": "any"
+        "apiKey": "public"
       }
     }
   }
@@ -210,8 +216,8 @@ The proxy pool rotates in round-robin order across all outbound requests.
 | :--- | :--- | :--- |
 | `OPENCODE_ZEN_PORT` | `8000` | Local port for the proxy server. |
 | `OPENCODE_ZEN_HOST` | `127.0.0.1` | Host address for binding the server (`0.0.0.0` in Docker). |
-| `WARP_CHECK_INTERVAL` | `15` | Health check interval in seconds. |
-| `WARP_ROTATION_INTERVAL` | `300` | Periodic IP rotation interval in seconds. |
+| `WARP_CHECK_INTERVAL` | `15` | Health check interval in seconds (set `0` to disable). |
+| `WARP_ROTATION_INTERVAL` | `300` | Periodic timed IP rotation interval in seconds (set `0` to disable timed rotation). |
 | `AUTO_RECYCLE_THRESHOLD` | `50` | Maximum rotations before triggering container environment refresh. |
 | `CORS_ALLOW_ORIGINS` | `http://127.0.0.1:8000,http://localhost:8000` | Comma-separated browser origins allowed to call the proxy. |
 | `WARP_ROTATOR_URL` | `http://127.0.0.1:8001` | Internal rotator endpoint. Do not expose port 8001 publicly. |

@@ -15,7 +15,8 @@ OPENCODE_CONFIG_FILE = OPENCODE_CONFIG_DIR / "opencode.jsonc"
 
 LOCAL_PROVIDER_ENTRY = {
     "options": {
-        "baseURL": "http://127.0.0.1:8000/v1"
+        "baseURL": "http://127.0.0.1:8000/v1",
+        "apiKey": "public"
     },
     "name": "OpenCode Zen Local Proxy"
 }

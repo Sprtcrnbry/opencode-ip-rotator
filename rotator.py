@@ -365,6 +365,8 @@ def handle_rate_limit(attempt: int, initial_delay: int, max_retries: int) -> boo
 # Background Monitors
 # -----------------------------------------------------------------------------
 def health_check_loop(endpoint: str, interval: int, initial_delay: int, max_retries: int, stop_event: threading.Event) -> None:
+    if interval <= 0:
+        return
     log.info(f"Health check monitor started. Endpoint: {endpoint} (Interval: {interval}s)")
     retry_count = 0
 

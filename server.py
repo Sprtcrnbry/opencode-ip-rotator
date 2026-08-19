@@ -343,6 +343,7 @@ def swap_warp_registration():
 # Model pricing reference (USD per 1M tokens)
 # -----------------------------------------------------------------------------
 MODEL_PRICING = {
+    "big-pickle": {"input_per_1m": 0.00, "output_per_1m": 0.00},
     "deepseek-v4-flash-free": {"input_per_1m": 0.15, "output_per_1m": 0.60},
     "mimo-v2.5-free": {"input_per_1m": 0.20, "output_per_1m": 0.80},
     "qwen3.6-plus-free": {"input_per_1m": 0.40, "output_per_1m": 1.20},
@@ -459,14 +460,16 @@ metrics = {
 }
 
 DEFAULT_FREE_MODELS = [
-    {"id": "deepseek-v4-flash-free", "name": "DeepSeek V4 Flash Free"},
-    {"id": "mimo-v2.5-free", "name": "MiMo V2.5 Free"},
-    {"id": "qwen3.6-plus-free", "name": "Qwen 3.6 Plus Free"},
-    {"id": "minimax-m3-free", "name": "MiniMax M3 Free"},
-    {"id": "nemotron-3-ultra-free", "name": "Nemotron 3 Ultra Free"},
+    {"id": "big-pickle", "name": "Big Pickle", "object": "model", "created": 1787139400, "owned_by": "opencode"},
+    {"id": "deepseek-v4-flash-free", "name": "DeepSeek V4 Flash Free", "object": "model", "created": 1787139400, "owned_by": "opencode"},
+    {"id": "mimo-v2.5-free", "name": "MiMo V2.5 Free", "object": "model", "created": 1787139400, "owned_by": "opencode"},
+    {"id": "hy3-free", "name": "Hy3 Free", "object": "model", "created": 1787139400, "owned_by": "opencode"},
+    {"id": "nemotron-3-ultra-free", "name": "Nemotron 3 Ultra Free", "object": "model", "created": 1787139400, "owned_by": "opencode"},
+    {"id": "nemotron-3.5-lightning-free", "name": "Nemotron 3.5 Lightning Free", "object": "model", "created": 1787139400, "owned_by": "opencode"},
+    {"id": "laguna-s-2.1-free", "name": "Laguna S 2.1 Free", "object": "model", "created": 1787139400, "owned_by": "opencode"},
 ]
 
-discovered_models: List[Dict[str, str]] = DEFAULT_FREE_MODELS.copy()
+discovered_models: List[Dict[str, Any]] = DEFAULT_FREE_MODELS.copy()
 _discovery_lock = threading.Lock()
 
 LOG_FORMAT = os.environ.get("LOG_FORMAT", "text").lower()
@@ -486,12 +489,54 @@ else:
     )
 log = logging.getLogger("zen_server")
 
+def fetch_models_from_server() -> Optional[List[Dict[str, Any]]]:
+    """Fetches model list and full metadata directly from the upstream server."""
+    try:
+        req = UrlRequest(
+            f"{TARGET_ZEN_BASE}/models",
+            headers={"Authorization": "Bearer public", "User-Agent": "Mozilla/5.0"}
+        )
+        with urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+            models_data = data.get("data", [])
+            if models_data:
+                new_models = []
+                for m in models_data:
+                    m_id = m.get("id", "")
+                    m_id_lower = m_id.lower()
+                    if "free" in m_id_lower or "big-pickle" in m_id_lower:
+                        model_entry = dict(m)
+                        if "name" not in model_entry:
+                            model_entry["name"] = m_id.replace("-", " ").title()
+                        new_models.append(model_entry)
+                return new_models if new_models else None
+    except Exception as e:
+        log.debug("Auto-Discovery error fetching models from server: %s", e)
+        return None
+
+def discover_models_task():
+    global discovered_models
+    while not _discovery_stop.is_set():
+        new_models = fetch_models_from_server()
+        if new_models:
+            with _discovery_lock:
+                discovered_models = new_models
+                metrics["discovered_models_count"] = len(discovered_models)
+            log.info(f"Auto-Discovery refreshed: {len(discovered_models)} active model(s) fetched from server.")
+        _discovery_stop.wait(MODEL_DISCOVERY_INTERVAL)
+
 @asynccontextmanager
 async def lifespan(application: FastAPI):
-    global model_usage_stats
+    global model_usage_stats, discovered_models
     init_db()
     model_usage_stats = load_metrics_from_db()
     _discovery_stop.clear()
+    initial_models = await asyncio.to_thread(fetch_models_from_server)
+    if initial_models:
+        with _discovery_lock:
+            discovered_models = initial_models
+            metrics["discovered_models_count"] = len(discovered_models)
+        log.info(f"Initial server model sync complete: {len(discovered_models)} active model(s) loaded.")
     threading.Thread(target=discover_models_task, daemon=True).start()
     yield
     _close_all_sessions()
@@ -506,33 +551,6 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-def discover_models_task():
-    global discovered_models
-    while not _discovery_stop.is_set():
-        try:
-            req = UrlRequest(
-                f"{TARGET_ZEN_BASE}/models",
-                headers={"Authorization": "Bearer public", "User-Agent": "Mozilla/5.0"}
-            )
-            with urlopen(req, timeout=10) as resp:
-                data = json.loads(resp.read().decode("utf-8"))
-                models_data = data.get("data", [])
-                if models_data:
-                    new_models = []
-                    for m in models_data:
-                        m_id = m.get("id", "")
-                        if "free" in m_id.lower() or "zen" in m_id.lower():
-                            new_models.append({"id": m_id, "name": m_id.replace("-", " ").title()})
-                    
-                    if new_models:
-                        with _discovery_lock:
-                            discovered_models = new_models
-                            metrics["discovered_models_count"] = len(discovered_models)
-                        log.info(f"Auto-Discovery refreshed: {len(discovered_models)} active model(s) fetched.")
-        except Exception as e:
-            log.debug(f"Auto-Discovery fallback active: {e}")
-        _discovery_stop.wait(300)
 
 class FlowContext:
     def __enter__(self):
@@ -656,6 +674,63 @@ def log_upstream_response(response, model_name: str, endpoint: str, attempt: int
     )
 
 
+def rotate_egress(reason: str) -> tuple[bool, Optional[str]]:
+    """Request rotation from the service that owns the shared WARP namespace."""
+    try:
+        response = cffi_requests.post(f"{WARP_ROTATOR_URL}/rotate", timeout=35)
+        data = response.json() if response.headers.get("content-type", "").startswith("application/json") else {}
+        if response.status_code == 200 and data.get("status") == "success":
+            return True, data.get("verified_ip")
+        return False, None
+    except Exception as exc:
+        log.warning("Rotator request failed: %s", exc)
+        return False, None
+
+
+_last_429_rotation_time = 0.0
+_429_rotation_lock: Optional[asyncio.Lock] = None
+ROTATION_429_COOLDOWN_SECONDS = float(os.environ.get("ROTATION_429_COOLDOWN_SECONDS", "10.0"))
+
+
+def _get_429_rotation_lock() -> asyncio.Lock:
+    global _429_rotation_lock
+    if _429_rotation_lock is None:
+        _429_rotation_lock = asyncio.Lock()
+    return _429_rotation_lock
+
+
+async def schedule_rotation_on_429(reason: str = "HTTP 429 Rate Limit"):
+    global _last_429_rotation_time
+    now = time.monotonic()
+    if _rotation_in_progress.is_set() or (now - _last_429_rotation_time < ROTATION_429_COOLDOWN_SECONDS):
+        log.debug("Auto-rotation on 429 skipped (cooldown active or rotation in progress).")
+        return
+
+    lock = _get_429_rotation_lock()
+    async with lock:
+        now = time.monotonic()
+        if _rotation_in_progress.is_set() or (now - _last_429_rotation_time < ROTATION_429_COOLDOWN_SECONDS):
+            return
+        _last_429_rotation_time = now
+
+        log.warning("Auto-rotating IP due to upstream rate limit: %s", reason)
+        signal_rotation_start()
+        try:
+            started = time.monotonic()
+            result, verified_ip = await asyncio.to_thread(rotate_egress, reason)
+            duration_ms = (time.monotonic() - started) * 1000
+            record_warp_rotation(result, duration_ms, new_ip=verified_ip or "")
+            if result:
+                swap_warp_registration()
+                log.info("Auto-rotation on 429 succeeded. New verified IP: %s (%.1fms)", verified_ip, duration_ms)
+            else:
+                log.warning("Auto-rotation on 429 completed without verified IP change.")
+        except Exception as exc:
+            log.error("Auto-rotation on 429 failed: %s", exc)
+        finally:
+            signal_rotation_done()
+
+
 def upstream_rate_limit_response(response, model_name: str) -> JSONResponse:
     category, retry_seconds, payload = classify_upstream_429(response)
     headers = {"X-Rate-Limit-Reason": category}
@@ -669,20 +744,12 @@ def upstream_rate_limit_response(response, model_name: str) -> JSONResponse:
         {key: value for key, value in response.headers.items() if key.lower() in SAFE_UPSTREAM_HEADERS},
         redact_for_log(payload),
     )
-    return JSONResponse(status_code=429, content=payload, headers=headers)
-
-
-def rotate_egress(reason: str) -> tuple[bool, Optional[str]]:
-    """Request rotation from the service that owns the shared WARP namespace."""
     try:
-        response = cffi_requests.post(f"{WARP_ROTATOR_URL}/rotate", timeout=35)
-        data = response.json() if response.headers.get("content-type", "").startswith("application/json") else {}
-        if response.status_code == 200 and data.get("status") == "success":
-            return True, data.get("verified_ip")
-        return False, None
-    except Exception as exc:
-        log.warning("Rotator request failed: %s", exc)
-        return False, None
+        loop = asyncio.get_running_loop()
+        loop.create_task(schedule_rotation_on_429(f"HTTP 429 ({category}) for {model_name}"))
+    except RuntimeError:
+        pass
+    return JSONResponse(status_code=429, content=payload, headers=headers)
 
 class EmptyStreamError(Exception):
     """Raised when upstream returns an empty or truncated stream without valid content/tool calls."""
@@ -919,10 +986,10 @@ async def list_models():
             "object": "list",
             "data": [
                 {
-                    "id": m["id"],
-                    "object": "model",
-                    "created": 1700000000,
-                    "owned_by": "opencode"
+                    "id": m.get("id"),
+                    "object": m.get("object", "model"),
+                    "created": m.get("created", 1787139400),
+                    "owned_by": m.get("owned_by", "opencode"),
                 }
                 for m in discovered_models
             ]
@@ -965,6 +1032,15 @@ async def chat_completions(raw_request: Request):
             if response.status_code == 429:
                 metrics["rate_limited_requests"] += 1
                 prom_requests_rate_limited.labels(model=current_model).inc()
+                category, retry_seconds, payload = classify_upstream_429(response)
+                if attempt < MAX_RETRIES_ON_429 and category != "quota":
+                    backoff = retry_seconds if (retry_seconds and retry_seconds <= 10) else compute_backoff_delay(attempt, INITIAL_BACKOFF)
+                    log.warning("Upstream 429 (%s) for '%s' (attempt %s/%s). Rotating IP and retrying in %.2fs...", category, current_model, attempt, MAX_RETRIES_ON_429, backoff)
+                    await schedule_rotation_on_429(f"429 rate limit ({category}) on attempt {attempt}")
+                    await wait_for_rotation_drain()
+                    await asyncio.sleep(backoff)
+                    headers = build_opencode_headers(raw_request)
+                    continue
                 return upstream_rate_limit_response(response, current_model)
 
             if response.status_code >= 500:
@@ -1076,6 +1152,16 @@ async def anthropic_messages(raw_request: Request):
             if response.status_code == 429:
                 metrics["rate_limited_requests"] += 1
                 prom_requests_rate_limited.labels(model=model_name).inc()
+                category, retry_seconds, payload = classify_upstream_429(response)
+                if attempt < MAX_RETRIES_ON_429 and category != "quota":
+                    backoff = retry_seconds if (retry_seconds and retry_seconds <= 10) else compute_backoff_delay(attempt, INITIAL_BACKOFF)
+                    log.warning("Upstream 429 (%s) for '%s' (attempt %s/%s). Rotating IP and retrying in %.2fs...", category, model_name, attempt, MAX_RETRIES_ON_429, backoff)
+                    await schedule_rotation_on_429(f"429 rate limit ({category}) on attempt {attempt}")
+                    await wait_for_rotation_drain()
+                    await asyncio.sleep(backoff)
+                    headers = build_opencode_headers(raw_request)
+                    headers["x-api-key"] = client_api_key or "public"
+                    continue
                 return upstream_rate_limit_response(response, model_name)
 
             if response.status_code >= 500:
@@ -1159,6 +1245,15 @@ async def responses_endpoint(raw_request: Request):
             if response.status_code == 429:
                 metrics["rate_limited_requests"] += 1
                 prom_requests_rate_limited.labels(model=model_name).inc()
+                category, retry_seconds, payload = classify_upstream_429(response)
+                if attempt < MAX_RETRIES_ON_429 and category != "quota":
+                    backoff = retry_seconds if (retry_seconds and retry_seconds <= 10) else compute_backoff_delay(attempt, INITIAL_BACKOFF)
+                    log.warning("Upstream 429 (%s) for '%s' (attempt %s/%s). Rotating IP and retrying in %.2fs...", category, model_name, attempt, MAX_RETRIES_ON_429, backoff)
+                    await schedule_rotation_on_429(f"429 rate limit ({category}) on attempt {attempt}")
+                    await wait_for_rotation_drain()
+                    await asyncio.sleep(backoff)
+                    headers = build_opencode_headers(raw_request)
+                    continue
                 return upstream_rate_limit_response(response, model_name)
 
             if response.status_code >= 500:

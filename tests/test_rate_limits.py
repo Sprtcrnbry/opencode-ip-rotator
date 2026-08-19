@@ -47,6 +47,25 @@ class RateLimitClassificationTests(unittest.TestCase):
             finally:
                 rotator.FLOW_LEASE_DB_PATH = original_path
 
+    def test_upstream_rate_limit_response_and_rotation(self):
+        import asyncio
+        from unittest.mock import patch, MagicMock
+        import server
+
+        response = FakeResponse({"error": {"type": "RateLimitError", "message": "rate limit reached"}}, "10")
+        with patch.object(server, "rotate_egress", return_value=(True, "1.2.3.4")) as mock_rotate, \
+             patch.object(server, "record_warp_rotation") as mock_record:
+            res = server.upstream_rate_limit_response(response, "test-model")
+            self.assertEqual(res.status_code, 429)
+            self.assertEqual(res.headers.get("x-rate-limit-reason"), "rate_limit")
+            self.assertEqual(res.headers.get("retry-after"), "10")
+
+            # Run event loop to execute the scheduled background task
+            async def run_rotation():
+                await server.schedule_rotation_on_429("test")
+            asyncio.run(run_rotation())
+            self.assertTrue(mock_rotate.called)
+
 
 if __name__ == "__main__":
     unittest.main()
