@@ -223,8 +223,8 @@ The proxy preserves upstream `429` responses, including `Retry-After`, and does 
 
 Every push to `master` publishes prebuilt images to GHCR (no local build needed):
 
-- `ghcr.io/sprtcrnbry/opencode-ip-rotator:latest` — proxy server (`Dockerfile.proxy`)
-- `ghcr.io/sprtcrnbry/opencode-ip-rotator:warp` — WARP rotator (`Dockerfile.warp`)
+- `ghcr.io/sprtcrnbry/opencode-ip-rotator:latest` — proxy server (`Dockerfile` target `proxy`)
+- `ghcr.io/sprtcrnbry/opencode-ip-rotator:warp` — WARP rotator (`Dockerfile` target `warp`)
 
 Log in once, then run. The default `docker-compose.yml` already references the
 published images, so no local build is needed:
