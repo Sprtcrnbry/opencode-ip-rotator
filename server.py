@@ -825,18 +825,22 @@ async def stream_response(response, model_name: str, session=None) -> AsyncGener
                 raise EmptyStreamError("Upstream returned empty response stream")
 
         # Yield buffered initial lines
-        for b_line in buffered_lines:
-            chunk_count += 1
-            yield b_line + b"\n"
-
-        # Step 2: Continue streaming remaining lines
         seen_done = False
         for b_line in buffered_lines:
             raw_text = b_line.decode("utf-8", errors="ignore").strip()
+            if not raw_text or raw_text.startswith(":"):
+                continue
             if raw_text == "data: [DONE]" or raw_text.startswith("data: [DONE]"):
                 seen_done = True
+                yield b"data: [DONE]\n\n"
                 break
+            if raw_text.startswith("data:"):
+                if '"cost":' in raw_text and '"choices":[]' in raw_text.replace(" ", ""):
+                    continue
+                chunk_count += 1
+                yield b_line.strip() + b"\n\n"
 
+        # Step 2: Continue streaming remaining lines
         if not seen_done:
             while True:
                 item = await loop.run_in_executor(None, get_next_line, line_iter)
@@ -849,16 +853,19 @@ async def stream_response(response, model_name: str, session=None) -> AsyncGener
 
                 line = item
                 if line:
-                    chunk_count += 1
                     raw_text = line.decode("utf-8", errors="ignore").strip()
+                    if not raw_text or raw_text.startswith(":"):
+                        continue
                     if raw_text == "data: [DONE]" or raw_text.startswith("data: [DONE]"):
                         seen_done = True
                         yield b"data: [DONE]\n\n"
                         # Standard SSE terminates on [DONE]; break immediately to ignore trailing upstream metadata
                         break
-                    yield line + b"\n"
-                else:
-                    yield b"\n"
+                    if raw_text.startswith("data:"):
+                        if '"cost":' in raw_text and '"choices":[]' in raw_text.replace(" ", ""):
+                            continue
+                        chunk_count += 1
+                        yield line.strip() + b"\n\n"
 
         if not seen_done:
             yield b"data: [DONE]\n\n"
