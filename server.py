@@ -542,6 +542,14 @@ async def lifespan(application: FastAPI):
     init_db()
     model_usage_stats = load_metrics_from_db()
     _discovery_stop.clear()
+
+    # Initialize in-process WARP rotator background monitor
+    try:
+        import rotator
+        rotator.start_rotator_background_tasks(_discovery_stop)
+    except Exception as e:
+        log.warning(f"Could not initialize in-process rotator: {e}")
+
     initial_models = await asyncio.to_thread(fetch_models_from_server)
     if initial_models:
         with _discovery_lock:
@@ -687,16 +695,24 @@ def log_upstream_response(response, model_name: str, endpoint: str, attempt: int
 
 
 def rotate_egress(reason: str) -> tuple[bool, Optional[str]]:
-    """Request rotation from the service that owns the shared WARP namespace."""
+    """Request rotation directly in-memory from rotator module or remote fallback."""
     try:
-        response = cffi_requests.post(f"{WARP_ROTATOR_URL}/rotate", timeout=35)
-        data = response.json() if response.headers.get("content-type", "").startswith("application/json") else {}
-        if response.status_code == 200 and data.get("status") == "success":
-            return True, data.get("verified_ip")
-        return False, None
+        import rotator
+        success = rotator.rotate_warp(reason=reason)
+        _close_all_sessions()
+        return success, rotator._current_ip
     except Exception as exc:
-        log.warning("Rotator request failed: %s", exc)
-        return False, None
+        log.warning("In-process rotation failed, attempting HTTP fallback: %s", exc)
+        try:
+            response = cffi_requests.post(f"{WARP_ROTATOR_URL}/rotate", timeout=35)
+            data = response.json() if response.headers.get("content-type", "").startswith("application/json") else {}
+            if response.status_code == 200 and data.get("status") == "success":
+                _close_all_sessions()
+                return True, data.get("verified_ip")
+            return False, None
+        except Exception as sub_exc:
+            log.warning("Rotator HTTP fallback failed: %s", sub_exc)
+            return False, None
 
 
 _last_429_rotation_time = 0.0
@@ -787,9 +803,7 @@ async def stream_response(response, model_name: str, session=None) -> AsyncGener
     lease_heartbeat = asyncio.create_task(keep_flow_lease_alive())
 
     chunk_count = 0
-    last_raw_line = ""
-    buffered_lines = []
-    has_meaningful_content = False
+    seen_done = False
 
     try:
         def get_next_line(iter_lines):
@@ -803,72 +817,30 @@ async def stream_response(response, model_name: str, session=None) -> AsyncGener
 
         line_iter = response.iter_lines()
 
-        # Step 1: Buffer up to 10 initial lines or until we confirm non-empty content
-        while len(buffered_lines) < 10:
+        while True:
             item = await loop.run_in_executor(None, get_next_line, line_iter)
-            if item in ("STOP_ITERATION", "SOCKET_ERROR"):
+            if item == "STOP_ITERATION":
+                log.info(f"[STREAM DEBUG] Upstream reached natural StopIteration for '{model_name}'. Total lines: {chunk_count}")
+                break
+            if item == "SOCKET_ERROR":
+                log.warning(f"[STREAM DEBUG] Upstream connection aborted via socket error for '{model_name}'. Lines sent: {chunk_count}")
                 break
 
             line = item
             if line:
                 raw_text = line.decode("utf-8", errors="ignore").strip()
-                if raw_text and not raw_text.startswith(":"):
-                    buffered_lines.append(line)
-                    if "content" in raw_text or "tool_calls" in raw_text or "reasoning_content" in raw_text:
-                        # Check if it's not just an empty choices array
-                        if '"choices":[]' not in raw_text.replace(" ", ""):
-                            has_meaningful_content = True
-                            break
-
-        # If stream ended prematurely without producing any meaningful content or tool calls
-        if not has_meaningful_content and len(buffered_lines) < 4:
-            all_buffered = "".join([l.decode("utf-8", errors="ignore") for l in buffered_lines])
-            if '"choices":[]' in all_buffered.replace(" ", "") or len(buffered_lines) == 0:
-                log.warning(f"[STREAM RECOVERY] Upstream returned empty/truncated stream for '{model_name}'. Triggering IP rotation & raising EmptyStreamError.")
-                raise EmptyStreamError("Upstream returned empty response stream")
-
-        # Yield buffered initial lines
-        seen_done = False
-        for b_line in buffered_lines:
-            raw_text = b_line.decode("utf-8", errors="ignore").strip()
-            if not raw_text or raw_text.startswith(":"):
-                continue
-            if raw_text == "data: [DONE]" or raw_text.startswith("data: [DONE]"):
-                seen_done = True
-                yield b"data: [DONE]\n\n"
-                break
-            if raw_text.startswith("data:"):
-                if '"cost":' in raw_text and '"choices":[]' in raw_text.replace(" ", ""):
+                if not raw_text or raw_text.startswith(":"):
                     continue
-                chunk_count += 1
-                yield b_line.strip() + b"\n\n"
-
-        # Step 2: Continue streaming remaining lines
-        if not seen_done:
-            while True:
-                item = await loop.run_in_executor(None, get_next_line, line_iter)
-                if item == "STOP_ITERATION":
-                    log.info(f"[STREAM DEBUG] Upstream reached natural StopIteration for '{model_name}'. Total lines: {chunk_count}")
+                if raw_text == "data: [DONE]" or raw_text.startswith("data: [DONE]"):
+                    seen_done = True
+                    yield b"data: [DONE]\n\n"
                     break
-                if item == "SOCKET_ERROR":
-                    log.warning(f"[STREAM DEBUG] Upstream connection aborted via socket error for '{model_name}'. Lines sent: {chunk_count}")
-                    break
-
-                line = item
-                if line:
-                    raw_text = line.decode("utf-8", errors="ignore").strip()
-                    if not raw_text or raw_text.startswith(":"):
+                if raw_text.startswith("data:"):
+                    # Discard empty trailing metadata like data: {"choices":[],"cost":"0"}
+                    if '"cost":' in raw_text and '"choices":[]' in raw_text.replace(" ", ""):
                         continue
-                    if raw_text == "data: [DONE]" or raw_text.startswith("data: [DONE]"):
-                        seen_done = True
-                        yield b"data: [DONE]\n\n"
-                        # Standard SSE terminates on [DONE]; break immediately to ignore trailing upstream metadata
-                        break
-                    if raw_text.startswith("data:"):
-                        if '"cost":' in raw_text and '"choices":[]' in raw_text.replace(" ", ""):
-                            continue
-                        chunk_count += 1
-                        yield line.strip() + b"\n\n"
+                    chunk_count += 1
+                    yield line.strip() + b"\n\n"
 
         if not seen_done:
             yield b"data: [DONE]\n\n"
@@ -933,40 +905,20 @@ async def get_metrics():
             model_usage_stats[m_name]["total_tokens"] = max(model_usage_stats[m_name]["total_tokens"], m_data["total_tokens"])
             model_usage_stats[m_name]["estimated_cost_usd"] = max(model_usage_stats[m_name]["estimated_cost_usd"], m_data["estimated_cost_usd"])
 
-    # Fetch data from warp-rotator microservice with 3-second cache to prevent executor thread starvation
-    global _cached_rotator_status
-    now = time.time()
-    rdata = None
-    if now - _cached_rotator_status["time"] < 3.0 and _cached_rotator_status["data"]:
-        rdata = _cached_rotator_status["data"]
-    else:
-        def fetch_rotator_status():
-            try:
-                r = cffi_requests.get(f"{WARP_ROTATOR_URL}/status", impersonate="chrome124", timeout=2)
-                if r.status_code == 200:
-                    return r.json()
-            except Exception as e:
-                log.debug(f"warp-rotator status fetch error: {e}")
-            return None
-
-        loop = asyncio.get_event_loop()
-        rdata = await loop.run_in_executor(None, fetch_rotator_status)
-        if rdata:
-            _cached_rotator_status = {"time": now, "data": rdata}
-        else:
-            rdata = _cached_rotator_status["data"]
-
     rotator_ip = None
     rotator_location = None
     rotator_rotations = rotation_count
     rotator_history = []
 
-    if rdata:
-        rotator_ip = rdata.get("current_ip")
-        rotator_rotations = rdata.get("rotations", rotation_count)
-        rotator_history = rdata.get("history", [])
+    try:
+        import rotator
+        rotator_ip = rotator._current_ip
+        rotator_rotations = rotator.rotation_count
+        rotator_history = rotator.ip_history
         if rotator_ip:
             rotator_location = get_ip_location(rotator_ip)
+    except Exception:
+        pass
 
     # Fallback: local IP lookup
     if not rotator_ip:
@@ -1051,9 +1003,8 @@ async def chat_completions(raw_request: Request):
 
     for attempt in range(1, MAX_RETRIES_ON_429 + 1):
         try:
-            await asyncio.sleep(random.uniform(0.1, 0.3))
             proxies = get_next_outbound_proxy()
-            session = create_fresh_session(is_stream) if is_stream else _get_session("chat")
+            session = _get_session("chat")
             response = session.post(
                 TARGET_ZEN_URL,
                 json=payload,
@@ -1183,9 +1134,8 @@ async def anthropic_messages(raw_request: Request):
 
     for attempt in range(1, MAX_RETRIES_ON_429 + 1):
         try:
-            await asyncio.sleep(random.uniform(0.1, 0.3))
             proxies = get_next_outbound_proxy()
-            session = create_fresh_session(is_stream) if is_stream else _get_session("anthropic")
+            session = _get_session("anthropic")
             response = session.post(
                 TARGET_ZEN_ANTHROPIC_URL,
                 json=body,
@@ -1297,9 +1247,8 @@ async def responses_endpoint(raw_request: Request):
 
     for attempt in range(1, MAX_RETRIES_ON_429 + 1):
         try:
-            await asyncio.sleep(random.uniform(0.1, 0.3))
             proxies = get_next_outbound_proxy()
-            session = create_fresh_session(is_stream) if is_stream else _get_session("responses")
+            session = _get_session("responses")
             response = session.post(
                 TARGET_ZEN_RESPONSES_URL,
                 json=body,

@@ -35,26 +35,14 @@ jobs:
             type=raw,value=latest,enable={{is_default_branch}}
             type=sha
 
-      - name: Build and push proxy image
+      - name: Build and push unified image
         uses: docker/build-push-action@v6
         with:
           context: .
           file: Dockerfile
-          target: proxy
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
-
-      - name: Build and push WARP rotator image
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          file: Dockerfile
-          target: warp
-          push: true
-          tags: ghcr.io/sprtcrnbry/opencode-ip-rotator:warp
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
@@ -74,16 +62,18 @@ jobs:
       - name: Run unit tests (rate limits + fingerprint headers)
         run: python -m unittest discover -s tests -v
 
-      - name: Pull published images from GHCR
+      - name: Pull published image from GHCR
+        run: docker pull ghcr.io/sprtcrnbry/opencode-ip-rotator:latest
+
+      - name: Verify warp-cli binary and dependencies in image
         run: |
-          docker pull ghcr.io/sprtcrnbry/opencode-ip-rotator:latest
-          docker pull ghcr.io/sprtcrnbry/opencode-ip-rotator:warp
+          docker run --rm --entrypoint '' ghcr.io/sprtcrnbry/opencode-ip-rotator:latest \
+            sh -c "which warp-cli && warp-cli --version && python -c \"import server, rotator; print('imports ok')\""
 
       - name: Smoke-test proxy health endpoint
         run: |
-          docker run -d --name ci-proxy -p 18000:8000 \
+          docker run -d --name ci-app -p 18000:8000 \
             -e OPENCODE_ZEN_HOST=0.0.0.0 \
-            -e WARP_ROTATOR_URL=http://127.0.0.1:1 \
             ghcr.io/sprtcrnbry/opencode-ip-rotator:latest
           ok=0
           for i in $(seq 1 15); do
@@ -92,12 +82,7 @@ jobs:
           done
           if [ "$ok" -ne 1 ]; then
             echo "::error::proxy smoketest failed — dumping container logs"
-            docker logs ci-proxy || true
+            docker logs ci-app || true
             exit 1
           fi
           echo "proxy smoketest ok"
-
-      - name: Verify rotator HTTP listener deps and warp-cli in warp image
-        run: |
-          docker run --rm --entrypoint '' ghcr.io/sprtcrnbry/opencode-ip-rotator:warp \
-            sh -c "which warp-cli && warp-cli --version && python3 -c \"import fastapi, uvicorn, curl_cffi; print('rotator HTTP deps ok')\""

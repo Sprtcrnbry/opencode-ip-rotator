@@ -13,15 +13,14 @@ A microservice-architected Cloudflare WARP IP rotator and proxy server for OpenC
 
 ## Key Features
 
-- **Verified Shared Egress**: The proxy and WARP service share one network namespace, so the observed egress path is the path used for upstream requests.
-- **Microservices Architecture**: Decoupled `proxy-server` (FastAPI) and `warp-rotator` (Cloudflare WARP daemon) services built with Docker Compose.
+- **Unified Single Container**: High-performance, all-in-one container combining Cloudflare WARP and FastAPI server with zero IPC overhead and in-memory flow locking.
+- **Zero-Latency TTFT**: Immediate token streaming with HTTP/2 keep-alive connection pooling to maximize prompt generation speed.
 - **Clean Management Dashboard**: Lightweight Web UI displaying active connections, current location, token statistics, and manual rotation controls.
 - **SQLite Data Persistence**: Stores token consumption, model request counts, and historical IP rotation logs on disk.
 - **USD Savings Calculator**: Estimates cost savings per model based on prompt and completion token rates.
 - **Table Pagination**: Built-in 5-item pagination for model usage and IP rotation log tables.
-- **Active Flow Locking**: Protects active SSE streams from being interrupted during IP rotation — `_active_flows_count` is held for the **full lifetime of the generator**, not just until `return`.
-- **Rate-limit Preservation**: Returns upstream 429 details and `Retry-After` without attempting to bypass model, account, provider, or subscription limits.
-- **Anthropic API Compatibility**: Native `/v1/messages` endpoint for Claude clients and the Vercel AI SDK `@ai-sdk/anthropic` provider.
+- **In-Memory Active Flow Locking**: Protects active SSE streams from being interrupted during IP rotation.
+- **Anthropic & Responses API Compatibility**: Native `/v1/messages` and `/v1/responses` endpoints.
 - **Custom Proxy Pool Support**: Round-robin outbound proxy pool via `data/proxies.txt` or `PROXY_LIST` environment variable.
 
 ---
@@ -29,21 +28,18 @@ A microservice-architected Cloudflare WARP IP rotator and proxy server for OpenC
 ## Architecture Overview
 
 ```
-[OpenCode Client] ──(HTTP/2)──> [Proxy Server (Port 8000)] ──(SQLite)──> [metrics.db]
+[OpenCode Client] ──(HTTP/2)──> [Unified Proxy & WARP Node (Port 8000)] ──(SQLite)──> [metrics.db]
                                            │
-                                  (Inter-Service IPC)
-                                           ▼
-                                [WARP Rotator (Port 8001)] ──> [Cloudflare WARP Daemon]
-                                           │
+                                  (Cloudflare WARP Tunnel)
                                            ▼
                               [OpenCode Zen API Endpoint]
 ```
 
 ### Core Architecture Components
 
-1. **Proxy Server (`server.py`):** An OpenAI-compatible API proxy server running on `http://127.0.0.1:8000/v1`. It processes requests, forwards headers dynamically, handles streaming SSE responses, and presents a Web Management Dashboard.
-2. **Rotator Module (`rotator.py`):** Owns the WARP network namespace and exposes a private health/rotation control endpoint. Manual rotation is authenticated; upstream 429 responses are not used as a rotation trigger.
-3. **Container Manager (`manager.py`):** Provides automated ephemeral container lifecycle management. Triggers container self-destruction and re-creation once a defined rotation threshold is reached to ensure fresh hardware identifiers (`machine-id`).
+1. **Proxy Server (`server.py`):** An OpenAI, Anthropic, and Responses compatible proxy server running on `http://127.0.0.1:8000`. It processes requests, forwards headers dynamically, handles streaming SSE responses, and presents a Web Management Dashboard.
+2. **Rotator Module (`rotator.py`):** Manages WARP tunnel rotation, health monitoring, and IP verification directly in-process.
+3. **Container Manager (`manager.py`):** Provides automated ephemeral container lifecycle management.
 
 ---
 

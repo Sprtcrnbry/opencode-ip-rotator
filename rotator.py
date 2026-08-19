@@ -446,13 +446,33 @@ def _cleanup_warp():
         log.warning(f"Error during WARP cleanup: {e}")
     log.info("WARP cleanup complete.")
 
-def main() -> None:
-    elevate()
+def start_rotator_background_tasks(stop_event: threading.Event) -> None:
+    """Starts rotator background tasks inside the unified server process."""
     load_proxy_list()
     global _current_ip
     _current_ip = get_public_ip()
-    log.info(f"Starting IP Rotator Node... Initial Verified Public IP: {_current_ip}")
+    log.info(f"Initialized in-process WARP Rotator. Current IP: {_current_ip}")
 
+    if CHECK_INTERVAL > 0:
+        health_thread = threading.Thread(
+            target=health_check_loop,
+            args=(CHECK_ENDPOINT, CHECK_INTERVAL, INITIAL_RETRY_DELAY, MAX_RETRIES, stop_event),
+            daemon=True,
+            name="rotator-health-check"
+        )
+        health_thread.start()
+
+    if PERIODIC_ROTATION_INTERVAL > 0:
+        periodic_thread = threading.Thread(
+            target=periodic_rotation_loop,
+            args=(PERIODIC_ROTATION_INTERVAL, stop_event),
+            daemon=True,
+            name="rotator-periodic"
+        )
+        periodic_thread.start()
+
+def main() -> None:
+    elevate()
     stop_event = threading.Event()
 
     def _handle_signal(signum, frame):
@@ -464,12 +484,8 @@ def main() -> None:
     signal.signal(signal.SIGTERM, _handle_signal)
     signal.signal(signal.SIGINT, _handle_signal)
 
-    health_thread = threading.Thread(target=health_check_loop, args=(CHECK_ENDPOINT, CHECK_INTERVAL, INITIAL_RETRY_DELAY, MAX_RETRIES, stop_event), daemon=True)
-    periodic_thread = threading.Thread(target=periodic_rotation_loop, args=(PERIODIC_ROTATION_INTERVAL, stop_event), daemon=True)
+    start_rotator_background_tasks(stop_event)
     http_thread = threading.Thread(target=start_rotator_http_server, daemon=True)
-
-    health_thread.start()
-    periodic_thread.start()
     http_thread.start()
 
     try:
