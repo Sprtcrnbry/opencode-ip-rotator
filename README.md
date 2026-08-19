@@ -215,6 +215,25 @@ The proxy pool rotates in round-robin order across all outbound requests.
 ### Rate-limit behavior
 
 The proxy preserves upstream `429` responses, including `Retry-After`, and does not treat them as a signal to bypass account, model, provider, or subscription limits. The dashboard can trigger manual WARP rotation. In Docker, the proxy shares the rotator's network namespace so the egress path being checked is the path used for upstream requests.
+## Deploy from GitHub Container Registry
+
+Every push to `master` publishes prebuilt images to GHCR (no local build needed):
+
+- `ghcr.io/sprtcrnbry/opencode-ip-rotator:latest` — proxy server (`Dockerfile.proxy`)
+- `ghcr.io/sprtcrnbry/opencode-ip-rotator:warp` — WARP rotator (`Dockerfile.warp`)
+
+Log in once, then pull and run:
+
+```bash
+docker login ghcr.io -u Sprtcrnbry
+docker pull ghcr.io/sprtcrnbry/opencode-ip-rotator:latest
+docker compose -f docker-compose.ghcr.yml up -d
+```
+
+`docker-compose.ghcr.yml` references the published images instead of building locally.
+First run still needs `proxies.txt` (see Configuration); WARP registration happens
+inside the rotator container on startup.
+
 
 ---
 
