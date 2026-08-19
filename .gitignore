@@ -29,3 +29,6 @@ proxies.txt
 # Cloned reference repos
 opencode-src/
 opencode-src-shallow/
+
+# local agent/harness state
+.omp/

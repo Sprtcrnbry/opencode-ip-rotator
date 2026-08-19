@@ -57,3 +57,47 @@ jobs:
           tags: ghcr.io/sprtcrnbry/opencode-ip-rotator:warp
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+  test:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install host test dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run unit tests (rate limits + fingerprint headers)
+        run: python -m unittest discover -s tests -v
+
+      - name: Pull published images from GHCR
+        run: |
+          docker pull ghcr.io/sprtcrnbry/opencode-ip-rotator:latest
+          docker pull ghcr.io/sprtcrnbry/opencode-ip-rotator:warp
+
+      - name: Smoke-test proxy health endpoint
+        run: |
+          docker run -d --name ci-proxy -p 18000:8000 \
+            -e OPENCODE_ZEN_HOST=0.0.0.0 \
+            -e WARP_ROTATOR_URL=http://127.0.0.1:1 \
+            ghcr.io/sprtcrnbry/opencode-ip-rotator:latest
+          ok=0
+          for i in $(seq 1 15); do
+            if curl -sf http://127.0.0.1:18000/metrics >/dev/null 2>&1; then ok=1; break; fi
+            sleep 1
+          done
+          if [ "$ok" -ne 1 ]; then
+            echo "::error::proxy smoketest failed — dumping container logs"
+            docker logs ci-proxy || true
+            exit 1
+          fi
+          echo "proxy smoketest ok"
+
+      - name: Verify rotator HTTP listener deps in warp image
+        run: |
+          docker run --rm --entrypoint '' ghcr.io/sprtcrnbry/opencode-ip-rotator:warp \
+            python3 -c "import fastapi, uvicorn, curl_cffi; print('rotator HTTP deps ok')"
