@@ -912,17 +912,19 @@ async def get_metrics():
 
     try:
         import rotator
+        if not rotator._current_ip or rotator._current_ip == "Disconnected":
+            rotator._current_ip = get_public_ip()
         rotator_ip = rotator._current_ip
         rotator_rotations = rotator.rotation_count
         rotator_history = rotator.ip_history
-        if rotator_ip:
+        if rotator_ip and rotator_ip != "Disconnected":
             rotator_location = get_ip_location(rotator_ip)
     except Exception:
         pass
 
     # Fallback: local IP lookup
-    if not rotator_ip:
-        rotator_ip = _cached_verified_ip or "Disconnected"
+    if not rotator_ip or rotator_ip == "Disconnected":
+        rotator_ip = get_public_ip() or "Disconnected"
         rotator_location = get_ip_location(rotator_ip) if rotator_ip != "Disconnected" else {"country": "Unknown", "flag": "🌐"}
 
     # Fallback: SQLite history

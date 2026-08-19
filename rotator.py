@@ -127,20 +127,41 @@ def has_active_flow_leases() -> bool:
 
 
 def get_public_ip() -> Optional[str]:
-    """Fetches current public IP using Chrome TLS impersonation."""
+    """Fetches current public IP using Cloudflare trace or multi-provider fallbacks."""
+    # 1. Cloudflare trace (fastest, native to Cloudflare/WARP)
+    for trace_url in ("https://cloudflare.com/cdn-cgi/trace", "https://1.1.1.1/cdn-cgi/trace"):
+        try:
+            from curl_cffi import requests
+            resp = requests.get(trace_url, impersonate="chrome124", timeout=4)
+            if resp.status_code == 200:
+                for line in resp.text.splitlines():
+                    if line.startswith("ip="):
+                        ip = line.split("=", 1)[1].strip()
+                        if ip:
+                            return ip
+        except Exception:
+            pass
+
+    # 2. ipify JSON fallback
     try:
         from curl_cffi import requests
-        resp = requests.get("https://api.ipify.org?format=json", impersonate="chrome124", timeout=5)
+        resp = requests.get("https://api.ipify.org?format=json", impersonate="chrome124", timeout=4)
         if resp.status_code == 200:
             return resp.json().get("ip")
     except Exception:
+        pass
+
+    # 3. icanhazip / ifconfig.me fallbacks
+    for fallback_url in ("https://icanhazip.com", "https://ifconfig.me/ip"):
         try:
             from curl_cffi import requests
-            resp = requests.get("https://ifconfig.me/ip", impersonate="chrome124", timeout=5)
-            if resp.status_code == 200:
+            resp = requests.get(fallback_url, impersonate="chrome124", timeout=4)
+            if resp.status_code == 200 and resp.text.strip():
                 return resp.text.strip()
         except Exception:
-            return None
+            pass
+
+    return None
 
 
 def get_public_ip_via_proxy(proxy: Dict[str, str]) -> Optional[str]:
@@ -375,8 +396,14 @@ def health_check_loop(endpoint: str, interval: int, initial_delay: int, max_retr
         return
     log.info(f"Health check monitor started. Endpoint: {endpoint} (Interval: {interval}s)")
     retry_count = 0
+    global _current_ip
 
     while not stop_event.is_set():
+        if not _current_ip or _current_ip == "Disconnected":
+            new_ip = get_public_ip()
+            if new_ip:
+                _current_ip = new_ip
+                log.info(f"WARP verified public IP updated: {_current_ip}")
         try:
             req = Request(endpoint, headers={"User-Agent": "WARP-Guard/1.0"}, method="HEAD")
             with urlopen(req, timeout=10) as resp:
@@ -450,8 +477,15 @@ def start_rotator_background_tasks(stop_event: threading.Event) -> None:
     """Starts rotator background tasks inside the unified server process."""
     load_proxy_list()
     global _current_ip
-    _current_ip = get_public_ip()
-    log.info(f"Initialized in-process WARP Rotator. Current IP: {_current_ip}")
+
+    # Actively resolve IP on startup with retries
+    for _ in range(5):
+        _current_ip = get_public_ip()
+        if _current_ip:
+            break
+        time.sleep(1)
+
+    log.info(f"Initialized in-process WARP Rotator. Current IP: {_current_ip or 'Disconnected'}")
 
     if CHECK_INTERVAL > 0:
         health_thread = threading.Thread(
