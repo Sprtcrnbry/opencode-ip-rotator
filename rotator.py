@@ -163,24 +163,30 @@ def get_public_ip_via_proxy(proxy: Dict[str, str]) -> Optional[str]:
 
 ip_history: List[Dict[str, Any]] = []
 
+_ip_location_cache: Dict[str, Dict[str, str]] = {}
+
 def get_ip_location(ip: str) -> Dict[str, str]:
-    """Fetches country, flag emoji, and location details for a given IP."""
-    if not ip:
+    """Fetches country, flag emoji, and location details for a given IP with in-memory caching."""
+    if not ip or ip == "Disconnected":
         return {"country": "Unknown", "countryCode": "UN", "flag": "🌐"}
+    if ip in _ip_location_cache:
+        return _ip_location_cache[ip]
     try:
         from curl_cffi import requests
-        resp = requests.get(f"http://ip-api.com/json/{ip}", impersonate="chrome124", timeout=5)
+        resp = requests.get(f"http://ip-api.com/json/{ip}", impersonate="chrome124", timeout=3)
         if resp.status_code == 200:
             data = resp.json()
             country_code = data.get("countryCode", "UN")
             # Generate flag emoji from country code
             flag = "".join(chr(127397 + ord(c)) for c in country_code) if len(country_code) == 2 else "🌐"
-            return {
+            loc = {
                 "country": data.get("country", "Unknown"),
                 "countryCode": country_code,
                 "city": data.get("city", ""),
                 "flag": flag
             }
+            _ip_location_cache[ip] = loc
+            return loc
     except Exception:
         pass
     return {"country": "Unknown", "countryCode": "UN", "flag": "🌐"}
@@ -424,7 +430,7 @@ def start_rotator_http_server():
         def http_status():
             return {"current_ip": _current_ip, "rotations": rotation_count, "history": ip_history}
 
-        uvicorn.run(rotator_app, host="0.0.0.0", port=8001, log_level="warning")
+        uvicorn.run(rotator_app, host="0.0.0.0", port=8001, log_level="warning", ws="none")
     except Exception as e:
         log.error(f"Failed to start rotator HTTP listener: {e}")
 

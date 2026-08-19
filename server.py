@@ -480,6 +480,7 @@ DEFAULT_FREE_MODELS = [
 
 discovered_models: List[Dict[str, Any]] = DEFAULT_FREE_MODELS.copy()
 _discovery_lock = threading.Lock()
+_cached_rotator_status = {"time": 0.0, "data": None}
 
 LOG_FORMAT = os.environ.get("LOG_FORMAT", "text").lower()
 LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
@@ -672,13 +673,14 @@ def log_upstream_response(response, model_name: str, endpoint: str, attempt: int
         for key, value in response.headers.items()
         if key.lower() in SAFE_UPSTREAM_HEADERS
     }
+    egress_type = "secondary_proxy" if uses_proxy else "warp_egress"
     log.debug(
-        "Upstream response model=%s endpoint=%s attempt=%s status=%s uses_proxy=%s headers=%s",
+        "Upstream response model=%s endpoint=%s attempt=%s status=%s egress=%s headers=%s",
         model_name,
         endpoint,
         attempt,
         response.status_code,
-        uses_proxy,
+        egress_type,
         headers,
     )
 
@@ -930,40 +932,45 @@ async def get_metrics():
             model_usage_stats[m_name]["total_tokens"] = max(model_usage_stats[m_name]["total_tokens"], m_data["total_tokens"])
             model_usage_stats[m_name]["estimated_cost_usd"] = max(model_usage_stats[m_name]["estimated_cost_usd"], m_data["estimated_cost_usd"])
 
-    # Fetch live data from warp-rotator microservice (offloaded to executor — blocking call)
+    # Fetch data from warp-rotator microservice with 3-second cache to prevent executor thread starvation
+    global _cached_rotator_status
+    now = time.time()
+    rdata = None
+    if now - _cached_rotator_status["time"] < 3.0 and _cached_rotator_status["data"]:
+        rdata = _cached_rotator_status["data"]
+    else:
+        def fetch_rotator_status():
+            try:
+                r = cffi_requests.get(f"{WARP_ROTATOR_URL}/status", impersonate="chrome124", timeout=2)
+                if r.status_code == 200:
+                    return r.json()
+            except Exception as e:
+                log.debug(f"warp-rotator status fetch error: {e}")
+            return None
+
+        loop = asyncio.get_event_loop()
+        rdata = await loop.run_in_executor(None, fetch_rotator_status)
+        if rdata:
+            _cached_rotator_status = {"time": now, "data": rdata}
+        else:
+            rdata = _cached_rotator_status["data"]
+
     rotator_ip = None
     rotator_location = None
     rotator_rotations = rotation_count
     rotator_history = []
-
-    def fetch_rotator_status():
-        try:
-            r = cffi_requests.get(f"{WARP_ROTATOR_URL}/status", impersonate="chrome124", timeout=4)
-            if r.status_code == 200:
-                return r.json()
-        except Exception as e:
-            log.debug(f"warp-rotator status fetch error: {e}")
-        return None
-
-    loop = asyncio.get_event_loop()
-    rdata = await loop.run_in_executor(None, fetch_rotator_status)
 
     if rdata:
         rotator_ip = rdata.get("current_ip")
         rotator_rotations = rdata.get("rotations", rotation_count)
         rotator_history = rdata.get("history", [])
         if rotator_ip:
-            def fetch_location():
-                return get_ip_location(rotator_ip)
-            rotator_location = await loop.run_in_executor(None, fetch_location)
+            rotator_location = get_ip_location(rotator_ip)
 
     # Fallback: local IP lookup
     if not rotator_ip:
-        def fetch_local_ip():
-            ip = get_public_ip()
-            loc = get_ip_location(ip) if ip else {"country": "Unknown", "flag": "🌐"}
-            return ip, loc
-        rotator_ip, rotator_location = await loop.run_in_executor(None, fetch_local_ip)
+        rotator_ip = _cached_verified_ip or "Disconnected"
+        rotator_location = get_ip_location(rotator_ip) if rotator_ip != "Disconnected" else {"country": "Unknown", "flag": "🌐"}
 
     # Fallback: SQLite history
     if not rotator_history:
