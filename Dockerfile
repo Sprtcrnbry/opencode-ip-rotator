@@ -1,27 +1,18 @@
 # syntax=docker/dockerfile:1
 
 # ---------------------------------------------------------------------------
-# Shared base: both images build from python:3.11-slim so GHCR dedupes the
-# base layer. The proxy shares the warp-rotator network namespace
-# (docker-compose network_mode: service:warp-rotator) and never runs warp-cli,
-# so it carries no Cloudflare WARP install.
+# Proxy stage — published as :latest (Alpine-based, ~80MB)
 # ---------------------------------------------------------------------------
-FROM python:3.11-slim AS base
-ENV DEBIAN_FRONTEND=noninteractive
-
-# ---------------------------------------------------------------------------
-# Proxy stage — published as :latest
-# ---------------------------------------------------------------------------
-FROM base AS proxy
+FROM python:3.11-alpine AS proxy
 WORKDIR /app
 
-# `curl` is only for the docker-compose healthcheck; the proxy shares the
-# warp-rotator network namespace, so it never runs warp-cli itself.
-RUN apt-get update && apt-get install -y --no-install-recommends curl \
-    && rm -rf /var/lib/apt/lists/*
+RUN apk add --no-cache curl ca-certificates && \
+    apk add --no-cache --virtual .build-deps gcc musl-dev python3-dev libffi-dev && \
+    pip install --no-cache-dir --upgrade pip
 
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+RUN pip install --no-cache-dir -r requirements.txt && \
+    apk del .build-deps
 
 COPY server.py .
 COPY rate_limits.py .
@@ -32,31 +23,30 @@ EXPOSE 8000
 CMD ["python", "server.py"]
 
 # ---------------------------------------------------------------------------
-# WARP rotator stage — published as :warp
+# WARP rotator stage — published as :warp (Debian-based, pruned)
 # ---------------------------------------------------------------------------
-FROM base AS warp
-ENV WARP_LOG_LEVEL=info
+FROM python:3.11-slim AS warp
+ENV WARP_LOG_LEVEL=info \
+    DEBIAN_FRONTEND=noninteractive
 WORKDIR /app
 
-# warp-svc needs dbus + iptables; rotator.py shells out to warp-cli.
-# sudo/net-tools/iproute2 are not required by the entrypoint.
+# Install iptables, dbus, and cloudflare-warp while purging setup tools
 RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
     gnupg \
     lsb-release \
     iptables \
     dbus \
-    && rm -rf /var/lib/apt/lists/*
-
-# rotator.py lazily imports fastapi/uvicorn for the :8001 /health + /rotate
-# listener — compose gates the proxy on that healthcheck. Keep both installed.
-RUN pip3 install --no-cache-dir curl_cffi "fastapi" "uvicorn[standard]"
-
-RUN curl -fsSL https://pkg.cloudflareclient.com/pubkey.gpg | gpg --yes --dearmor --output /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg \
+    && curl -fsSL https://pkg.cloudflareclient.com/pubkey.gpg | gpg --yes --dearmor --output /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg \
     && echo "deb [signed-by=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg] https://pkg.cloudflareclient.com/ $(lsb_release -cs) main" | tee /etc/apt/sources.list.d/cloudflare-client.list \
     && apt-get update \
-    && apt-get install -y cloudflare-warp \
-    && rm -rf /var/lib/apt/lists/*
+    && apt-get install -y --no-install-recommends cloudflare-warp \
+    && apt-get purge -y gnupg lsb-release \
+    && apt-get autoremove -y \
+    && rm -rf /var/lib/apt/lists/* /var/cache/apt/*
+
+# rotator.py imports fastapi/uvicorn/curl_cffi for the :8001 listener
+RUN pip3 install --no-cache-dir curl_cffi "fastapi" "uvicorn[standard]"
 
 COPY rotator.py .
 COPY manager.py .
