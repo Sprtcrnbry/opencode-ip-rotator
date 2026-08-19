@@ -590,7 +590,7 @@ OPENCODE_UA = "opencode/latest/1.18.18/cli"
 
 def _is_loopback_ip(value: str) -> bool:
     try:
-        return ipaddress.ip_address(value).is_loopback
+        return ipaddress.ip_address(value.strip()).is_loopback
     except ValueError:
         return False
 
@@ -610,7 +610,7 @@ def build_opencode_headers(raw_request: Request) -> Dict[str, str]:
     headers["x-opencode-request"] = f"req_{uuid.uuid4().hex}"
 
     real_ip = raw_request.headers.get("x-real-ip")
-    if real_ip and not _is_loopback_ip(real_ip.strip()):
+    if real_ip and not _is_loopback_ip(real_ip):
         headers["x-real-ip"] = real_ip.strip()
 
     # Preserve other downstream opencode/anthropic metadata headers.
@@ -1130,8 +1130,13 @@ async def anthropic_messages(raw_request: Request):
         if auth.startswith("Bearer "):
             client_api_key = auth[7:]
 
+    # Enforce 'public' key unless a valid non-dummy API key is provided
+    effective_api_key = "public"
+    if client_api_key and client_api_key.lower() not in ("any", "none", "null", "test", "dummy", "public"):
+        effective_api_key = client_api_key
+
     headers = build_opencode_headers(raw_request)
-    headers["x-api-key"] = client_api_key or "public"
+    headers["x-api-key"] = effective_api_key
 
     for attempt in range(1, MAX_RETRIES_ON_429 + 1):
         try:
@@ -1160,7 +1165,7 @@ async def anthropic_messages(raw_request: Request):
                     await wait_for_rotation_drain()
                     await asyncio.sleep(backoff)
                     headers = build_opencode_headers(raw_request)
-                    headers["x-api-key"] = client_api_key or "public"
+                    headers["x-api-key"] = effective_api_key
                     continue
                 return upstream_rate_limit_response(response, model_name)
 
