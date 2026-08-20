@@ -499,6 +499,53 @@ else:
     )
 log = logging.getLogger("zen_server")
 
+KNOWN_MODEL_CONTEXT_WINDOWS = {
+    "gemini-2.5-flash": {"context": 1048576, "label": "1M context"},
+    "gemini-2.5-pro": {"context": 2097152, "label": "2M context"},
+    "gemini-2.0-flash": {"context": 1048576, "label": "1M context"},
+    "deepseek-v4-flash": {"context": 131072, "label": "128k context"},
+    "deepseek-v3": {"context": 131072, "label": "128k context"},
+    "deepseek-r1": {"context": 131072, "label": "128k context"},
+    "deepseek-coder": {"context": 131072, "label": "128k context"},
+    "claude-3-7-sonnet": {"context": 200000, "label": "200k context"},
+    "claude-3-5-sonnet": {"context": 200000, "label": "200k context"},
+    "claude-3-opus": {"context": 200000, "label": "200k context"},
+    "claude-3-haiku": {"context": 200000, "label": "200k context"},
+    "gpt-4o": {"context": 128000, "label": "128k context"},
+    "gpt-4o-mini": {"context": 128000, "label": "128k context"},
+    "o1": {"context": 200000, "label": "200k context"},
+    "o3-mini": {"context": 200000, "label": "200k context"},
+    "muse-spark": {"context": 32768, "label": "32k context"},
+    "big-pickle": {"context": 131072, "label": "128k context"},
+    "llama-3.3-70b": {"context": 131072, "label": "128k context"},
+    "llama-3.1-405b": {"context": 131072, "label": "128k context"},
+    "qwen": {"context": 131072, "label": "128k context"},
+}
+
+def resolve_model_context(model_id: str, upstream_meta: dict) -> dict:
+    """Extracts or infers max context window information."""
+    ctx = (
+        upstream_meta.get("context_length")
+        or upstream_meta.get("max_context_length")
+        or upstream_meta.get("context_window")
+        or upstream_meta.get("max_tokens")
+    )
+    if ctx and isinstance(ctx, (int, float)) and ctx > 0:
+        if ctx >= 1000000:
+            label = f"{round(ctx / 1000000, 1) if ctx % 1000000 != 0 else int(ctx / 1000000)}M context"
+        elif ctx >= 1000:
+            label = f"{int(ctx / 1000)}k context"
+        else:
+            label = f"{ctx} tokens"
+        return {"context_tokens": int(ctx), "context_label": label}
+
+    m_id_lower = model_id.lower()
+    for key, val in KNOWN_MODEL_CONTEXT_WINDOWS.items():
+        if key in m_id_lower:
+            return {"context_tokens": val["context"], "context_label": val["label"]}
+
+    return {"context_tokens": 131072, "context_label": "128k context"}
+
 def fetch_models_from_server() -> Optional[List[Dict[str, Any]]]:
     """Fetches model list and full metadata directly from the upstream server."""
     try:
@@ -518,6 +565,9 @@ def fetch_models_from_server() -> Optional[List[Dict[str, Any]]]:
                         model_entry = dict(m)
                         if "name" not in model_entry:
                             model_entry["name"] = m_id.replace("-", " ").title()
+                        ctx_info = resolve_model_context(m_id, m)
+                        model_entry["context_tokens"] = ctx_info["context_tokens"]
+                        model_entry["context_label"] = ctx_info["context_label"]
                         new_models.append(model_entry)
                 return new_models if new_models else None
     except Exception as e:
