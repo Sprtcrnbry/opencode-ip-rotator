@@ -13,7 +13,6 @@ from collections import deque
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, AsyncGenerator, Dict, List, Optional
-from urllib.error import HTTPError, URLError
 from urllib.request import Request as UrlRequest, urlopen
 
 import uvicorn
@@ -21,7 +20,6 @@ from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import StreamingResponse, JSONResponse, HTMLResponse, Response
 from fastapi.templating import Jinja2Templates
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field
 from prometheus_client import Counter, Gauge, Histogram, REGISTRY, generate_latest, CONTENT_TYPE_LATEST
 
 from curl_cffi import requests as cffi_requests
@@ -586,24 +584,7 @@ class FlowContext:
             active_flows_count = max(0, active_flows_count - 1)
             prom_active_flows.set(active_flows_count)
 
-class ChatMessage(BaseModel):
-    role: str
-    content: str
 
-class ChatCompletionRequest(BaseModel):
-    model: str = Field(default="deepseek-v4-flash-free")
-    messages: List[ChatMessage]
-    stream: Optional[bool] = False
-    temperature: Optional[float] = 0.7
-    max_tokens: Optional[int] = None
-
-def get_realistic_headers() -> Dict[str, str]:
-    return {
-        "Content-Type": "application/json",
-        "Authorization": "Bearer public",
-        "Accept": "application/json, text/event-stream, */*",
-        "User-Agent": "OpenCode-IP-Rotator/1.0",
-    }
 # Opencode CLI fingerprint (exact User-Agent from official OpenCode client).
 OPENCODE_UA = "opencode/1.18.18 ai-sdk/provider-utils/4.0.23 runtime/bun/1.3.14"
 
@@ -623,7 +604,10 @@ def build_opencode_headers(raw_request: Request) -> Dict[str, str]:
     x-opencode-project: /opencode (or client pass-through)
     x-opencode-client: desktop (or client pass-through)
     Authorization: Bearer public (or client valid key)"""
-    headers = get_realistic_headers()
+    headers = {
+        "Content-Type": "application/json",
+        "Accept": "application/json, text/event-stream, */*",
+    }
 
     # Pass through valid API keys or map dummy/placeholder keys to 'Bearer public'
     client_auth = raw_request.headers.get("authorization", "")
