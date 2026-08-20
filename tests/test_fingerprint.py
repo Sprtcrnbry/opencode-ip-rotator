@@ -18,6 +18,8 @@ class BuildOpencodeHeadersTests(unittest.TestCase):
         self.assertEqual(headers["x-opencode-client"], "desktop")
         self.assertEqual(headers["x-opencode-project"], "/opencode")
         self.assertTrue(headers["x-opencode-session"].startswith("ses_"))
+        self.assertEqual(headers["x-session-id"], headers["x-opencode-session"])
+        self.assertEqual(headers["x-session-affinity"], headers["x-opencode-session"])
         self.assertTrue(headers["x-opencode-request"].startswith("req_"))
         self.assertEqual(headers["x-opencode-user"], "opencode-user")
         self.assertEqual(headers["x-user-id"], "opencode-user")

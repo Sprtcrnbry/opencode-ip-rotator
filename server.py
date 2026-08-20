@@ -603,8 +603,8 @@ def get_realistic_headers() -> Dict[str, str]:
         "Accept": "application/json, text/event-stream, */*",
         "User-Agent": "OpenCode-IP-Rotator/1.0",
     }
-# Opencode CLI fingerprint (keep UA in sync with opencode releases).
-OPENCODE_UA = "opencode/latest/1.18.18/cli"
+# Opencode CLI fingerprint (exact User-Agent from official OpenCode client).
+OPENCODE_UA = "opencode/1.18.18 ai-sdk/provider-utils/4.0.23 runtime/bun/1.3.14"
 
 
 def _is_loopback_ip(value: str) -> bool:
@@ -642,10 +642,19 @@ def build_opencode_headers(raw_request: Request) -> Dict[str, str]:
     else:
         headers["User-Agent"] = OPENCODE_UA
 
-    # Identity headers: use client values if passed, otherwise generate
+    # Session & Identity headers: match official OpenCode ai-sdk conventions
+    session_id = (
+        raw_request.headers.get("x-session-id")
+        or raw_request.headers.get("x-session-affinity")
+        or raw_request.headers.get("x-opencode-session")
+        or f"ses_{uuid.uuid4().hex}"
+    )
+    headers["x-session-id"] = session_id
+    headers["x-session-affinity"] = session_id
+    headers["x-opencode-session"] = session_id
+
     headers["x-opencode-client"] = raw_request.headers.get("x-opencode-client", "desktop")
     headers["x-opencode-project"] = raw_request.headers.get("x-opencode-project", "/opencode")
-    headers["x-opencode-session"] = raw_request.headers.get("x-opencode-session") or f"ses_{uuid.uuid4().hex}"
     headers["x-opencode-request"] = raw_request.headers.get("x-opencode-request") or f"req_{uuid.uuid4().hex}"
     headers["x-opencode-user"] = raw_request.headers.get("x-opencode-user") or "opencode-user"
     headers["x-user-id"] = raw_request.headers.get("x-user-id") or headers["x-opencode-user"]
@@ -654,11 +663,12 @@ def build_opencode_headers(raw_request: Request) -> Dict[str, str]:
     if real_ip and not _is_loopback_ip(real_ip):
         headers["x-real-ip"] = real_ip.strip()
 
-    # Transparently pass through all other metadata headers (opencode, anthropic, openai, safety, etc.)
+    # Transparently pass through all other metadata headers (opencode, anthropic, openai, safety, session, etc.)
     for k, v in raw_request.headers.items():
         kl = k.lower()
         if (
             kl.startswith("x-opencode-")
+            or kl.startswith("x-session-")
             or kl.startswith("anthropic-")
             or kl.startswith("openai-")
             or kl.startswith("x-user-")
