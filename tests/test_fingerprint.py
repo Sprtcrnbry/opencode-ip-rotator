@@ -74,6 +74,20 @@ class BuildOpencodeHeadersTests(unittest.TestCase):
         hdrs = server.build_opencode_headers(FakeRequest({"authorization": "Bearer sk-valid-account-key"}))
         self.assertEqual(hdrs["Authorization"], "Bearer sk-valid-account-key")
 
+    def test_normalize_upstream_model_name_strips_routing_prefixes(self):
+        cases = [
+            ("opencode/muse-spark-1.2-contributor-free", "muse-spark-1.2-contributor-free"),
+            ("ocf/big-pickle", "big-pickle"),
+            ("zen/deepseek-v4-flash-free", "deepseek-v4-flash-free"),
+            ("openai/gpt-4o", "gpt-4o"),
+            ("nous/tencent/hy3-free", "hy3-free"),
+            ("muse-spark-1.2-contributor-free", "muse-spark-1.2-contributor-free"),
+            ("", "deepseek-v4-flash-free"),
+            (None, "deepseek-v4-flash-free"),
+        ]
+        for raw, expected in cases:
+            self.assertEqual(server.normalize_upstream_model_name(raw), expected)
+
 
 if __name__ == "__main__":
     unittest.main()

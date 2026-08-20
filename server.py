@@ -604,6 +604,15 @@ def fetch_router_model_specs() -> Dict[str, Dict[str, Any]]:
         log.debug("Could not fetch models metadata from ROUTER_MODELS_URL: %s", e)
         return {}
 
+def normalize_upstream_model_name(model_name: Optional[str]) -> str:
+    """Normalizes client model name by stripping routing/provider prefixes (e.g. opencode/, ocf/, openai/, etc.) for upstream Zen."""
+    if not model_name:
+        return "deepseek-v4-flash-free"
+    m = model_name.strip()
+    if "/" in m:
+        m = m.split("/")[-1]
+    return m
+
 def format_tokens_label(tokens: Optional[int], suffix: str, default: str) -> str:
     """Formats numeric token values to human-friendly labels (e.g. 1M Context, 64k Max Output)."""
     if not tokens or tokens <= 0:
@@ -1302,9 +1311,11 @@ async def chat_completions(raw_request: Request):
     except Exception:
         payload = {}
 
-    current_model = payload.get("model", "deepseek-v4-flash-free")
+    raw_model = payload.get("model", "deepseek-v4-flash-free")
+    current_model = normalize_upstream_model_name(raw_model)
+    payload["model"] = current_model
     is_stream = payload.get("stream", False)
-    log.info(f"Received request for model '{current_model}' (Stream: {is_stream} | Has Tools: {'tools' in payload})")
+    log.info(f"Received request for model '{current_model}' (raw: '{raw_model}' | Stream: {is_stream} | Has Tools: {'tools' in payload})")
 
     # Record client headers & payload summary for web dashboard inspector
     req_entry = record_client_request("/v1/chat/completions", current_model, is_stream, raw_request, payload)
@@ -1446,9 +1457,11 @@ async def anthropic_messages(raw_request: Request):
     except Exception:
         body = {}
 
-    model_name = body.get("model", "deepseek-v4-flash-free")
+    raw_model = body.get("model", "deepseek-v4-flash-free")
+    model_name = normalize_upstream_model_name(raw_model)
+    body["model"] = model_name
     is_stream = body.get("stream", False)
-    log.info(f"Received Anthropic-format request for model '{model_name}' (Stream: {is_stream})")
+    log.info(f"Received Anthropic-format request for model '{model_name}' (raw: '{raw_model}' | Stream: {is_stream})")
 
     # Record client headers & payload summary for web dashboard inspector
     req_entry = record_client_request("/v1/messages", model_name, is_stream, raw_request, body)
@@ -1602,9 +1615,11 @@ async def responses_endpoint(raw_request: Request):
     except Exception:
         body = {}
 
-    model_name = body.get("model", "deepseek-v4-flash-free")
+    raw_model = body.get("model", "deepseek-v4-flash-free")
+    model_name = normalize_upstream_model_name(raw_model)
+    body["model"] = model_name
     is_stream = body.get("stream", False)
-    log.info(f"Received Responses API request for model '{model_name}' (Stream: {is_stream})")
+    log.info(f"Received Responses API request for model '{model_name}' (raw: '{raw_model}' | Stream: {is_stream})")
 
     # Record client headers & payload summary for web dashboard inspector
     req_entry = record_client_request("/v1/responses", model_name, is_stream, raw_request, body)
