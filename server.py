@@ -664,14 +664,12 @@ def build_opencode_headers(raw_request: Request) -> Dict[str, str]:
     if real_ip and not _is_loopback_ip(real_ip):
         headers["x-real-ip"] = real_ip.strip()
 
-    # Pass through only legitimate custom x-opencode-* headers (strips all openai, x-session, and anthropic headers)
+    # Pass through only legitimate custom x-opencode-* headers
     for k, v in raw_request.headers.items():
         kl = k.lower()
         if kl.startswith("x-opencode-"):
             if kl in ("x-opencode-session", "x-opencode-client", "x-opencode-project", "x-opencode-request"):
                 continue
-            headers[k] = v
-        elif kl in ("x-api-key", "x-request-id", "x-client-id"):
             headers[k] = v
     return headers
 
