@@ -627,6 +627,8 @@ def build_opencode_headers(raw_request: Request) -> Dict[str, str]:
     # upstream request gets its own bucket, no cross-request rate-limit collision.
     headers["x-opencode-session"] = f"ses_{uuid.uuid4().hex}"
     headers["x-opencode-request"] = f"req_{uuid.uuid4().hex}"
+    headers["x-opencode-user"] = f"usr_{uuid.uuid4().hex[:16]}"
+    headers["x-user-id"] = headers["x-opencode-user"]
 
     real_ip = raw_request.headers.get("x-real-ip")
     if real_ip and not _is_loopback_ip(real_ip):
@@ -1001,6 +1003,12 @@ async def chat_completions(raw_request: Request):
     is_stream = payload.get("stream", False)
     log.info(f"Received request for model '{current_model}' (Stream: {is_stream} | Has Tools: {'tools' in payload})")
 
+    # Ensure end-user identifier is present for models requiring safety_identifier / user (e.g. contributor / vertex models)
+    if not payload.get("user"):
+        payload["user"] = f"usr_{uuid.uuid4().hex[:16]}"
+    if not payload.get("safety_identifier"):
+        payload["safety_identifier"] = payload["user"]
+
     headers = build_opencode_headers(raw_request)
 
     for attempt in range(1, MAX_RETRIES_ON_429 + 1):
@@ -1142,6 +1150,17 @@ async def anthropic_messages(raw_request: Request):
     if client_api_key and client_api_key.lower() not in ("any", "none", "null", "test", "dummy", "public"):
         effective_api_key = client_api_key
 
+    # Ensure end-user identifier is present
+    if not body.get("user"):
+        body["user"] = f"usr_{uuid.uuid4().hex[:16]}"
+    if not body.get("safety_identifier"):
+        body["safety_identifier"] = body["user"]
+    if isinstance(body.get("metadata"), dict):
+        if not body["metadata"].get("user_id"):
+            body["metadata"]["user_id"] = body["user"]
+    elif "metadata" not in body:
+        body["metadata"] = {"user_id": body["user"]}
+
     headers = build_opencode_headers(raw_request)
     headers["x-api-key"] = effective_api_key
 
@@ -1267,6 +1286,12 @@ async def responses_endpoint(raw_request: Request):
     model_name = body.get("model", "deepseek-v4-flash-free")
     is_stream = body.get("stream", False)
     log.info(f"Received Responses API request for model '{model_name}' (Stream: {is_stream})")
+
+    # Ensure end-user identifier is present
+    if not body.get("user"):
+        body["user"] = f"usr_{uuid.uuid4().hex[:16]}"
+    if not body.get("safety_identifier"):
+        body["safety_identifier"] = body["user"]
 
     headers = build_opencode_headers(raw_request)
 

@@ -19,12 +19,15 @@ class BuildOpencodeHeadersTests(unittest.TestCase):
         self.assertEqual(headers["x-opencode-project"], "/opencode")
         self.assertTrue(headers["x-opencode-session"].startswith("ses_"))
         self.assertTrue(headers["x-opencode-request"].startswith("req_"))
+        self.assertTrue(headers["x-opencode-user"].startswith("usr_"))
+        self.assertEqual(headers["x-user-id"], headers["x-opencode-user"])
 
     def test_ids_are_fresh_per_call(self):
         first = server.build_opencode_headers(FakeRequest({}))
         second = server.build_opencode_headers(FakeRequest({}))
         self.assertNotEqual(first["x-opencode-session"], second["x-opencode-session"])
         self.assertNotEqual(first["x-opencode-request"], second["x-opencode-request"])
+        self.assertNotEqual(first["x-opencode-user"], second["x-opencode-user"])
 
     def test_loopback_x_real_ip_is_dropped(self):
         headers = server.build_opencode_headers(FakeRequest({"x-real-ip": " 127.0.0.1 "}))
