@@ -499,47 +499,82 @@ else:
     )
 log = logging.getLogger("zen_server")
 
-KNOWN_MODEL_SPECS = {
-    # OpenCode Free / Zen Models (from 9router / ocf)
-    "muse-spark-1.2-contributor-free": {"context": 200000, "context_label": "200k Context", "max_output": 64000, "output_label": "64k Max Output"},
-    "muse-spark": {"context": 200000, "context_label": "200k Context", "max_output": 64000, "output_label": "64k Max Output"},
-    "big-pickle": {"context": 200000, "context_label": "200k Context", "max_output": 64000, "output_label": "64k Max Output"},
-    "deepseek-v4-flash-free": {"context": 1000000, "context_label": "1M Context", "max_output": 384000, "output_label": "384k Max Output"},
-    "deepseek-v4-flash": {"context": 1000000, "context_label": "1M Context", "max_output": 384000, "output_label": "384k Max Output"},
-    "x-preview-f-free": {"context": 200000, "context_label": "200k Context", "max_output": 64000, "output_label": "64k Max Output"},
-    "mimo-v2.5-free": {"context": 1048576, "context_label": "1M Context", "max_output": 131072, "output_label": "128k Max Output"},
-    "mimo-v2.5": {"context": 1048576, "context_label": "1M Context", "max_output": 131072, "output_label": "128k Max Output"},
-    "hy3-free": {"context": 262144, "context_label": "256k Context", "max_output": 262144, "output_label": "256k Max Output"},
-    "hy3": {"context": 262144, "context_label": "256k Context", "max_output": 262144, "output_label": "256k Max Output"},
-    "nemotron-3-ultra-free": {"context": 128000, "context_label": "128k Context", "max_output": 64000, "output_label": "64k Max Output"},
-    "nemotron-3-ultra": {"context": 128000, "context_label": "128k Context", "max_output": 64000, "output_label": "64k Max Output"},
-    "nemotron-3.5-lightning-free": {"context": 128000, "context_label": "128k Context", "max_output": 64000, "output_label": "64k Max Output"},
-    "nemotron-3.5-lightning": {"context": 128000, "context_label": "128k Context", "max_output": 64000, "output_label": "64k Max Output"},
-    "laguna-s-2.1-free": {"context": 200000, "context_label": "200k Context", "max_output": 32000, "output_label": "32k Max Output"},
-    "laguna-s-2.1": {"context": 200000, "context_label": "200k Context", "max_output": 32000, "output_label": "32k Max Output"},
-
-    # Frontier Models (from 9router / standard catalog)
-    "claude-opus-5": {"context": 1000000, "context_label": "1M Context", "max_output": 128000, "output_label": "128k Max Output"},
-    "claude-sonnet-5": {"context": 1000000, "context_label": "1M Context", "max_output": 128000, "output_label": "128k Max Output"},
-    "claude-fable-5": {"context": 1000000, "context_label": "1M Context", "max_output": 128000, "output_label": "128k Max Output"},
-    "claude-opus-4": {"context": 1000000, "context_label": "1M Context", "max_output": 128000, "output_label": "128k Max Output"},
-    "claude-sonnet-4": {"context": 1000000, "context_label": "1M Context", "max_output": 128000, "output_label": "128k Max Output"},
-    "claude-haiku-4.5": {"context": 200000, "context_label": "200k Context", "max_output": 64000, "output_label": "64k Max Output"},
-    "gpt-5.6": {"context": 400000, "context_label": "400k Context", "max_output": 128000, "output_label": "128k Max Output"},
-    "gpt-5": {"context": 400000, "context_label": "400k Context", "max_output": 128000, "output_label": "128k Max Output"},
-    "kimi-k3": {"context": 1048576, "context_label": "1M Context", "max_output": 131072, "output_label": "128k Max Output"},
-    "grok-4": {"context": 256000, "context_label": "256k Context", "max_output": 64000, "output_label": "64k Max Output"},
-    "gemini-2.5-flash": {"context": 1048576, "context_label": "1M Context", "max_output": 65536, "output_label": "64k Max Output"},
-    "gemini-2.5-pro": {"context": 1048576, "context_label": "1M Context", "max_output": 65536, "output_label": "64k Max Output"},
-    "deepseek-r1": {"context": 128000, "context_label": "128k Context", "max_output": 64000, "output_label": "64k Max Output"},
-    "deepseek-v3": {"context": 128000, "context_label": "128k Context", "max_output": 64000, "output_label": "64k Max Output"},
-}
+# Dynamic models.dev and Router metadata cache
+_models_dev_cache: Dict[str, Dict[str, Any]] = {}
+_models_dev_last_fetch: float = 0.0
+_models_dev_lock = threading.Lock()
+MODELS_DEV_CACHE_TTL = 3600  # 1 hour
 
 ROUTER_MODELS_URL = os.environ.get("ROUTER_MODELS_URL", "").strip()
 ROUTER_API_KEY = os.environ.get("ROUTER_API_KEY", "").strip()
 
+def fetch_models_dev_specs() -> Dict[str, Dict[str, Any]]:
+    """Fetches live provider-agnostic and provider-specific model metadata dynamically from models.dev."""
+    global _models_dev_cache, _models_dev_last_fetch
+    now = time.time()
+    with _models_dev_lock:
+        if _models_dev_cache and (now - _models_dev_last_fetch < MODELS_DEV_CACHE_TTL):
+            return _models_dev_cache
+
+    specs: Dict[str, Dict[str, Any]] = {}
+
+    # 1. Fetch provider models from https://models.dev/api.json
+    try:
+        req = UrlRequest("https://models.dev/api.json", headers={"User-Agent": "Mozilla/5.0"})
+        with urlopen(req, timeout=10) as resp:
+            api_data = json.loads(resp.read().decode("utf-8"))
+            for provider_id, provider in api_data.items():
+                models = provider.get("models", {})
+                for m_id, m_info in models.items():
+                    norm_id = m_id.split("/")[-1].lower()
+                    limits = m_info.get("limit") or {}
+                    ctx = limits.get("context")
+                    out = limits.get("output")
+                    entry = {
+                        "name": m_info.get("name"),
+                        "description": m_info.get("description"),
+                        "context": ctx,
+                        "max_output": out,
+                        "reasoning": bool(m_info.get("reasoning")),
+                        "tool_call": bool(m_info.get("tool_call")),
+                    }
+                    if norm_id not in specs or provider_id == "opencode":
+                        specs[norm_id] = entry
+                    if m_id.lower() not in specs or provider_id == "opencode":
+                        specs[m_id.lower()] = entry
+    except Exception as e:
+        log.debug("Error fetching models.dev/api.json: %s", e)
+
+    # 2. Fetch global models catalog from https://models.dev/models.json as fallback
+    try:
+        req = UrlRequest("https://models.dev/models.json", headers={"User-Agent": "Mozilla/5.0"})
+        with urlopen(req, timeout=10) as resp:
+            models_data = json.loads(resp.read().decode("utf-8"))
+            for m_id, m_info in models_data.items():
+                norm_id = m_id.split("/")[-1].lower()
+                limits = m_info.get("limit") or {}
+                ctx = limits.get("context")
+                out = limits.get("output")
+                if norm_id not in specs:
+                    specs[norm_id] = {
+                        "name": m_info.get("name"),
+                        "description": m_info.get("description"),
+                        "context": ctx,
+                        "max_output": out,
+                        "reasoning": bool(m_info.get("reasoning")),
+                        "tool_call": bool(m_info.get("tool_call")),
+                    }
+    except Exception as e:
+        log.debug("Error fetching models.dev/models.json: %s", e)
+
+    with _models_dev_lock:
+        if specs:
+            _models_dev_cache = specs
+            _models_dev_last_fetch = now
+        return _models_dev_cache or specs
+
 def fetch_router_model_specs() -> Dict[str, Dict[str, Any]]:
-    """Optionally queries an upstream router (e.g. 9router) for live capability metadata."""
+    """Optionally queries a local router (e.g. 9router) for live capability metadata."""
     if not ROUTER_MODELS_URL:
         return {}
     try:
@@ -558,99 +593,97 @@ def fetch_router_model_specs() -> Dict[str, Dict[str, Any]]:
                 ctx = m.get("context_length") or caps.get("contextWindow")
                 out = m.get("max_completion_tokens") or caps.get("maxOutput")
                 if ctx or out:
-                    ctx_num = int(ctx) if ctx else 128000
-                    out_num = int(out) if out else 8192
-                    ctx_label = f"{round(ctx_num / 1000000, 1) if ctx_num % 1000000 != 0 else int(ctx_num / 1000000)}M Context" if ctx_num >= 1000000 else f"{int(ctx_num / 1000)}k Context"
-                    out_label = f"{round(out_num / 1000000, 1) if out_num % 1000000 != 0 else int(out_num / 1000000)}M Max Output" if out_num >= 1000000 else f"{int(out_num / 1000)}k Max Output"
                     specs[norm_id] = {
-                        "context": ctx_num,
-                        "context_label": ctx_label,
-                        "max_output": out_num,
-                        "output_label": out_label,
+                        "context": int(ctx) if ctx else None,
+                        "max_output": int(out) if out else None,
+                        "reasoning": bool(caps.get("reasoning")),
+                        "tool_call": bool(caps.get("tools")),
                     }
             return specs
     except Exception as e:
         log.debug("Could not fetch models metadata from ROUTER_MODELS_URL: %s", e)
         return {}
 
-def resolve_model_specs(model_id: str, upstream_meta: dict, dynamic_router_specs: Optional[dict] = None) -> dict:
-    """Extracts or infers both Context Window (input) and Max Output Tokens (generation)."""
-    # 1. Check live capabilities or context from upstream object
+def format_tokens_label(tokens: Optional[int], suffix: str, default: str) -> str:
+    """Formats numeric token values to human-friendly labels (e.g. 1M Context, 64k Max Output)."""
+    if not tokens or tokens <= 0:
+        return default
+    if tokens >= 1000000:
+        val = round(tokens / 1000000, 1) if (tokens % 1000000 != 0 and tokens < 10000000) else int(tokens / 1000000)
+        return f"{val}M {suffix}"
+    if tokens >= 1000:
+        return f"{int(tokens / 1000)}k {suffix}"
+    return f"{tokens} {suffix}"
+
+def resolve_model_specs(model_id: str, upstream_meta: dict, dynamic_specs: Optional[dict] = None) -> dict:
+    """Extracts or infers metadata, context window (input), and max output tokens (generation)."""
     caps = upstream_meta.get("capabilities") or {}
-    ctx = (
+    ctx_val = (
         upstream_meta.get("context_length")
         or upstream_meta.get("max_context_length")
         or upstream_meta.get("context_window")
         or upstream_meta.get("input_token_limit")
         or caps.get("contextWindow")
     )
-    if ctx and isinstance(ctx, (int, float)) and ctx > 0:
-        ctx_val = int(ctx)
-        if ctx_val >= 1000000:
-            ctx_label = f"{round(ctx_val / 1000000, 1) if ctx_val % 1000000 != 0 else int(ctx_val / 1000000)}M Context"
-        elif ctx_val >= 1000:
-            ctx_label = f"{int(ctx_val / 1000)}k Context"
-        else:
-            ctx_label = f"{ctx_val} Context"
-    else:
-        ctx_val = None
-        ctx_label = None
-
-    # 2. Check live max output from upstream object
-    out = (
+    out_val = (
         upstream_meta.get("max_output_tokens")
         or upstream_meta.get("max_completion_tokens")
         or upstream_meta.get("max_tokens")
         or upstream_meta.get("output_token_limit")
         or caps.get("maxOutput")
     )
-    if out and isinstance(out, (int, float)) and out > 0:
-        out_val = int(out)
-        if out_val >= 1000000:
-            out_label = f"{round(out_val / 1000000, 1) if out_val % 1000000 != 0 else int(out_val / 1000000)}M Max Output"
-        elif out_val >= 1000:
-            out_label = f"{int(out_val / 1000)}k Max Output"
-        else:
-            out_label = f"{out_val} Max Output"
-    else:
-        out_val = None
-        out_label = None
+    name_val = upstream_meta.get("name")
+    desc_val = upstream_meta.get("description", "")
+    reasoning_val = bool(caps.get("reasoning"))
+    tool_val = bool(caps.get("tools"))
 
     m_id_lower = model_id.lower()
     norm_id = m_id_lower.split("/")[-1]
 
-    # Check dynamic router specs if available
-    if dynamic_router_specs and norm_id in dynamic_router_specs:
-        router_spec = dynamic_router_specs[norm_id]
-        if not ctx_val:
-            ctx_val = router_spec["context"]
-            ctx_label = router_spec["context_label"]
-        if not out_val:
-            out_val = router_spec["max_output"]
-            out_label = router_spec["output_label"]
+    # Check dynamic specs from models.dev or 9router
+    if dynamic_specs:
+        match_spec = dynamic_specs.get(m_id_lower) or dynamic_specs.get(norm_id)
+        if not match_spec:
+            # Check prefix / suffix match
+            for k, v in dynamic_specs.items():
+                if k == norm_id or norm_id.endswith(k) or k.endswith(norm_id):
+                    match_spec = v
+                    break
+        if match_spec:
+            if not ctx_val and match_spec.get("context"):
+                ctx_val = match_spec["context"]
+            if not out_val and match_spec.get("max_output"):
+                out_val = match_spec["max_output"]
+            if not name_val and match_spec.get("name"):
+                name_val = match_spec["name"]
+            if not desc_val and match_spec.get("description"):
+                desc_val = match_spec["description"]
+            if "reasoning" in match_spec:
+                reasoning_val = match_spec["reasoning"]
+            if "tool_call" in match_spec:
+                tool_val = match_spec["tool_call"]
 
-    # Fallback to KNOWN_MODEL_SPECS
-    for key, spec in KNOWN_MODEL_SPECS.items():
-        if key in m_id_lower or key in norm_id:
-            if not ctx_val:
-                ctx_val = spec["context"]
-                ctx_label = spec["context_label"]
-            if not out_val:
-                out_val = spec["max_output"]
-                out_label = spec["output_label"]
-            break
+    ctx_num = int(ctx_val) if (ctx_val and isinstance(ctx_val, (int, float))) else 128000
+    out_num = int(out_val) if (out_val and isinstance(out_val, (int, float))) else 8192
 
     return {
-        "context_tokens": ctx_val or 131072,
-        "context_label": ctx_label or "128k Context",
-        "max_output_tokens": out_val or 8192,
-        "output_label": out_label or "8k Max Output",
+        "name": name_val or model_id.replace("-", " ").title(),
+        "description": desc_val,
+        "context_tokens": ctx_num,
+        "context_label": format_tokens_label(ctx_num, "Context", "128k Context"),
+        "max_output_tokens": out_num,
+        "output_label": format_tokens_label(out_num, "Max Output", "8k Max Output"),
+        "reasoning": reasoning_val,
+        "tool_call": tool_val,
     }
 
 def fetch_models_from_server() -> Optional[List[Dict[str, Any]]]:
-    """Fetches model list and full metadata directly from the upstream server and router."""
+    """Fetches model list directly from the upstream server and enriches dynamically from models.dev / router."""
     try:
-        dynamic_router_specs = fetch_router_model_specs()
+        models_dev_specs = fetch_models_dev_specs()
+        router_specs = fetch_router_model_specs()
+        dynamic_specs = {**models_dev_specs, **router_specs}
+
         req = UrlRequest(
             f"{TARGET_ZEN_BASE}/models",
             headers={"Authorization": "Bearer public", "User-Agent": "Mozilla/5.0"}
@@ -665,13 +698,15 @@ def fetch_models_from_server() -> Optional[List[Dict[str, Any]]]:
                     m_id_lower = m_id.lower()
                     if "free" in m_id_lower or "big-pickle" in m_id_lower:
                         model_entry = dict(m)
-                        if "name" not in model_entry:
-                            model_entry["name"] = m_id.replace("-", " ").title()
-                        specs = resolve_model_specs(m_id, m, dynamic_router_specs)
+                        specs = resolve_model_specs(m_id, m, dynamic_specs)
+                        model_entry["name"] = specs["name"]
+                        model_entry["description"] = specs["description"]
                         model_entry["context_tokens"] = specs["context_tokens"]
                         model_entry["context_label"] = specs["context_label"]
                         model_entry["max_output_tokens"] = specs["max_output_tokens"]
                         model_entry["output_label"] = specs["output_label"]
+                        model_entry["reasoning"] = specs["reasoning"]
+                        model_entry["tool_call"] = specs["tool_call"]
                         new_models.append(model_entry)
                 return new_models if new_models else None
     except Exception as e:

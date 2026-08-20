@@ -375,16 +375,23 @@
                 const outTokens = (typeof m === 'object' && m.max_output_tokens) ? m.max_output_tokens.toLocaleString() + ' max output tokens' : '';
                 const outBadge = `<span class="text-[9px] bg-blue-50 text-blue-700 font-medium font-mono px-1.5 py-0.5 rounded border border-blue-200" title="${outTokens}">${outLabel}</span>`;
 
+                const reasoningBadge = (typeof m === 'object' && m.reasoning) ? '<span class="text-[9px] bg-purple-50 text-purple-700 font-medium font-sans px-1.5 py-0.5 rounded border border-purple-200" title="Supports Reasoning / Thinking">Reasoning</span>' : '';
+                const toolsBadge = (typeof m === 'object' && m.tool_call) ? '<span class="text-[9px] bg-amber-50 text-amber-700 font-medium font-sans px-1.5 py-0.5 rounded border border-amber-200" title="Supports Tool / Function Calling">Tools</span>' : '';
+                const desc = (typeof m === 'object' && m.description) ? `<p class="text-[11px] text-slate-400 font-sans line-clamp-1 pt-0.5">${m.description}</p>` : '';
+
                 return `
                     <div class="py-2.5 flex items-center justify-between hover:bg-slate-50 px-2 rounded-lg transition-colors">
-                        <div class="space-y-1 pr-3 min-w-0">
+                        <div class="space-y-0.5 pr-3 min-w-0">
                             <div class="flex items-center space-x-1.5 flex-wrap gap-y-1">
                                 <span class="font-sans font-semibold text-slate-900 text-xs truncate">${name}</span>
                                 ${badge}
                                 ${ctxBadge}
                                 ${outBadge}
+                                ${reasoningBadge}
+                                ${toolsBadge}
                             </div>
                             <p class="font-mono text-[11px] text-slate-500 truncate">${id}</p>
+                            ${desc}
                         </div>
                         <button onclick="copyModelId(this, '${id}')" class="px-2.5 py-1 bg-white hover:bg-slate-100 text-slate-700 border border-slate-200 rounded text-[11px] font-sans font-medium transition-all shadow-xs flex-shrink-0 cursor-pointer">
                             Copy ID
