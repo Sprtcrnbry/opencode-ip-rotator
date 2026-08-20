@@ -500,36 +500,89 @@ else:
 log = logging.getLogger("zen_server")
 
 KNOWN_MODEL_SPECS = {
-    "gemini-2.5-flash": {"context": 1048576, "context_label": "1M Context", "max_output": 8192, "output_label": "8k Max Output"},
-    "gemini-2.5-pro": {"context": 2097152, "context_label": "2M Context", "max_output": 8192, "output_label": "8k Max Output"},
-    "gemini-2.0-flash": {"context": 1048576, "context_label": "1M Context", "max_output": 8192, "output_label": "8k Max Output"},
-    "deepseek-v4-flash": {"context": 131072, "context_label": "128k Context", "max_output": 16384, "output_label": "16k Max Output"},
-    "deepseek-v3": {"context": 131072, "context_label": "128k Context", "max_output": 8192, "output_label": "8k Max Output"},
-    "deepseek-r1": {"context": 131072, "context_label": "128k Context", "max_output": 65536, "output_label": "64k Max Output"},
-    "deepseek-coder": {"context": 131072, "context_label": "128k Context", "max_output": 8192, "output_label": "8k Max Output"},
-    "claude-3-7-sonnet": {"context": 200000, "context_label": "200k Context", "max_output": 64000, "output_label": "64k Max Output"},
-    "claude-3-5-sonnet": {"context": 200000, "context_label": "200k Context", "max_output": 8192, "output_label": "8k Max Output"},
-    "claude-3-opus": {"context": 200000, "context_label": "200k Context", "max_output": 4096, "output_label": "4k Max Output"},
-    "claude-3-haiku": {"context": 200000, "context_label": "200k Context", "max_output": 4096, "output_label": "4k Max Output"},
-    "gpt-4o": {"context": 128000, "context_label": "128k Context", "max_output": 16384, "output_label": "16k Max Output"},
-    "gpt-4o-mini": {"context": 128000, "context_label": "128k Context", "max_output": 16384, "output_label": "16k Max Output"},
-    "o1": {"context": 200000, "context_label": "200k Context", "max_output": 100000, "output_label": "100k Max Output"},
-    "o3-mini": {"context": 200000, "context_label": "200k Context", "max_output": 100000, "output_label": "100k Max Output"},
-    "muse-spark": {"context": 32768, "context_label": "32k Context", "max_output": 8192, "output_label": "8k Max Output"},
-    "big-pickle": {"context": 131072, "context_label": "128k Context", "max_output": 8192, "output_label": "8k Max Output"},
-    "llama-3.3-70b": {"context": 131072, "context_label": "128k Context", "max_output": 8192, "output_label": "8k Max Output"},
-    "llama-3.1-405b": {"context": 131072, "context_label": "128k Context", "max_output": 8192, "output_label": "8k Max Output"},
-    "qwen": {"context": 131072, "context_label": "128k Context", "max_output": 8192, "output_label": "8k Max Output"},
+    # OpenCode Free / Zen Models (from 9router / ocf)
+    "muse-spark-1.2-contributor-free": {"context": 200000, "context_label": "200k Context", "max_output": 64000, "output_label": "64k Max Output"},
+    "muse-spark": {"context": 200000, "context_label": "200k Context", "max_output": 64000, "output_label": "64k Max Output"},
+    "big-pickle": {"context": 200000, "context_label": "200k Context", "max_output": 64000, "output_label": "64k Max Output"},
+    "deepseek-v4-flash-free": {"context": 1000000, "context_label": "1M Context", "max_output": 384000, "output_label": "384k Max Output"},
+    "deepseek-v4-flash": {"context": 1000000, "context_label": "1M Context", "max_output": 384000, "output_label": "384k Max Output"},
+    "x-preview-f-free": {"context": 200000, "context_label": "200k Context", "max_output": 64000, "output_label": "64k Max Output"},
+    "mimo-v2.5-free": {"context": 1048576, "context_label": "1M Context", "max_output": 131072, "output_label": "128k Max Output"},
+    "mimo-v2.5": {"context": 1048576, "context_label": "1M Context", "max_output": 131072, "output_label": "128k Max Output"},
+    "hy3-free": {"context": 262144, "context_label": "256k Context", "max_output": 262144, "output_label": "256k Max Output"},
+    "hy3": {"context": 262144, "context_label": "256k Context", "max_output": 262144, "output_label": "256k Max Output"},
+    "nemotron-3-ultra-free": {"context": 128000, "context_label": "128k Context", "max_output": 64000, "output_label": "64k Max Output"},
+    "nemotron-3-ultra": {"context": 128000, "context_label": "128k Context", "max_output": 64000, "output_label": "64k Max Output"},
+    "nemotron-3.5-lightning-free": {"context": 128000, "context_label": "128k Context", "max_output": 64000, "output_label": "64k Max Output"},
+    "nemotron-3.5-lightning": {"context": 128000, "context_label": "128k Context", "max_output": 64000, "output_label": "64k Max Output"},
+    "laguna-s-2.1-free": {"context": 200000, "context_label": "200k Context", "max_output": 32000, "output_label": "32k Max Output"},
+    "laguna-s-2.1": {"context": 200000, "context_label": "200k Context", "max_output": 32000, "output_label": "32k Max Output"},
+
+    # Frontier Models (from 9router / standard catalog)
+    "claude-opus-5": {"context": 1000000, "context_label": "1M Context", "max_output": 128000, "output_label": "128k Max Output"},
+    "claude-sonnet-5": {"context": 1000000, "context_label": "1M Context", "max_output": 128000, "output_label": "128k Max Output"},
+    "claude-fable-5": {"context": 1000000, "context_label": "1M Context", "max_output": 128000, "output_label": "128k Max Output"},
+    "claude-opus-4": {"context": 1000000, "context_label": "1M Context", "max_output": 128000, "output_label": "128k Max Output"},
+    "claude-sonnet-4": {"context": 1000000, "context_label": "1M Context", "max_output": 128000, "output_label": "128k Max Output"},
+    "claude-haiku-4.5": {"context": 200000, "context_label": "200k Context", "max_output": 64000, "output_label": "64k Max Output"},
+    "gpt-5.6": {"context": 400000, "context_label": "400k Context", "max_output": 128000, "output_label": "128k Max Output"},
+    "gpt-5": {"context": 400000, "context_label": "400k Context", "max_output": 128000, "output_label": "128k Max Output"},
+    "kimi-k3": {"context": 1048576, "context_label": "1M Context", "max_output": 131072, "output_label": "128k Max Output"},
+    "grok-4": {"context": 256000, "context_label": "256k Context", "max_output": 64000, "output_label": "64k Max Output"},
+    "gemini-2.5-flash": {"context": 1048576, "context_label": "1M Context", "max_output": 65536, "output_label": "64k Max Output"},
+    "gemini-2.5-pro": {"context": 1048576, "context_label": "1M Context", "max_output": 65536, "output_label": "64k Max Output"},
+    "deepseek-r1": {"context": 128000, "context_label": "128k Context", "max_output": 64000, "output_label": "64k Max Output"},
+    "deepseek-v3": {"context": 128000, "context_label": "128k Context", "max_output": 64000, "output_label": "64k Max Output"},
 }
 
-def resolve_model_specs(model_id: str, upstream_meta: dict) -> dict:
+ROUTER_MODELS_URL = os.environ.get("ROUTER_MODELS_URL", "").strip()
+ROUTER_API_KEY = os.environ.get("ROUTER_API_KEY", "").strip()
+
+def fetch_router_model_specs() -> Dict[str, Dict[str, Any]]:
+    """Optionally queries an upstream router (e.g. 9router) for live capability metadata."""
+    if not ROUTER_MODELS_URL:
+        return {}
+    try:
+        headers = {"User-Agent": "Mozilla/5.0"}
+        if ROUTER_API_KEY:
+            headers["Authorization"] = f"Bearer {ROUTER_API_KEY}"
+        req = UrlRequest(ROUTER_MODELS_URL, headers=headers)
+        with urlopen(req, timeout=8) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+            models = data.get("data", [])
+            specs = {}
+            for m in models:
+                m_id = m.get("id", "")
+                norm_id = m_id.split("/")[-1].lower()
+                caps = m.get("capabilities") or {}
+                ctx = m.get("context_length") or caps.get("contextWindow")
+                out = m.get("max_completion_tokens") or caps.get("maxOutput")
+                if ctx or out:
+                    ctx_num = int(ctx) if ctx else 128000
+                    out_num = int(out) if out else 8192
+                    ctx_label = f"{round(ctx_num / 1000000, 1) if ctx_num % 1000000 != 0 else int(ctx_num / 1000000)}M Context" if ctx_num >= 1000000 else f"{int(ctx_num / 1000)}k Context"
+                    out_label = f"{round(out_num / 1000000, 1) if out_num % 1000000 != 0 else int(out_num / 1000000)}M Max Output" if out_num >= 1000000 else f"{int(out_num / 1000)}k Max Output"
+                    specs[norm_id] = {
+                        "context": ctx_num,
+                        "context_label": ctx_label,
+                        "max_output": out_num,
+                        "output_label": out_label,
+                    }
+            return specs
+    except Exception as e:
+        log.debug("Could not fetch models metadata from ROUTER_MODELS_URL: %s", e)
+        return {}
+
+def resolve_model_specs(model_id: str, upstream_meta: dict, dynamic_router_specs: Optional[dict] = None) -> dict:
     """Extracts or infers both Context Window (input) and Max Output Tokens (generation)."""
-    # 1. Context Window
+    # 1. Check live capabilities or context from upstream object
+    caps = upstream_meta.get("capabilities") or {}
     ctx = (
         upstream_meta.get("context_length")
         or upstream_meta.get("max_context_length")
         or upstream_meta.get("context_window")
         or upstream_meta.get("input_token_limit")
+        or caps.get("contextWindow")
     )
     if ctx and isinstance(ctx, (int, float)) and ctx > 0:
         ctx_val = int(ctx)
@@ -543,15 +596,19 @@ def resolve_model_specs(model_id: str, upstream_meta: dict) -> dict:
         ctx_val = None
         ctx_label = None
 
-    # 2. Max Output Tokens
+    # 2. Check live max output from upstream object
     out = (
         upstream_meta.get("max_output_tokens")
+        or upstream_meta.get("max_completion_tokens")
         or upstream_meta.get("max_tokens")
         or upstream_meta.get("output_token_limit")
+        or caps.get("maxOutput")
     )
     if out and isinstance(out, (int, float)) and out > 0:
         out_val = int(out)
-        if out_val >= 1000:
+        if out_val >= 1000000:
+            out_label = f"{round(out_val / 1000000, 1) if out_val % 1000000 != 0 else int(out_val / 1000000)}M Max Output"
+        elif out_val >= 1000:
             out_label = f"{int(out_val / 1000)}k Max Output"
         else:
             out_label = f"{out_val} Max Output"
@@ -560,8 +617,21 @@ def resolve_model_specs(model_id: str, upstream_meta: dict) -> dict:
         out_label = None
 
     m_id_lower = model_id.lower()
+    norm_id = m_id_lower.split("/")[-1]
+
+    # Check dynamic router specs if available
+    if dynamic_router_specs and norm_id in dynamic_router_specs:
+        router_spec = dynamic_router_specs[norm_id]
+        if not ctx_val:
+            ctx_val = router_spec["context"]
+            ctx_label = router_spec["context_label"]
+        if not out_val:
+            out_val = router_spec["max_output"]
+            out_label = router_spec["output_label"]
+
+    # Fallback to KNOWN_MODEL_SPECS
     for key, spec in KNOWN_MODEL_SPECS.items():
-        if key in m_id_lower:
+        if key in m_id_lower or key in norm_id:
             if not ctx_val:
                 ctx_val = spec["context"]
                 ctx_label = spec["context_label"]
@@ -578,8 +648,9 @@ def resolve_model_specs(model_id: str, upstream_meta: dict) -> dict:
     }
 
 def fetch_models_from_server() -> Optional[List[Dict[str, Any]]]:
-    """Fetches model list and full metadata directly from the upstream server."""
+    """Fetches model list and full metadata directly from the upstream server and router."""
     try:
+        dynamic_router_specs = fetch_router_model_specs()
         req = UrlRequest(
             f"{TARGET_ZEN_BASE}/models",
             headers={"Authorization": "Bearer public", "User-Agent": "Mozilla/5.0"}
@@ -596,7 +667,7 @@ def fetch_models_from_server() -> Optional[List[Dict[str, Any]]]:
                         model_entry = dict(m)
                         if "name" not in model_entry:
                             model_entry["name"] = m_id.replace("-", " ").title()
-                        specs = resolve_model_specs(m_id, m)
+                        specs = resolve_model_specs(m_id, m, dynamic_router_specs)
                         model_entry["context_tokens"] = specs["context_tokens"]
                         model_entry["context_label"] = specs["context_label"]
                         model_entry["max_output_tokens"] = specs["max_output_tokens"]
