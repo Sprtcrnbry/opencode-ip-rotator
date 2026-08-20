@@ -794,11 +794,32 @@ def _is_loopback_ip(value: str) -> bool:
         return False
 
 
-def build_opencode_headers(raw_request: Request) -> Dict[str, str]:
+def optimize_payload_for_upstream(payload: dict) -> dict:
+    """Ensures payload size stays safely within upstream OpenCode Zen's ingress limits (< 1.5MB)."""
+    messages = payload.get("messages")
+    if not isinstance(messages, list) or len(messages) <= 20:
+        return payload
+
+    try:
+        payload_bytes = len(json.dumps(payload).encode("utf-8"))
+        if payload_bytes <= 1_400_000:
+            return payload
+
+        log.warning("Payload size is %s bytes (%s messages). Trimming older conversation history to fit upstream Zen limit...", payload_bytes, len(messages))
+        # Keep initial system prompts and most recent messages
+        head = messages[:4]
+        tail = messages[-60:]
+        optimized = dict(payload)
+        optimized["messages"] = head + tail
+        return optimized
+    except Exception:
+        return payload
+
+def build_opencode_headers(raw_request: Request, fresh_session: bool = False) -> Dict[str, str]:
     """Builds upstream headers matching official OpenCode client fingerprint:
     User-Agent: opencode/1.18.18 ai-sdk/provider-utils/4.0.23 runtime/bun/1.3.14 (or authentic client pass-through)
     x-opencode-session: fresh ses_<hex> (or client pass-through)
-    x-opencode-request: fresh req_<hex> (or client pass-through)
+    x-opencode-request: fresh req_<hex>
     x-opencode-project: /opencode (or client pass-through)
     x-opencode-client: desktop (or client pass-through)
     Authorization: Bearer public (or client valid key)"""
@@ -831,12 +852,15 @@ def build_opencode_headers(raw_request: Request) -> Dict[str, str]:
         headers["User-Agent"] = OPENCODE_UA
 
     # Session & Identity headers
-    session_id = (
-        raw_request.headers.get("x-opencode-session")
-        or raw_request.headers.get("x-session-id")
-        or raw_request.headers.get("x-session-affinity")
-        or f"ses_{uuid.uuid4().hex}"
-    )
+    if fresh_session:
+        session_id = f"ses_{uuid.uuid4().hex}"
+    else:
+        session_id = (
+            raw_request.headers.get("x-opencode-session")
+            or raw_request.headers.get("x-session-id")
+            or raw_request.headers.get("x-session-affinity")
+            or f"ses_{uuid.uuid4().hex}"
+        )
     headers["x-opencode-session"] = session_id
     headers["x-opencode-client"] = raw_request.headers.get("x-opencode-client", "desktop")
     headers["x-opencode-project"] = raw_request.headers.get("x-opencode-project", "/opencode")
@@ -1314,6 +1338,7 @@ async def chat_completions(raw_request: Request):
     raw_model = payload.get("model", "deepseek-v4-flash-free")
     current_model = normalize_upstream_model_name(raw_model)
     payload["model"] = current_model
+    payload = optimize_payload_for_upstream(payload)
     is_stream = payload.get("stream", False)
     log.info(f"Received request for model '{current_model}' (raw: '{raw_model}' | Stream: {is_stream} | Has Tools: {'tools' in payload})")
 
@@ -1326,7 +1351,7 @@ async def chat_completions(raw_request: Request):
     if not payload.get("safety_identifier"):
         payload["safety_identifier"] = payload.get("user", "opencode-user")
 
-    headers = build_opencode_headers(raw_request)
+    headers = build_opencode_headers(raw_request, fresh_session=True)
 
     for attempt in range(1, MAX_RETRIES_ON_429 + 1):
         session = None
@@ -1354,9 +1379,20 @@ async def chat_completions(raw_request: Request):
                     await schedule_rotation_on_429(f"429 rate limit ({category}) on attempt {attempt}")
                     await wait_for_rotation_drain()
                     await asyncio.sleep(backoff)
-                    headers = build_opencode_headers(raw_request)
+                    headers = build_opencode_headers(raw_request, fresh_session=True)
                     continue
                 return upstream_rate_limit_response(response, current_model)
+
+            if response.status_code == 401:
+                raw_err_text = extract_response_body(response)
+                if "is not supported" in raw_err_text or "Rate limit" in raw_err_text or "FreeUsageLimit" in raw_err_text:
+                    if attempt < MAX_RETRIES_ON_429:
+                        log.warning("Upstream 401 ('%s') for '%s' (attempt %s/%s). Auto-rotating IP and retrying...", raw_err_text[:80], current_model, attempt, MAX_RETRIES_ON_429)
+                        await schedule_rotation_on_429(f"401 error ({raw_err_text[:40]}) on attempt {attempt}")
+                        await wait_for_rotation_drain()
+                        await asyncio.sleep(1.0)
+                        headers = build_opencode_headers(raw_request, fresh_session=True)
+                        continue
 
             if response.status_code >= 500:
                 delay = compute_backoff_delay(attempt, INITIAL_BACKOFF)
@@ -1460,6 +1496,7 @@ async def anthropic_messages(raw_request: Request):
     raw_model = body.get("model", "deepseek-v4-flash-free")
     model_name = normalize_upstream_model_name(raw_model)
     body["model"] = model_name
+    body = optimize_payload_for_upstream(body)
     is_stream = body.get("stream", False)
     log.info(f"Received Anthropic-format request for model '{model_name}' (raw: '{raw_model}' | Stream: {is_stream})")
 
@@ -1488,7 +1525,7 @@ async def anthropic_messages(raw_request: Request):
     elif "metadata" not in body:
         body["metadata"] = {"user_id": body.get("user", "opencode-user")}
 
-    headers = build_opencode_headers(raw_request)
+    headers = build_opencode_headers(raw_request, fresh_session=True)
     headers["x-api-key"] = effective_api_key
 
     for attempt in range(1, MAX_RETRIES_ON_429 + 1):
@@ -1517,10 +1554,22 @@ async def anthropic_messages(raw_request: Request):
                     await schedule_rotation_on_429(f"429 rate limit ({category}) on attempt {attempt}")
                     await wait_for_rotation_drain()
                     await asyncio.sleep(backoff)
-                    headers = build_opencode_headers(raw_request)
+                    headers = build_opencode_headers(raw_request, fresh_session=True)
                     headers["x-api-key"] = effective_api_key
                     continue
                 return upstream_rate_limit_response(response, model_name)
+
+            if response.status_code == 401:
+                raw_err_text = extract_response_body(response)
+                if "is not supported" in raw_err_text or "Rate limit" in raw_err_text or "FreeUsageLimit" in raw_err_text:
+                    if attempt < MAX_RETRIES_ON_429:
+                        log.warning("Upstream 401 ('%s') for '%s' (attempt %s/%s). Auto-rotating IP and retrying...", raw_err_text[:80], model_name, attempt, MAX_RETRIES_ON_429)
+                        await schedule_rotation_on_429(f"401 error ({raw_err_text[:40]}) on attempt {attempt}")
+                        await wait_for_rotation_drain()
+                        await asyncio.sleep(1.0)
+                        headers = build_opencode_headers(raw_request, fresh_session=True)
+                        headers["x-api-key"] = effective_api_key
+                        continue
 
             if response.status_code >= 500:
                 delay = compute_backoff_delay(attempt, INITIAL_BACKOFF)
@@ -1618,6 +1667,7 @@ async def responses_endpoint(raw_request: Request):
     raw_model = body.get("model", "deepseek-v4-flash-free")
     model_name = normalize_upstream_model_name(raw_model)
     body["model"] = model_name
+    body = optimize_payload_for_upstream(body)
     is_stream = body.get("stream", False)
     log.info(f"Received Responses API request for model '{model_name}' (raw: '{raw_model}' | Stream: {is_stream})")
 
@@ -1630,7 +1680,7 @@ async def responses_endpoint(raw_request: Request):
     if not body.get("safety_identifier"):
         body["safety_identifier"] = body.get("user", "opencode-user")
 
-    headers = build_opencode_headers(raw_request)
+    headers = build_opencode_headers(raw_request, fresh_session=True)
 
     for attempt in range(1, MAX_RETRIES_ON_429 + 1):
         session = None
