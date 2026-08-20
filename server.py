@@ -693,6 +693,31 @@ def redact_headers_for_log(headers_dict: Dict[str, str]) -> Dict[str, str]:
     return redacted
 
 
+def summarize_payload_for_log(payload: dict) -> dict:
+    summary = {}
+    for k, v in payload.items():
+        if k == "messages" and isinstance(v, list):
+            summary["messages_count"] = len(v)
+            summary["message_roles"] = [m.get("role") for m in v if isinstance(m, dict)][:10]
+        elif k == "tools" and isinstance(v, list):
+            summary["tools_count"] = len(v)
+            summary["tool_names"] = [
+                (t.get("function", {}).get("name") if isinstance(t, dict) else str(t))
+                for t in v
+            ][:10]
+        elif k == "system" and isinstance(v, str):
+            summary["system_prompt_len"] = len(v)
+        elif isinstance(v, (str, int, float, bool, type(None))):
+            summary[k] = v
+        elif isinstance(v, dict):
+            summary[k] = list(v.keys())
+        elif isinstance(v, list):
+            summary[k] = f"list(len={len(v)})"
+        else:
+            summary[k] = f"[{type(v).__name__}]"
+    return summary
+
+
 SAFE_UPSTREAM_HEADERS = {
     "content-type",
     "retry-after",
@@ -1045,6 +1070,7 @@ async def chat_completions(raw_request: Request):
     is_stream = payload.get("stream", False)
     log.info(f"Received request for model '{current_model}' (Stream: {is_stream} | Has Tools: {'tools' in payload})")
     log.info(f"Incoming client headers: {redact_headers_for_log(dict(raw_request.headers))}")
+    log.info(f"Incoming client JSON payload summary: {json.dumps(summarize_payload_for_log(payload))}")
 
     # Ensure end-user identifier is present for models requiring safety_identifier / user (e.g. contributor / vertex models)
     if not payload.get("user"):
@@ -1182,6 +1208,7 @@ async def anthropic_messages(raw_request: Request):
     is_stream = body.get("stream", False)
     log.info(f"Received Anthropic-format request for model '{model_name}' (Stream: {is_stream})")
     log.info(f"Incoming client headers: {redact_headers_for_log(dict(raw_request.headers))}")
+    log.info(f"Incoming client JSON payload summary: {json.dumps(summarize_payload_for_log(body))}")
 
     client_api_key = raw_request.headers.get("x-api-key") or ""
     if not client_api_key:
@@ -1331,6 +1358,7 @@ async def responses_endpoint(raw_request: Request):
     is_stream = body.get("stream", False)
     log.info(f"Received Responses API request for model '{model_name}' (Stream: {is_stream})")
     log.info(f"Incoming client headers: {redact_headers_for_log(dict(raw_request.headers))}")
+    log.info(f"Incoming client JSON payload summary: {json.dumps(summarize_payload_for_log(body))}")
 
     # Ensure end-user identifier is present
     if not body.get("user"):
