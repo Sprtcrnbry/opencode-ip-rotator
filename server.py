@@ -605,7 +605,7 @@ def get_realistic_headers() -> Dict[str, str]:
         "User-Agent": "OpenCode-IP-Rotator/1.0",
     }
 # Opencode CLI fingerprint (exact User-Agent from official OpenCode client).
-OPENCODE_UA = "opencode/1.18.18 ai-sdk/provider-utils/4.0.23 runtime/bun/1.3.14"
+OPENCODE_UA = "opencode/latest/1.18.18/cli"
 
 
 def _is_loopback_ip(value: str) -> bool:
@@ -616,8 +616,13 @@ def _is_loopback_ip(value: str) -> bool:
 
 
 def build_opencode_headers(raw_request: Request) -> Dict[str, str]:
-    """Builds upstream headers, passing through authentic OpenCode agent headers
-    and supplying realistic CLI defaults when missing."""
+    """Builds upstream headers matching official OpenCode CLI fingerprint:
+    User-Agent: opencode/latest/1.18.18/cli (or authentic client pass-through)
+    x-opencode-session: fresh ses_<hex> (or client pass-through)
+    x-opencode-request: fresh req_<hex> (or client pass-through)
+    x-opencode-project: /opencode (or client pass-through)
+    x-opencode-client: desktop (or client pass-through)
+    Authorization: Bearer public (or client valid key)"""
     headers = get_realistic_headers()
 
     # Pass through valid API keys or map dummy/placeholder keys to 'Bearer public'
@@ -643,28 +648,27 @@ def build_opencode_headers(raw_request: Request) -> Dict[str, str]:
     else:
         headers["User-Agent"] = OPENCODE_UA
 
-    # Session & Identity headers: match official OpenCode ai-sdk conventions
+    # Session & Identity headers
     session_id = (
-        raw_request.headers.get("x-session-id")
+        raw_request.headers.get("x-opencode-session")
+        or raw_request.headers.get("x-session-id")
         or raw_request.headers.get("x-session-affinity")
-        or raw_request.headers.get("x-opencode-session")
         or f"ses_{uuid.uuid4().hex}"
     )
-    headers["x-session-id"] = session_id
-    headers["x-session-affinity"] = session_id
     headers["x-opencode-session"] = session_id
+    if "x-session-id" in raw_request.headers or "x-session-affinity" in raw_request.headers:
+        headers["x-session-id"] = session_id
+        headers["x-session-affinity"] = session_id
 
     headers["x-opencode-client"] = raw_request.headers.get("x-opencode-client", "desktop")
     headers["x-opencode-project"] = raw_request.headers.get("x-opencode-project", "/opencode")
     headers["x-opencode-request"] = raw_request.headers.get("x-opencode-request") or f"req_{uuid.uuid4().hex}"
-    headers["x-opencode-user"] = raw_request.headers.get("x-opencode-user") or "opencode-user"
-    headers["x-user-id"] = raw_request.headers.get("x-user-id") or headers["x-opencode-user"]
 
     real_ip = raw_request.headers.get("x-real-ip")
     if real_ip and not _is_loopback_ip(real_ip):
         headers["x-real-ip"] = real_ip.strip()
 
-    # Transparently pass through all other metadata headers (opencode, anthropic, openai, safety, session, etc.)
+    # Transparently pass through all other metadata headers
     for k, v in raw_request.headers.items():
         kl = k.lower()
         if (
@@ -672,9 +676,7 @@ def build_opencode_headers(raw_request: Request) -> Dict[str, str]:
             or kl.startswith("x-session-")
             or kl.startswith("anthropic-")
             or kl.startswith("openai-")
-            or kl.startswith("x-user-")
-            or kl.startswith("x-safety-")
-            or kl in ("x-api-key", "x-request-id", "x-client-id", "safety-identifier")
+            or kl in ("x-api-key", "x-request-id", "x-client-id")
         ):
             headers[k] = v
     return headers

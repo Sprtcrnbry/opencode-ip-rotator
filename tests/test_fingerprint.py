@@ -14,15 +14,12 @@ class FakeRequest:
 class BuildOpencodeHeadersTests(unittest.TestCase):
     def test_fingerprint_values_match_verified_cli_identity(self):
         headers = server.build_opencode_headers(FakeRequest({}))
-        self.assertEqual(headers["User-Agent"], server.OPENCODE_UA)
+        self.assertEqual(headers["User-Agent"], "opencode/latest/1.18.18/cli")
         self.assertEqual(headers["x-opencode-client"], "desktop")
         self.assertEqual(headers["x-opencode-project"], "/opencode")
         self.assertTrue(headers["x-opencode-session"].startswith("ses_"))
-        self.assertEqual(headers["x-session-id"], headers["x-opencode-session"])
-        self.assertEqual(headers["x-session-affinity"], headers["x-opencode-session"])
         self.assertTrue(headers["x-opencode-request"].startswith("req_"))
-        self.assertEqual(headers["x-opencode-user"], "opencode-user")
-        self.assertEqual(headers["x-user-id"], "opencode-user")
+        self.assertEqual(headers["Authorization"], "Bearer public")
 
     def test_ids_are_fresh_per_call(self):
         first = server.build_opencode_headers(FakeRequest({}))
@@ -55,8 +52,6 @@ class BuildOpencodeHeadersTests(unittest.TestCase):
             "x-opencode-project": "/custom/workspace",
             "x-opencode-session": "ses_my_custom_session",
             "x-opencode-request": "req_my_custom_request",
-            "x-opencode-user": "usr_my_custom_user",
-            "x-safety-identifier": "safe_123",
             "authorization": "Bearer sk-custom-key",
         }))
         self.assertEqual(hdrs["User-Agent"], "opencode/1.18.18 (vscode)")
@@ -64,9 +59,6 @@ class BuildOpencodeHeadersTests(unittest.TestCase):
         self.assertEqual(hdrs["x-opencode-project"], "/custom/workspace")
         self.assertEqual(hdrs["x-opencode-session"], "ses_my_custom_session")
         self.assertEqual(hdrs["x-opencode-request"], "req_my_custom_request")
-        self.assertEqual(hdrs["x-opencode-user"], "usr_my_custom_user")
-        self.assertEqual(hdrs["x-user-id"], "usr_my_custom_user")
-        self.assertEqual(hdrs["x-safety-identifier"], "safe_123")
         self.assertEqual(hdrs["Authorization"], "Bearer sk-custom-key")
 
     def test_dummy_authorization_maps_to_public(self):
