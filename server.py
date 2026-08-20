@@ -656,10 +656,6 @@ def build_opencode_headers(raw_request: Request) -> Dict[str, str]:
         or f"ses_{uuid.uuid4().hex}"
     )
     headers["x-opencode-session"] = session_id
-    if "x-session-id" in raw_request.headers or "x-session-affinity" in raw_request.headers:
-        headers["x-session-id"] = session_id
-        headers["x-session-affinity"] = session_id
-
     headers["x-opencode-client"] = raw_request.headers.get("x-opencode-client", "desktop")
     headers["x-opencode-project"] = raw_request.headers.get("x-opencode-project", "/opencode")
     headers["x-opencode-request"] = raw_request.headers.get("x-opencode-request") or f"req_{uuid.uuid4().hex}"
@@ -668,16 +664,14 @@ def build_opencode_headers(raw_request: Request) -> Dict[str, str]:
     if real_ip and not _is_loopback_ip(real_ip):
         headers["x-real-ip"] = real_ip.strip()
 
-    # Transparently pass through all other metadata headers
+    # Pass through only legitimate custom x-opencode-* headers (strips all openai, x-session, and anthropic headers)
     for k, v in raw_request.headers.items():
         kl = k.lower()
-        if (
-            kl.startswith("x-opencode-")
-            or kl.startswith("x-session-")
-            or kl.startswith("anthropic-")
-            or kl.startswith("openai-")
-            or kl in ("x-api-key", "x-request-id", "x-client-id")
-        ):
+        if kl.startswith("x-opencode-"):
+            if kl in ("x-opencode-session", "x-opencode-client", "x-opencode-project", "x-opencode-request"):
+                continue
+            headers[k] = v
+        elif kl in ("x-api-key", "x-request-id", "x-client-id"):
             headers[k] = v
     return headers
 

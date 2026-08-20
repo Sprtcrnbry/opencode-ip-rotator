@@ -35,14 +35,18 @@ class BuildOpencodeHeadersTests(unittest.TestCase):
         headers = server.build_opencode_headers(FakeRequest({"x-real-ip": " 203.0.113.7 "}))
         self.assertEqual(headers.get("x-real-ip"), "203.0.113.7")
 
-    def test_downstream_opencode_and_anthropic_headers_pass_through(self):
+    def test_downstream_opencode_headers_pass_through_and_extraneous_dropped(self):
         hdrs = server.build_opencode_headers(FakeRequest({
             "x-opencode-custom": "keep-me",
             "anthropic-beta": "prompt-caching-2024-07-31",
+            "openai-organization": "org-123",
+            "x-session-affinity": "ses-aff-123",
             "cookie": "session=abc",
         }))
         self.assertEqual(hdrs["x-opencode-custom"], "keep-me")
-        self.assertEqual(hdrs["anthropic-beta"], "prompt-caching-2024-07-31")
+        self.assertNotIn("anthropic-beta", hdrs)
+        self.assertNotIn("openai-organization", hdrs)
+        self.assertNotIn("x-session-affinity", hdrs)
         self.assertNotIn("cookie", hdrs)
 
     def test_real_opencode_agent_headers_are_preserved(self):
