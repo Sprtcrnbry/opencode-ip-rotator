@@ -14,7 +14,7 @@ class FakeRequest:
 class BuildOpencodeHeadersTests(unittest.TestCase):
     def test_fingerprint_values_match_verified_cli_identity(self):
         headers = server.build_opencode_headers(FakeRequest({}))
-        self.assertEqual(headers["User-Agent"], "opencode/latest/1.18.18/cli")
+        self.assertEqual(headers["User-Agent"], server.OPENCODE_UA)
         self.assertEqual(headers["x-opencode-client"], "desktop")
         self.assertEqual(headers["x-opencode-project"], "/opencode")
         self.assertTrue(headers["x-opencode-session"].startswith("ses_"))

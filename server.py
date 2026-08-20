@@ -605,7 +605,7 @@ def get_realistic_headers() -> Dict[str, str]:
         "User-Agent": "OpenCode-IP-Rotator/1.0",
     }
 # Opencode CLI fingerprint (exact User-Agent from official OpenCode client).
-OPENCODE_UA = "opencode/latest/1.18.18/cli"
+OPENCODE_UA = "opencode/1.18.18 ai-sdk/provider-utils/4.0.23 runtime/bun/1.3.14"
 
 
 def _is_loopback_ip(value: str) -> bool:
@@ -616,8 +616,8 @@ def _is_loopback_ip(value: str) -> bool:
 
 
 def build_opencode_headers(raw_request: Request) -> Dict[str, str]:
-    """Builds upstream headers matching official OpenCode CLI fingerprint:
-    User-Agent: opencode/latest/1.18.18/cli (or authentic client pass-through)
+    """Builds upstream headers matching official OpenCode client fingerprint:
+    User-Agent: opencode/1.18.18 ai-sdk/provider-utils/4.0.23 runtime/bun/1.3.14 (or authentic client pass-through)
     x-opencode-session: fresh ses_<hex> (or client pass-through)
     x-opencode-request: fresh req_<hex> (or client pass-through)
     x-opencode-project: /opencode (or client pass-through)
