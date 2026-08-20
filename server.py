@@ -647,7 +647,7 @@ def build_opencode_headers(raw_request: Request) -> Dict[str, str]:
     headers["x-opencode-project"] = raw_request.headers.get("x-opencode-project", "/opencode")
     headers["x-opencode-session"] = raw_request.headers.get("x-opencode-session") or f"ses_{uuid.uuid4().hex}"
     headers["x-opencode-request"] = raw_request.headers.get("x-opencode-request") or f"req_{uuid.uuid4().hex}"
-    headers["x-opencode-user"] = raw_request.headers.get("x-opencode-user") or f"usr_{uuid.uuid4().hex[:16]}"
+    headers["x-opencode-user"] = raw_request.headers.get("x-opencode-user") or "opencode-user"
     headers["x-user-id"] = raw_request.headers.get("x-user-id") or headers["x-opencode-user"]
 
     real_ip = raw_request.headers.get("x-real-ip")
@@ -667,6 +667,20 @@ def build_opencode_headers(raw_request: Request) -> Dict[str, str]:
         ):
             headers[k] = v
     return headers
+
+
+def redact_headers_for_log(headers_dict: Dict[str, str]) -> Dict[str, str]:
+    redacted = {}
+    for k, v in headers_dict.items():
+        kl = k.lower()
+        if any(marker in kl.replace("-", "_") for marker in ("authorization", "token", "password", "secret", "cookie")):
+            if v.lower() in ("bearer public", "public"):
+                redacted[k] = v
+            else:
+                redacted[k] = f"{v[:10]}...[redacted]" if len(v) > 10 else "[redacted]"
+        else:
+            redacted[k] = v
+    return redacted
 
 
 SAFE_UPSTREAM_HEADERS = {
@@ -1020,12 +1034,13 @@ async def chat_completions(raw_request: Request):
     current_model = payload.get("model", "deepseek-v4-flash-free")
     is_stream = payload.get("stream", False)
     log.info(f"Received request for model '{current_model}' (Stream: {is_stream} | Has Tools: {'tools' in payload})")
+    log.info(f"Incoming client headers: {redact_headers_for_log(dict(raw_request.headers))}")
 
     # Ensure end-user identifier is present for models requiring safety_identifier / user (e.g. contributor / vertex models)
     if not payload.get("user"):
-        payload["user"] = f"usr_{uuid.uuid4().hex[:16]}"
+        payload["user"] = "opencode-user"
     if not payload.get("safety_identifier"):
-        payload["safety_identifier"] = payload["user"]
+        payload["safety_identifier"] = payload.get("user", "opencode-user")
 
     headers = build_opencode_headers(raw_request)
 
@@ -1156,6 +1171,7 @@ async def anthropic_messages(raw_request: Request):
     model_name = body.get("model", "deepseek-v4-flash-free")
     is_stream = body.get("stream", False)
     log.info(f"Received Anthropic-format request for model '{model_name}' (Stream: {is_stream})")
+    log.info(f"Incoming client headers: {redact_headers_for_log(dict(raw_request.headers))}")
 
     client_api_key = raw_request.headers.get("x-api-key") or ""
     if not client_api_key:
@@ -1165,19 +1181,19 @@ async def anthropic_messages(raw_request: Request):
 
     # Enforce 'public' key unless a valid non-dummy API key is provided
     effective_api_key = "public"
-    if client_api_key and client_api_key.lower() not in ("any", "none", "null", "test", "dummy", "public"):
+    if client_api_key and client_api_key.lower() not in ("any", "none", "null", "test", "dummy", "public", "undefined", "false"):
         effective_api_key = client_api_key
 
     # Ensure end-user identifier is present
     if not body.get("user"):
-        body["user"] = f"usr_{uuid.uuid4().hex[:16]}"
+        body["user"] = "opencode-user"
     if not body.get("safety_identifier"):
-        body["safety_identifier"] = body["user"]
+        body["safety_identifier"] = body.get("user", "opencode-user")
     if isinstance(body.get("metadata"), dict):
         if not body["metadata"].get("user_id"):
-            body["metadata"]["user_id"] = body["user"]
+            body["metadata"]["user_id"] = body.get("user", "opencode-user")
     elif "metadata" not in body:
-        body["metadata"] = {"user_id": body["user"]}
+        body["metadata"] = {"user_id": body.get("user", "opencode-user")}
 
     headers = build_opencode_headers(raw_request)
     headers["x-api-key"] = effective_api_key
@@ -1304,12 +1320,13 @@ async def responses_endpoint(raw_request: Request):
     model_name = body.get("model", "deepseek-v4-flash-free")
     is_stream = body.get("stream", False)
     log.info(f"Received Responses API request for model '{model_name}' (Stream: {is_stream})")
+    log.info(f"Incoming client headers: {redact_headers_for_log(dict(raw_request.headers))}")
 
     # Ensure end-user identifier is present
     if not body.get("user"):
-        body["user"] = f"usr_{uuid.uuid4().hex[:16]}"
+        body["user"] = "opencode-user"
     if not body.get("safety_identifier"):
-        body["safety_identifier"] = body["user"]
+        body["safety_identifier"] = body.get("user", "opencode-user")
 
     headers = build_opencode_headers(raw_request)
 
