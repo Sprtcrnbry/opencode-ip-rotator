@@ -731,6 +731,33 @@ def record_client_request(endpoint: str, model: str, is_stream: bool, raw_reques
         return None
 
 
+def extract_response_body(response) -> str:
+    """Safely extracts full text from a curl_cffi Response even when stream=True."""
+    if response is None:
+        return ""
+    try:
+        if hasattr(response, "text") and response.text:
+            return response.text
+    except Exception:
+        pass
+    try:
+        if hasattr(response, "content") and response.content:
+            return response.content.decode("utf-8", errors="replace")
+    except Exception:
+        pass
+    try:
+        if hasattr(response, "iter_content"):
+            chunks = []
+            for chunk in response.iter_content(chunk_size=4096):
+                if chunk:
+                    chunks.append(chunk)
+            if chunks:
+                return b"".join(chunks).decode("utf-8", errors="replace")
+    except Exception:
+        pass
+    return ""
+
+
 SAFE_UPSTREAM_HEADERS = {
     "content-type",
     "retry-after",
@@ -1138,17 +1165,18 @@ async def chat_completions(raw_request: Request):
                 continue
 
             if response.status_code != 200:
-                log.warning("Upstream returned HTTP %s for '%s': %s", response.status_code, current_model, response.text[:500])
+                raw_err_text = extract_response_body(response)
+                log.warning("Upstream returned HTTP %s for '%s': %s", response.status_code, current_model, raw_err_text[:500])
                 if req_entry:
                     req_entry["status_code"] = response.status_code
-                    req_entry["error_detail"] = response.text[:1000]
+                    req_entry["error_detail"] = raw_err_text[:2000]
                 try:
-                    res_json = response.json()
+                    res_json = json.loads(raw_err_text) if raw_err_text else response.json()
                     return JSONResponse(status_code=response.status_code, content=res_json)
                 except Exception:
                     return JSONResponse(
                         status_code=response.status_code,
-                        content={"error": {"message": response.text or f"Upstream returned HTTP {response.status_code}", "type": "upstream_error", "code": response.status_code}}
+                        content={"error": {"message": raw_err_text or f"Upstream returned HTTP {response.status_code}", "type": "upstream_error", "code": response.status_code}}
                     )
 
             metrics["successful_requests"] += 1
@@ -1299,17 +1327,18 @@ async def anthropic_messages(raw_request: Request):
                 continue
 
             if response.status_code != 200:
-                log.warning("Upstream returned HTTP %s for '%s': %s", response.status_code, model_name, response.text[:500])
+                raw_err_text = extract_response_body(response)
+                log.warning("Upstream returned HTTP %s for '%s': %s", response.status_code, model_name, raw_err_text[:500])
                 if req_entry:
                     req_entry["status_code"] = response.status_code
-                    req_entry["error_detail"] = response.text[:1000]
+                    req_entry["error_detail"] = raw_err_text[:2000]
                 try:
-                    res_json = response.json()
+                    res_json = json.loads(raw_err_text) if raw_err_text else response.json()
                     return JSONResponse(status_code=response.status_code, content=res_json)
                 except Exception:
                     return JSONResponse(
                         status_code=response.status_code,
-                        content={"error": {"type": "upstream_error", "message": response.text or f"HTTP {response.status_code}"}}
+                        content={"error": {"type": "upstream_error", "message": raw_err_text or f"HTTP {response.status_code}"}}
                     )
 
             metrics["successful_requests"] += 1
@@ -1436,17 +1465,18 @@ async def responses_endpoint(raw_request: Request):
                 continue
 
             if response.status_code != 200:
-                log.warning("Upstream returned HTTP %s for '%s': %s", response.status_code, model_name, response.text[:500])
+                raw_err_text = extract_response_body(response)
+                log.warning("Upstream returned HTTP %s for '%s': %s", response.status_code, model_name, raw_err_text[:500])
                 if req_entry:
                     req_entry["status_code"] = response.status_code
-                    req_entry["error_detail"] = response.text[:1000]
+                    req_entry["error_detail"] = raw_err_text[:2000]
                 try:
-                    res_json = response.json()
+                    res_json = json.loads(raw_err_text) if raw_err_text else response.json()
                     return JSONResponse(status_code=response.status_code, content=res_json)
                 except Exception:
                     return JSONResponse(
                         status_code=response.status_code,
-                        content={"error": {"type": "upstream_error", "message": response.text or f"HTTP {response.status_code}"}}
+                        content={"error": {"type": "upstream_error", "message": raw_err_text or f"HTTP {response.status_code}"}}
                     )
 
             metrics["successful_requests"] += 1
