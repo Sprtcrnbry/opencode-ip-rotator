@@ -615,38 +615,45 @@ def _is_loopback_ip(value: str) -> bool:
 
 
 def build_opencode_headers(raw_request: Request) -> Dict[str, str]:
-    """Official opencode CLI fingerprint so Zen's free-tier limiter stops 429-ing.
-    Mirrors 9router custom-server buildHeaders(): always-fresh ses_/req_ ids +
-    project + client + UA. x-real-ip is forwarded best-effort but loopback is
-    dropped (127.0.0.1/::1 would collapse every local user into one shared bucket)."""
+    """Builds upstream headers, passing through authentic OpenCode agent headers
+    and supplying realistic CLI defaults when missing."""
     headers = get_realistic_headers()
-    headers["User-Agent"] = OPENCODE_UA
-    headers["x-opencode-client"] = "desktop"
-    headers["x-opencode-project"] = "/opencode"
-    # Fresh session + request ids every call (matches 9router buildHeaders): each
-    # upstream request gets its own bucket, no cross-request rate-limit collision.
-    headers["x-opencode-session"] = f"ses_{uuid.uuid4().hex}"
-    headers["x-opencode-request"] = f"req_{uuid.uuid4().hex}"
-    headers["x-opencode-user"] = f"usr_{uuid.uuid4().hex[:16]}"
-    headers["x-user-id"] = headers["x-opencode-user"]
+
+    # Pass through client's Authorization if provided
+    client_auth = raw_request.headers.get("authorization")
+    if client_auth:
+        headers["Authorization"] = client_auth
+
+    # Detect if client is an authentic OpenCode agent / CLI
+    client_ua = raw_request.headers.get("user-agent", "")
+    if client_ua and "opencode" in client_ua.lower():
+        headers["User-Agent"] = client_ua
+    else:
+        headers["User-Agent"] = OPENCODE_UA
+
+    # Identity headers: use client values if passed, otherwise generate
+    headers["x-opencode-client"] = raw_request.headers.get("x-opencode-client", "desktop")
+    headers["x-opencode-project"] = raw_request.headers.get("x-opencode-project", "/opencode")
+    headers["x-opencode-session"] = raw_request.headers.get("x-opencode-session") or f"ses_{uuid.uuid4().hex}"
+    headers["x-opencode-request"] = raw_request.headers.get("x-opencode-request") or f"req_{uuid.uuid4().hex}"
+    headers["x-opencode-user"] = raw_request.headers.get("x-opencode-user") or f"usr_{uuid.uuid4().hex[:16]}"
+    headers["x-user-id"] = raw_request.headers.get("x-user-id") or headers["x-opencode-user"]
 
     real_ip = raw_request.headers.get("x-real-ip")
     if real_ip and not _is_loopback_ip(real_ip):
         headers["x-real-ip"] = real_ip.strip()
 
-    # Preserve other downstream opencode/anthropic metadata headers.
+    # Transparently pass through all other metadata headers (opencode, anthropic, openai, safety, etc.)
     for k, v in raw_request.headers.items():
         kl = k.lower()
-        if kl.startswith("x-opencode-"):
-            if kl in (
-                "x-opencode-session",
-                "x-opencode-request",
-                "x-opencode-project",
-                "x-opencode-client",
-            ):
-                continue
-            headers[k] = v
-        elif kl.startswith("anthropic-"):
+        if (
+            kl.startswith("x-opencode-")
+            or kl.startswith("anthropic-")
+            or kl.startswith("openai-")
+            or kl.startswith("x-user-")
+            or kl.startswith("x-safety-")
+            or kl in ("x-api-key", "x-request-id", "x-client-id", "safety-identifier")
+        ):
             headers[k] = v
     return headers
 

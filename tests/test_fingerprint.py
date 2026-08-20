@@ -47,6 +47,22 @@ class BuildOpencodeHeadersTests(unittest.TestCase):
         self.assertEqual(hdrs["anthropic-beta"], "prompt-caching-2024-07-31")
         self.assertNotIn("cookie", hdrs)
 
+    def test_real_opencode_agent_headers_are_preserved(self):
+        hdrs = server.build_opencode_headers(FakeRequest({
+            "user-agent": "opencode/1.18.18 (vscode)",
+            "x-opencode-session": "ses_my_custom_session",
+            "x-opencode-request": "req_my_custom_request",
+            "x-opencode-user": "usr_my_custom_user",
+            "x-safety-identifier": "safe_123",
+            "authorization": "Bearer custom-key",
+        }))
+        self.assertEqual(hdrs["User-Agent"], "opencode/1.18.18 (vscode)")
+        self.assertEqual(hdrs["x-opencode-session"], "ses_my_custom_session")
+        self.assertEqual(hdrs["x-opencode-request"], "req_my_custom_request")
+        self.assertEqual(hdrs["x-opencode-user"], "usr_my_custom_user")
+        self.assertEqual(hdrs["x-safety-identifier"], "safe_123")
+        self.assertEqual(hdrs["Authorization"], "Bearer custom-key")
+
 
 if __name__ == "__main__":
     unittest.main()
