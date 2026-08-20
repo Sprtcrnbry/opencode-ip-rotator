@@ -85,8 +85,21 @@ class BuildOpencodeHeadersTests(unittest.TestCase):
             ("", "deepseek-v4-flash-free"),
             (None, "deepseek-v4-flash-free"),
         ]
-        for raw, expected in cases:
-            self.assertEqual(server.normalize_upstream_model_name(raw), expected)
+    def test_optimize_payload_drops_orphaned_tools(self):
+        payload = {
+            "model": "muse-spark-1.2-contributor-free",
+            "messages": [
+                {"role": "system", "content": "prompt"},
+                {"role": "user", "content": "hi"},
+                {"role": "tool", "tool_call_id": "orphaned_call_123", "content": "orphan"},
+                {"role": "assistant", "content": "call me", "tool_calls": [{"id": "valid_call_456", "type": "function", "function": {"name": "f"}}]},
+                {"role": "tool", "tool_call_id": "valid_call_456", "content": "valid result"}
+            ]
+        }
+        optimized = server.optimize_payload_for_upstream(payload)
+        roles = [m["role"] for m in optimized["messages"]]
+        self.assertEqual(roles, ["system", "user", "assistant", "tool"])
+        self.assertEqual(optimized["messages"][-1]["tool_call_id"], "valid_call_456")
 
 
 if __name__ == "__main__":

@@ -795,24 +795,59 @@ def _is_loopback_ip(value: str) -> bool:
 
 
 def optimize_payload_for_upstream(payload: dict) -> dict:
-    """Ensures payload size stays safely within upstream OpenCode Zen's ingress limits (< 1.5MB)."""
+    """Ensures payload size stays safely within upstream OpenCode Zen's ingress limits (< 1.5MB)
+    and strictly validates tool/assistant message pairings to prevent HTTP 400 Bad Request."""
     messages = payload.get("messages")
-    if not isinstance(messages, list) or len(messages) <= 20:
+    if not isinstance(messages, list) or not messages:
         return payload
 
     try:
+        candidate_messages = messages
         payload_bytes = len(json.dumps(payload).encode("utf-8"))
-        if payload_bytes <= 1_400_000:
-            return payload
 
-        log.warning("Payload size is %s bytes (%s messages). Trimming older conversation history to fit upstream Zen limit...", payload_bytes, len(messages))
-        # Keep initial system prompts and most recent messages
-        head = messages[:4]
-        tail = messages[-60:]
+        # If payload is oversized (> 1.4MB) or message count is large, trim older history safely
+        if payload_bytes > 1_400_000 or len(messages) > 80:
+            log.warning("Payload size is %s bytes (%s messages). Optimizing conversation history for upstream Zen ingress...", payload_bytes, len(messages))
+            # Preserve system/setup prompts from head
+            head = [m for m in messages[:4] if m.get("role") in ("system", "user")]
+
+            # Locate a clean 'user' message turn boundary in the recent turns
+            tail_target = max(len(messages) - 50, 4)
+            tail_start = tail_target
+            for i in range(tail_target, len(messages)):
+                if messages[i].get("role") == "user":
+                    tail_start = i
+                    break
+            tail = messages[tail_start:]
+            candidate_messages = head + tail
+
+        # Strict validation of tool message pairs
+        known_tool_calls = set()
+        sanitized = []
+        for m in candidate_messages:
+            if not isinstance(m, dict):
+                continue
+            role = m.get("role")
+            if role == "assistant":
+                tool_calls = m.get("tool_calls") or []
+                if isinstance(tool_calls, list):
+                    for tc in tool_calls:
+                        if isinstance(tc, dict) and tc.get("id"):
+                            known_tool_calls.add(tc["id"])
+                sanitized.append(m)
+            elif role == "tool":
+                tc_id = m.get("tool_call_id")
+                # Drop orphaned tool message to prevent 400 Bad Request
+                if tc_id and tc_id in known_tool_calls:
+                    sanitized.append(m)
+            else:
+                sanitized.append(m)
+
         optimized = dict(payload)
-        optimized["messages"] = head + tail
+        optimized["messages"] = sanitized
         return optimized
-    except Exception:
+    except Exception as e:
+        log.debug("Error optimizing payload: %s", e)
         return payload
 
 def build_opencode_headers(raw_request: Request, fresh_session: bool = False) -> Dict[str, str]:
