@@ -118,6 +118,39 @@
         </div>
 
         <div class="bg-white border border-slate-200/80 rounded-xl shadow-sm overflow-hidden">
+            <div class="px-5 py-3.5 border-b border-slate-100 bg-slate-50/50 flex justify-between items-center">
+                <div>
+                    <h2 class="text-xs font-semibold text-slate-900 uppercase tracking-wider">Client Request & Header Inspector</h2>
+                    <p class="text-[11px] text-slate-400">Captured headers and JSON payload parameters</p>
+                </div>
+                <span id="requests-count-badge" class="bg-white text-slate-600 text-[11px] font-mono font-medium px-2 py-0.5 rounded border border-slate-200">0 Requests</span>
+            </div>
+            <div class="overflow-x-auto">
+                <table class="w-full text-left text-xs">
+                    <thead class="bg-slate-50/60 text-slate-400 font-medium uppercase border-b border-slate-100 text-[10px] tracking-wider">
+                        <tr>
+                            <th class="px-5 py-2.5">Time</th>
+                            <th class="px-5 py-2.5">Endpoint</th>
+                            <th class="px-5 py-2.5">Model</th>
+                            <th class="px-5 py-2.5">Client User-Agent</th>
+                            <th class="px-5 py-2.5 text-right">Inspect</th>
+                        </tr>
+                    </thead>
+                    <tbody id="recent-requests-body" class="divide-y divide-slate-100 font-mono text-slate-700">
+                        <tr><td colspan="5" class="px-5 py-6 text-center text-slate-400 italic font-sans text-xs">No client requests captured yet.</td></tr>
+                    </tbody>
+                </table>
+            </div>
+            <div class="px-5 py-2.5 border-t border-slate-100 bg-slate-50/40 flex items-center justify-between text-xs text-slate-500 font-sans">
+                <span id="req-page-info">Page 1 of 1</span>
+                <div class="flex items-center space-x-1">
+                    <button id="req-prev-btn" onclick="changeReqPage(-1)" class="px-2 py-1 border border-slate-200 rounded text-[11px] bg-white hover:bg-slate-50 disabled:opacity-40 disabled:cursor-not-allowed">Previous</button>
+                    <button id="req-next-btn" onclick="changeReqPage(1)" class="px-2 py-1 border border-slate-200 rounded text-[11px] bg-white hover:bg-slate-50 disabled:opacity-40 disabled:cursor-not-allowed">Next</button>
+                </div>
+            </div>
+        </div>
+
+        <div class="bg-white border border-slate-200/80 rounded-xl shadow-sm overflow-hidden">
             <div class="px-5 py-3.5 border-b border-slate-100 bg-slate-50/50"><h2 class="text-xs font-semibold text-slate-900 uppercase tracking-wider">WARP Quality Metrics</h2></div>
             <div class="overflow-x-auto">
                 <table class="w-full text-left text-xs">
@@ -132,6 +165,22 @@
         </div>
     </main>
 
+    <!-- Inspection Modal -->
+    <div id="inspect-modal" class="fixed inset-0 z-50 bg-slate-900/60 backdrop-blur-sm hidden flex items-center justify-center p-4">
+        <div class="bg-white border border-slate-200 rounded-xl shadow-xl max-w-2xl w-full max-h-[85vh] flex flex-col overflow-hidden">
+            <div class="px-5 py-3.5 border-b border-slate-100 flex justify-between items-center bg-slate-50/50">
+                <h3 id="modal-title" class="text-xs font-semibold text-slate-900 uppercase tracking-wider">Request Inspection</h3>
+                <button onclick="closeModal()" class="text-slate-400 hover:text-slate-600 text-lg leading-none">&times;</button>
+            </div>
+            <div class="p-4 overflow-y-auto flex-1 bg-slate-950 font-mono text-[11px] text-emerald-400">
+                <pre id="modal-content" class="whitespace-pre-wrap break-all"></pre>
+            </div>
+            <div class="px-5 py-2.5 border-t border-slate-100 bg-slate-50/50 flex justify-end">
+                <button onclick="closeModal()" class="bg-slate-900 hover:bg-slate-800 text-white text-xs px-3 py-1.5 rounded-md font-medium">Close</button>
+            </div>
+        </div>
+    </div>
+
     <script>
         const PAGE_SIZE = 5;
         let currentModelPage = 1;
@@ -139,6 +188,8 @@
         let cachedModelKeys = [];
         let cachedUsageData = {};
         let cachedIpHistory = [];
+        let cachedRequests = [];
+        let currentReqPage = 1;
 
         function renderModelTable() {
             const tableBody = document.getElementById('usage-table-body');
@@ -177,8 +228,64 @@
             document.getElementById('ip-next-btn').disabled = (currentIpPage >= totalPages);
         }
 
+        function renderRequestsTable() {
+            const body = document.getElementById('recent-requests-body');
+            const countBadge = document.getElementById('requests-count-badge');
+            countBadge.innerText = `${cachedRequests.length} Captured`;
+
+            const totalPages = Math.max(1, Math.ceil(cachedRequests.length / PAGE_SIZE));
+            if (currentReqPage > totalPages) currentReqPage = totalPages;
+            const start = (currentReqPage - 1) * PAGE_SIZE;
+            const pageItems = cachedRequests.slice(start, start + PAGE_SIZE);
+
+            if (pageItems.length > 0) {
+                body.innerHTML = pageItems.map((r, idx) => {
+                    const globalIdx = start + idx;
+                    const streamBadge = r.stream ? '<span class="text-[9px] bg-slate-100 text-slate-600 px-1 py-0.5 rounded ml-1">stream</span>' : '';
+                    return `
+                        <tr class="hover:bg-slate-50/60 transition-colors">
+                            <td class="px-5 py-2.5 text-slate-400">${r.timestamp}</td>
+                            <td class="px-5 py-2.5 font-bold text-slate-900 font-sans text-[11px]">${r.endpoint} ${streamBadge}</td>
+                            <td class="px-5 py-2.5 text-slate-700">${r.model}</td>
+                            <td class="px-5 py-2.5 text-slate-500 font-sans text-[11px] max-w-xs truncate" title="${r.user_agent}">${r.user_agent}</td>
+                            <td class="px-5 py-2.5 text-right space-x-1">
+                                <button onclick="inspectHeaders(${globalIdx})" class="px-2 py-1 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded text-[10px] font-sans font-medium transition-colors">Headers</button>
+                                <button onclick="inspectPayload(${globalIdx})" class="px-2 py-1 bg-slate-900 hover:bg-slate-800 text-white rounded text-[10px] font-sans font-medium transition-colors">Payload</button>
+                            </td>
+                        </tr>
+                    `;
+                }).join('');
+            } else {
+                body.innerHTML = '<tr><td colspan="5" class="px-5 py-6 text-center text-slate-400 italic font-sans text-xs">No client requests captured yet. Send requests from your AI client to inspect live headers.</td></tr>';
+            }
+            document.getElementById('req-page-info').innerText = `Page ${currentReqPage} of ${totalPages}`;
+            document.getElementById('req-prev-btn').disabled = (currentReqPage <= 1);
+            document.getElementById('req-next-btn').disabled = (currentReqPage >= totalPages);
+        }
+
         function changeModelPage(delta) { currentModelPage += delta; renderModelTable(); }
         function changeIpPage(delta) { currentIpPage += delta; renderIpTable(); }
+        function changeReqPage(delta) { currentReqPage += delta; renderRequestsTable(); }
+
+        function inspectHeaders(index) {
+            const req = cachedRequests[index];
+            if (!req) return;
+            document.getElementById('modal-title').innerText = `HTTP Headers (${req.endpoint} @ ${req.timestamp})`;
+            document.getElementById('modal-content').innerText = JSON.stringify(req.headers, null, 2);
+            document.getElementById('inspect-modal').classList.remove('hidden');
+        }
+
+        function inspectPayload(index) {
+            const req = cachedRequests[index];
+            if (!req) return;
+            document.getElementById('modal-title').innerText = `Payload Summary (${req.model} @ ${req.timestamp})`;
+            document.getElementById('modal-content').innerText = JSON.stringify(req.payload_summary, null, 2);
+            document.getElementById('inspect-modal').classList.remove('hidden');
+        }
+
+        function closeModal() {
+            document.getElementById('inspect-modal').classList.add('hidden');
+        }
 
         function renderWarpQuality(data) {
             const body = document.getElementById('warp-quality-body');
@@ -216,6 +323,8 @@
                 document.getElementById('total-saved').innerText = '$' + grandTotalUsd.toFixed(4);
                 renderModelTable();
                 renderWarpQuality(data);
+                cachedRequests = data.recent_requests || [];
+                renderRequestsTable();
             } catch (e) { /* dashboard will retry */ }
         }
 

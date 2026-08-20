@@ -9,6 +9,7 @@ import threading
 import time
 import uuid
 import ipaddress
+from collections import deque
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, AsyncGenerator, Dict, List, Optional
@@ -718,6 +719,38 @@ def summarize_payload_for_log(payload: dict) -> dict:
     return summary
 
 
+recent_client_requests = deque(maxlen=50)
+_recent_requests_lock = threading.Lock()
+
+
+def record_client_request(endpoint: str, model: str, is_stream: bool, raw_request: Request, payload: dict, status_code: int = 200):
+    """Stores inspected client request headers and payload summary in a bounded ring buffer for the dashboard."""
+    try:
+        req_id = f"req_{uuid.uuid4().hex[:8]}"
+        client_ip = raw_request.client.host if raw_request.client else "unknown"
+        headers_dict = dict(raw_request.headers)
+        ua = headers_dict.get("user-agent", "unknown")
+        session_id = headers_dict.get("x-session-id") or headers_dict.get("x-session-affinity") or headers_dict.get("x-opencode-session") or "-"
+
+        entry = {
+            "id": req_id,
+            "timestamp": time.strftime("%H:%M:%S"),
+            "endpoint": endpoint,
+            "model": model,
+            "stream": is_stream,
+            "status_code": status_code,
+            "client_ip": client_ip,
+            "user_agent": ua,
+            "session_id": session_id,
+            "headers": redact_headers_for_log(headers_dict),
+            "payload_summary": summarize_payload_for_log(payload),
+        }
+        with _recent_requests_lock:
+            recent_client_requests.appendleft(entry)
+    except Exception:
+        pass
+
+
 SAFE_UPSTREAM_HEADERS = {
     "content-type",
     "retry-after",
@@ -1016,8 +1049,15 @@ async def get_metrics():
         "ip_history": rotator_history,
         "warp_quality": dict(warp_quality_stats),
         "dual_warp": dict(_dual_warp),
+        "recent_requests": list(recent_client_requests),
         "rotation_in_progress": _rotation_in_progress.is_set()
     }
+
+
+@app.get("/api/recent-requests")
+async def get_recent_requests():
+    with _recent_requests_lock:
+        return {"requests": list(recent_client_requests)}
 
 @app.get("/health")
 async def health():
@@ -1069,8 +1109,9 @@ async def chat_completions(raw_request: Request):
     current_model = payload.get("model", "deepseek-v4-flash-free")
     is_stream = payload.get("stream", False)
     log.info(f"Received request for model '{current_model}' (Stream: {is_stream} | Has Tools: {'tools' in payload})")
-    log.info(f"Incoming client headers: {redact_headers_for_log(dict(raw_request.headers))}")
-    log.info(f"Incoming client JSON payload summary: {json.dumps(summarize_payload_for_log(payload))}")
+
+    # Record client headers & payload summary for web dashboard inspector
+    record_client_request("/v1/chat/completions", current_model, is_stream, raw_request, payload)
 
     # Ensure end-user identifier is present for models requiring safety_identifier / user (e.g. contributor / vertex models)
     if not payload.get("user"):
@@ -1207,8 +1248,9 @@ async def anthropic_messages(raw_request: Request):
     model_name = body.get("model", "deepseek-v4-flash-free")
     is_stream = body.get("stream", False)
     log.info(f"Received Anthropic-format request for model '{model_name}' (Stream: {is_stream})")
-    log.info(f"Incoming client headers: {redact_headers_for_log(dict(raw_request.headers))}")
-    log.info(f"Incoming client JSON payload summary: {json.dumps(summarize_payload_for_log(body))}")
+
+    # Record client headers & payload summary for web dashboard inspector
+    record_client_request("/v1/messages", model_name, is_stream, raw_request, body)
 
     client_api_key = raw_request.headers.get("x-api-key") or ""
     if not client_api_key:
@@ -1357,8 +1399,9 @@ async def responses_endpoint(raw_request: Request):
     model_name = body.get("model", "deepseek-v4-flash-free")
     is_stream = body.get("stream", False)
     log.info(f"Received Responses API request for model '{model_name}' (Stream: {is_stream})")
-    log.info(f"Incoming client headers: {redact_headers_for_log(dict(raw_request.headers))}")
-    log.info(f"Incoming client JSON payload summary: {json.dumps(summarize_payload_for_log(body))}")
+
+    # Record client headers & payload summary for web dashboard inspector
+    record_client_request("/v1/responses", model_name, is_stream, raw_request, body)
 
     # Ensure end-user identifier is present
     if not body.get("user"):
