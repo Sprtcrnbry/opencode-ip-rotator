@@ -56,7 +56,7 @@ class BuildOpencodeHeadersTests(unittest.TestCase):
             "x-opencode-request": "req_my_custom_request",
             "x-opencode-user": "usr_my_custom_user",
             "x-safety-identifier": "safe_123",
-            "authorization": "Bearer custom-key",
+            "authorization": "Bearer sk-custom-key",
         }))
         self.assertEqual(hdrs["User-Agent"], "opencode/1.18.18 (vscode)")
         self.assertEqual(hdrs["x-opencode-client"], "vscode-extension")
@@ -66,7 +66,16 @@ class BuildOpencodeHeadersTests(unittest.TestCase):
         self.assertEqual(hdrs["x-opencode-user"], "usr_my_custom_user")
         self.assertEqual(hdrs["x-user-id"], "usr_my_custom_user")
         self.assertEqual(hdrs["x-safety-identifier"], "safe_123")
-        self.assertEqual(hdrs["Authorization"], "Bearer custom-key")
+        self.assertEqual(hdrs["Authorization"], "Bearer sk-custom-key")
+
+    def test_dummy_authorization_maps_to_public(self):
+        for dummy in ("Bearer dummy", "Bearer test", "Bearer null", "Bearer undefined", "Bearer any"):
+            hdrs = server.build_opencode_headers(FakeRequest({"authorization": dummy}))
+            self.assertEqual(hdrs["Authorization"], "Bearer public")
+
+    def test_real_authorization_is_preserved(self):
+        hdrs = server.build_opencode_headers(FakeRequest({"authorization": "Bearer sk-valid-account-key"}))
+        self.assertEqual(hdrs["Authorization"], "Bearer sk-valid-account-key")
 
 
 if __name__ == "__main__":

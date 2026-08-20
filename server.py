@@ -619,10 +619,21 @@ def build_opencode_headers(raw_request: Request) -> Dict[str, str]:
     and supplying realistic CLI defaults when missing."""
     headers = get_realistic_headers()
 
-    # Pass through client's Authorization if provided
-    client_auth = raw_request.headers.get("authorization")
-    if client_auth:
-        headers["Authorization"] = client_auth
+    # Pass through valid API keys or map dummy/placeholder keys to 'Bearer public'
+    client_auth = raw_request.headers.get("authorization", "")
+    client_api_key = raw_request.headers.get("x-api-key", "")
+    token = ""
+    if client_auth.startswith("Bearer "):
+        token = client_auth[7:].strip()
+    elif client_auth:
+        token = client_auth.strip()
+    elif client_api_key:
+        token = client_api_key.strip()
+
+    if not token or token.lower() in ("any", "none", "null", "test", "dummy", "public", "undefined", "false", "true", "local"):
+        headers["Authorization"] = "Bearer public"
+    else:
+        headers["Authorization"] = f"Bearer {token}"
 
     # Detect if client is an authentic OpenCode agent / CLI
     client_ua = raw_request.headers.get("user-agent", "")
