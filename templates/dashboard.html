@@ -242,11 +242,13 @@
                 body.innerHTML = pageItems.map((r, idx) => {
                     const globalIdx = start + idx;
                     const streamBadge = r.stream ? '<span class="text-[9px] bg-slate-100 text-slate-600 px-1 py-0.5 rounded ml-1">stream</span>' : '';
-                    let statusBadge = '<span class="text-[9px] bg-emerald-50 text-emerald-700 font-bold px-1.5 py-0.5 rounded border border-emerald-200 ml-1">200</span>';
-                    if (r.status_code && r.status_code !== 200) {
-                        statusBadge = `<span class="text-[9px] bg-rose-50 text-rose-700 font-bold px-1.5 py-0.5 rounded border border-rose-200 ml-1">${r.status_code}</span>`;
-                    }
-                    const errorBtn = r.error_detail ? `<button onclick="inspectError(${globalIdx})" class="px-2 py-1 bg-rose-100 hover:bg-rose-200 text-rose-800 rounded text-[10px] font-sans font-medium transition-colors">Error</button>` : '';
+                    const isError = r.status_code && r.status_code !== 200;
+                    const statusBadge = isError
+                        ? `<span class="text-[9px] bg-rose-50 text-rose-700 font-bold px-1.5 py-0.5 rounded border border-rose-200 ml-1">${r.status_code}</span>`
+                        : '<span class="text-[9px] bg-emerald-50 text-emerald-700 font-bold px-1.5 py-0.5 rounded border border-emerald-200 ml-1">200</span>';
+                    const errorBtn = isError
+                        ? `<button onclick="inspectError(${globalIdx})" class="px-2 py-1 bg-rose-100 hover:bg-rose-200 text-rose-800 rounded text-[10px] font-sans font-medium transition-colors">Error</button>`
+                        : '';
 
                     return `
                         <tr class="hover:bg-slate-50/60 transition-colors">
@@ -294,7 +296,18 @@
             const req = cachedRequests[index];
             if (!req) return;
             document.getElementById('modal-title').innerText = `Upstream Error Response (${req.status_code} @ ${req.timestamp})`;
-            document.getElementById('modal-content').innerText = req.error_detail || 'No error details recorded.';
+            let errContent = req.error_detail;
+            if (!errContent) {
+                errContent = `HTTP ${req.status_code} Error. (No additional response text recorded)`;
+            } else {
+                try {
+                    const parsed = JSON.parse(errContent);
+                    errContent = JSON.stringify(parsed, null, 2);
+                } catch (e) {
+                    // Keep raw text
+                }
+            }
+            document.getElementById('modal-content').innerText = errContent;
             document.getElementById('inspect-modal').classList.remove('hidden');
         }
 
