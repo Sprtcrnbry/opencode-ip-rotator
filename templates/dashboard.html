@@ -367,17 +367,22 @@
                 const name = (typeof m === 'object' && m.name) ? m.name : id.replace(/-/g, ' ').replace(/\b\w/g, l => l.toUpperCase());
                 const isFree = id.toLowerCase().includes('free') || id.toLowerCase().includes('pickle');
                 const badge = isFree ? '<span class="text-[9px] bg-emerald-50 text-emerald-700 font-bold px-1.5 py-0.5 rounded border border-emerald-200">Free</span>' : '';
-                const ctxLabel = (typeof m === 'object' && m.context_label) ? m.context_label : '128k context';
-                const ctxTokens = (typeof m === 'object' && m.context_tokens) ? m.context_tokens.toLocaleString() + ' max tokens' : '';
-                const ctxBadge = `<span class="text-[9px] bg-slate-100 text-slate-600 font-medium font-mono px-1.5 py-0.5 rounded border border-slate-200" title="${ctxTokens}">${ctxLabel}</span>`;
+                const ctxLabel = (typeof m === 'object' && m.context_label) ? m.context_label : '128k Context';
+                const ctxTokens = (typeof m === 'object' && m.context_tokens) ? m.context_tokens.toLocaleString() + ' tokens context window' : '';
+                const ctxBadge = `<span class="text-[9px] bg-slate-100 text-slate-700 font-medium font-mono px-1.5 py-0.5 rounded border border-slate-200" title="${ctxTokens}">${ctxLabel}</span>`;
+                
+                const outLabel = (typeof m === 'object' && m.output_label) ? m.output_label : '8k Max Output';
+                const outTokens = (typeof m === 'object' && m.max_output_tokens) ? m.max_output_tokens.toLocaleString() + ' max output tokens' : '';
+                const outBadge = `<span class="text-[9px] bg-blue-50 text-blue-700 font-medium font-mono px-1.5 py-0.5 rounded border border-blue-200" title="${outTokens}">${outLabel}</span>`;
 
                 return `
                     <div class="py-2.5 flex items-center justify-between hover:bg-slate-50 px-2 rounded-lg transition-colors">
-                        <div class="space-y-0.5 pr-3 min-w-0">
-                            <div class="flex items-center space-x-1.5">
-                                <span class="font-sans font-medium text-slate-900 text-xs truncate">${name}</span>
+                        <div class="space-y-1 pr-3 min-w-0">
+                            <div class="flex items-center space-x-1.5 flex-wrap gap-y-1">
+                                <span class="font-sans font-semibold text-slate-900 text-xs truncate">${name}</span>
                                 ${badge}
                                 ${ctxBadge}
+                                ${outBadge}
                             </div>
                             <p class="font-mono text-[11px] text-slate-500 truncate">${id}</p>
                         </div>

@@ -499,52 +499,83 @@ else:
     )
 log = logging.getLogger("zen_server")
 
-KNOWN_MODEL_CONTEXT_WINDOWS = {
-    "gemini-2.5-flash": {"context": 1048576, "label": "1M context"},
-    "gemini-2.5-pro": {"context": 2097152, "label": "2M context"},
-    "gemini-2.0-flash": {"context": 1048576, "label": "1M context"},
-    "deepseek-v4-flash": {"context": 131072, "label": "128k context"},
-    "deepseek-v3": {"context": 131072, "label": "128k context"},
-    "deepseek-r1": {"context": 131072, "label": "128k context"},
-    "deepseek-coder": {"context": 131072, "label": "128k context"},
-    "claude-3-7-sonnet": {"context": 200000, "label": "200k context"},
-    "claude-3-5-sonnet": {"context": 200000, "label": "200k context"},
-    "claude-3-opus": {"context": 200000, "label": "200k context"},
-    "claude-3-haiku": {"context": 200000, "label": "200k context"},
-    "gpt-4o": {"context": 128000, "label": "128k context"},
-    "gpt-4o-mini": {"context": 128000, "label": "128k context"},
-    "o1": {"context": 200000, "label": "200k context"},
-    "o3-mini": {"context": 200000, "label": "200k context"},
-    "muse-spark": {"context": 32768, "label": "32k context"},
-    "big-pickle": {"context": 131072, "label": "128k context"},
-    "llama-3.3-70b": {"context": 131072, "label": "128k context"},
-    "llama-3.1-405b": {"context": 131072, "label": "128k context"},
-    "qwen": {"context": 131072, "label": "128k context"},
+KNOWN_MODEL_SPECS = {
+    "gemini-2.5-flash": {"context": 1048576, "context_label": "1M Context", "max_output": 8192, "output_label": "8k Max Output"},
+    "gemini-2.5-pro": {"context": 2097152, "context_label": "2M Context", "max_output": 8192, "output_label": "8k Max Output"},
+    "gemini-2.0-flash": {"context": 1048576, "context_label": "1M Context", "max_output": 8192, "output_label": "8k Max Output"},
+    "deepseek-v4-flash": {"context": 131072, "context_label": "128k Context", "max_output": 16384, "output_label": "16k Max Output"},
+    "deepseek-v3": {"context": 131072, "context_label": "128k Context", "max_output": 8192, "output_label": "8k Max Output"},
+    "deepseek-r1": {"context": 131072, "context_label": "128k Context", "max_output": 65536, "output_label": "64k Max Output"},
+    "deepseek-coder": {"context": 131072, "context_label": "128k Context", "max_output": 8192, "output_label": "8k Max Output"},
+    "claude-3-7-sonnet": {"context": 200000, "context_label": "200k Context", "max_output": 64000, "output_label": "64k Max Output"},
+    "claude-3-5-sonnet": {"context": 200000, "context_label": "200k Context", "max_output": 8192, "output_label": "8k Max Output"},
+    "claude-3-opus": {"context": 200000, "context_label": "200k Context", "max_output": 4096, "output_label": "4k Max Output"},
+    "claude-3-haiku": {"context": 200000, "context_label": "200k Context", "max_output": 4096, "output_label": "4k Max Output"},
+    "gpt-4o": {"context": 128000, "context_label": "128k Context", "max_output": 16384, "output_label": "16k Max Output"},
+    "gpt-4o-mini": {"context": 128000, "context_label": "128k Context", "max_output": 16384, "output_label": "16k Max Output"},
+    "o1": {"context": 200000, "context_label": "200k Context", "max_output": 100000, "output_label": "100k Max Output"},
+    "o3-mini": {"context": 200000, "context_label": "200k Context", "max_output": 100000, "output_label": "100k Max Output"},
+    "muse-spark": {"context": 32768, "context_label": "32k Context", "max_output": 8192, "output_label": "8k Max Output"},
+    "big-pickle": {"context": 131072, "context_label": "128k Context", "max_output": 8192, "output_label": "8k Max Output"},
+    "llama-3.3-70b": {"context": 131072, "context_label": "128k Context", "max_output": 8192, "output_label": "8k Max Output"},
+    "llama-3.1-405b": {"context": 131072, "context_label": "128k Context", "max_output": 8192, "output_label": "8k Max Output"},
+    "qwen": {"context": 131072, "context_label": "128k Context", "max_output": 8192, "output_label": "8k Max Output"},
 }
 
-def resolve_model_context(model_id: str, upstream_meta: dict) -> dict:
-    """Extracts or infers max context window information."""
+def resolve_model_specs(model_id: str, upstream_meta: dict) -> dict:
+    """Extracts or infers both Context Window (input) and Max Output Tokens (generation)."""
+    # 1. Context Window
     ctx = (
         upstream_meta.get("context_length")
         or upstream_meta.get("max_context_length")
         or upstream_meta.get("context_window")
-        or upstream_meta.get("max_tokens")
+        or upstream_meta.get("input_token_limit")
     )
     if ctx and isinstance(ctx, (int, float)) and ctx > 0:
-        if ctx >= 1000000:
-            label = f"{round(ctx / 1000000, 1) if ctx % 1000000 != 0 else int(ctx / 1000000)}M context"
-        elif ctx >= 1000:
-            label = f"{int(ctx / 1000)}k context"
+        ctx_val = int(ctx)
+        if ctx_val >= 1000000:
+            ctx_label = f"{round(ctx_val / 1000000, 1) if ctx_val % 1000000 != 0 else int(ctx_val / 1000000)}M Context"
+        elif ctx_val >= 1000:
+            ctx_label = f"{int(ctx_val / 1000)}k Context"
         else:
-            label = f"{ctx} tokens"
-        return {"context_tokens": int(ctx), "context_label": label}
+            ctx_label = f"{ctx_val} Context"
+    else:
+        ctx_val = None
+        ctx_label = None
+
+    # 2. Max Output Tokens
+    out = (
+        upstream_meta.get("max_output_tokens")
+        or upstream_meta.get("max_tokens")
+        or upstream_meta.get("output_token_limit")
+    )
+    if out and isinstance(out, (int, float)) and out > 0:
+        out_val = int(out)
+        if out_val >= 1000:
+            out_label = f"{int(out_val / 1000)}k Max Output"
+        else:
+            out_label = f"{out_val} Max Output"
+    else:
+        out_val = None
+        out_label = None
 
     m_id_lower = model_id.lower()
-    for key, val in KNOWN_MODEL_CONTEXT_WINDOWS.items():
+    for key, spec in KNOWN_MODEL_SPECS.items():
         if key in m_id_lower:
-            return {"context_tokens": val["context"], "context_label": val["label"]}
+            if not ctx_val:
+                ctx_val = spec["context"]
+                ctx_label = spec["context_label"]
+            if not out_val:
+                out_val = spec["max_output"]
+                out_label = spec["output_label"]
+            break
 
-    return {"context_tokens": 131072, "context_label": "128k context"}
+    return {
+        "context_tokens": ctx_val or 131072,
+        "context_label": ctx_label or "128k Context",
+        "max_output_tokens": out_val or 8192,
+        "output_label": out_label or "8k Max Output",
+    }
 
 def fetch_models_from_server() -> Optional[List[Dict[str, Any]]]:
     """Fetches model list and full metadata directly from the upstream server."""
@@ -565,9 +596,11 @@ def fetch_models_from_server() -> Optional[List[Dict[str, Any]]]:
                         model_entry = dict(m)
                         if "name" not in model_entry:
                             model_entry["name"] = m_id.replace("-", " ").title()
-                        ctx_info = resolve_model_context(m_id, m)
-                        model_entry["context_tokens"] = ctx_info["context_tokens"]
-                        model_entry["context_label"] = ctx_info["context_label"]
+                        specs = resolve_model_specs(m_id, m)
+                        model_entry["context_tokens"] = specs["context_tokens"]
+                        model_entry["context_label"] = specs["context_label"]
+                        model_entry["max_output_tokens"] = specs["max_output_tokens"]
+                        model_entry["output_label"] = specs["output_label"]
                         new_models.append(model_entry)
                 return new_models if new_models else None
     except Exception as e:
