@@ -701,7 +701,7 @@ recent_client_requests = deque(maxlen=50)
 _recent_requests_lock = threading.Lock()
 
 
-def record_client_request(endpoint: str, model: str, is_stream: bool, raw_request: Request, payload: dict, status_code: int = 200):
+def record_client_request(endpoint: str, model: str, is_stream: bool, raw_request: Request, payload: dict, status_code: int = 200) -> Optional[dict]:
     """Stores inspected client request headers and payload summary in a bounded ring buffer for the dashboard."""
     try:
         req_id = f"req_{uuid.uuid4().hex[:8]}"
@@ -722,11 +722,13 @@ def record_client_request(endpoint: str, model: str, is_stream: bool, raw_reques
             "session_id": session_id,
             "headers": redact_headers_for_log(headers_dict),
             "payload_summary": summarize_payload_for_log(payload),
+            "error_detail": None,
         }
         with _recent_requests_lock:
             recent_client_requests.appendleft(entry)
+        return entry
     except Exception:
-        pass
+        return None
 
 
 SAFE_UPSTREAM_HEADERS = {
@@ -1089,7 +1091,7 @@ async def chat_completions(raw_request: Request):
     log.info(f"Received request for model '{current_model}' (Stream: {is_stream} | Has Tools: {'tools' in payload})")
 
     # Record client headers & payload summary for web dashboard inspector
-    record_client_request("/v1/chat/completions", current_model, is_stream, raw_request, payload)
+    req_entry = record_client_request("/v1/chat/completions", current_model, is_stream, raw_request, payload)
 
     # Ensure end-user identifier is present for models requiring safety_identifier / user (e.g. contributor / vertex models)
     if not payload.get("user"):
@@ -1136,6 +1138,10 @@ async def chat_completions(raw_request: Request):
                 continue
 
             if response.status_code != 200:
+                log.warning("Upstream returned HTTP %s for '%s': %s", response.status_code, current_model, response.text[:500])
+                if req_entry:
+                    req_entry["status_code"] = response.status_code
+                    req_entry["error_detail"] = response.text[:1000]
                 try:
                     res_json = response.json()
                     return JSONResponse(status_code=response.status_code, content=res_json)
@@ -1228,7 +1234,7 @@ async def anthropic_messages(raw_request: Request):
     log.info(f"Received Anthropic-format request for model '{model_name}' (Stream: {is_stream})")
 
     # Record client headers & payload summary for web dashboard inspector
-    record_client_request("/v1/messages", model_name, is_stream, raw_request, body)
+    req_entry = record_client_request("/v1/messages", model_name, is_stream, raw_request, body)
 
     client_api_key = raw_request.headers.get("x-api-key") or ""
     if not client_api_key:
@@ -1293,6 +1299,10 @@ async def anthropic_messages(raw_request: Request):
                 continue
 
             if response.status_code != 200:
+                log.warning("Upstream returned HTTP %s for '%s': %s", response.status_code, model_name, response.text[:500])
+                if req_entry:
+                    req_entry["status_code"] = response.status_code
+                    req_entry["error_detail"] = response.text[:1000]
                 try:
                     res_json = response.json()
                     return JSONResponse(status_code=response.status_code, content=res_json)
@@ -1379,7 +1389,7 @@ async def responses_endpoint(raw_request: Request):
     log.info(f"Received Responses API request for model '{model_name}' (Stream: {is_stream})")
 
     # Record client headers & payload summary for web dashboard inspector
-    record_client_request("/v1/responses", model_name, is_stream, raw_request, body)
+    req_entry = record_client_request("/v1/responses", model_name, is_stream, raw_request, body)
 
     # Ensure end-user identifier is present
     if not body.get("user"):
@@ -1426,6 +1436,10 @@ async def responses_endpoint(raw_request: Request):
                 continue
 
             if response.status_code != 200:
+                log.warning("Upstream returned HTTP %s for '%s': %s", response.status_code, model_name, response.text[:500])
+                if req_entry:
+                    req_entry["status_code"] = response.status_code
+                    req_entry["error_detail"] = response.text[:1000]
                 try:
                     res_json = response.json()
                     return JSONResponse(status_code=response.status_code, content=res_json)

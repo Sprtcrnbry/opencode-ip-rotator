@@ -242,13 +242,20 @@
                 body.innerHTML = pageItems.map((r, idx) => {
                     const globalIdx = start + idx;
                     const streamBadge = r.stream ? '<span class="text-[9px] bg-slate-100 text-slate-600 px-1 py-0.5 rounded ml-1">stream</span>' : '';
+                    let statusBadge = '<span class="text-[9px] bg-emerald-50 text-emerald-700 font-bold px-1.5 py-0.5 rounded border border-emerald-200 ml-1">200</span>';
+                    if (r.status_code && r.status_code !== 200) {
+                        statusBadge = `<span class="text-[9px] bg-rose-50 text-rose-700 font-bold px-1.5 py-0.5 rounded border border-rose-200 ml-1">${r.status_code}</span>`;
+                    }
+                    const errorBtn = r.error_detail ? `<button onclick="inspectError(${globalIdx})" class="px-2 py-1 bg-rose-100 hover:bg-rose-200 text-rose-800 rounded text-[10px] font-sans font-medium transition-colors">Error</button>` : '';
+
                     return `
                         <tr class="hover:bg-slate-50/60 transition-colors">
                             <td class="px-5 py-2.5 text-slate-400">${r.timestamp}</td>
-                            <td class="px-5 py-2.5 font-bold text-slate-900 font-sans text-[11px]">${r.endpoint} ${streamBadge}</td>
+                            <td class="px-5 py-2.5 font-bold text-slate-900 font-sans text-[11px]">${r.endpoint} ${streamBadge} ${statusBadge}</td>
                             <td class="px-5 py-2.5 text-slate-700">${r.model}</td>
                             <td class="px-5 py-2.5 text-slate-500 font-sans text-[11px] max-w-xs truncate" title="${r.user_agent}">${r.user_agent}</td>
                             <td class="px-5 py-2.5 text-right space-x-1">
+                                ${errorBtn}
                                 <button onclick="inspectHeaders(${globalIdx})" class="px-2 py-1 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded text-[10px] font-sans font-medium transition-colors">Headers</button>
                                 <button onclick="inspectPayload(${globalIdx})" class="px-2 py-1 bg-slate-900 hover:bg-slate-800 text-white rounded text-[10px] font-sans font-medium transition-colors">Payload</button>
                             </td>
@@ -280,6 +287,14 @@
             if (!req) return;
             document.getElementById('modal-title').innerText = `Payload Summary (${req.model} @ ${req.timestamp})`;
             document.getElementById('modal-content').innerText = JSON.stringify(req.payload_summary, null, 2);
+            document.getElementById('inspect-modal').classList.remove('hidden');
+        }
+
+        function inspectError(index) {
+            const req = cachedRequests[index];
+            if (!req) return;
+            document.getElementById('modal-title').innerText = `Upstream Error Response (${req.status_code} @ ${req.timestamp})`;
+            document.getElementById('modal-content').innerText = req.error_detail || 'No error details recorded.';
             document.getElementById('inspect-modal').classList.remove('hidden');
         }
 
