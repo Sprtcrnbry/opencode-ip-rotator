@@ -50,6 +50,8 @@ class BuildOpencodeHeadersTests(unittest.TestCase):
     def test_real_opencode_agent_headers_are_preserved(self):
         hdrs = server.build_opencode_headers(FakeRequest({
             "user-agent": "opencode/1.18.18 (vscode)",
+            "x-opencode-client": "vscode-extension",
+            "x-opencode-project": "/custom/workspace",
             "x-opencode-session": "ses_my_custom_session",
             "x-opencode-request": "req_my_custom_request",
             "x-opencode-user": "usr_my_custom_user",
@@ -57,9 +59,12 @@ class BuildOpencodeHeadersTests(unittest.TestCase):
             "authorization": "Bearer custom-key",
         }))
         self.assertEqual(hdrs["User-Agent"], "opencode/1.18.18 (vscode)")
+        self.assertEqual(hdrs["x-opencode-client"], "vscode-extension")
+        self.assertEqual(hdrs["x-opencode-project"], "/custom/workspace")
         self.assertEqual(hdrs["x-opencode-session"], "ses_my_custom_session")
         self.assertEqual(hdrs["x-opencode-request"], "req_my_custom_request")
         self.assertEqual(hdrs["x-opencode-user"], "usr_my_custom_user")
+        self.assertEqual(hdrs["x-user-id"], "usr_my_custom_user")
         self.assertEqual(hdrs["x-safety-identifier"], "safe_123")
         self.assertEqual(hdrs["Authorization"], "Bearer custom-key")
 
