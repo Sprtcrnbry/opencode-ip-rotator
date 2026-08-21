@@ -791,6 +791,12 @@ async def lifespan(application: FastAPI):
     yield
     _close_all_sessions()
     _discovery_stop.set()
+    try:
+        import subprocess, rotator
+        subprocess.run([rotator.get_warp_bin(), "--accept-tos", "disconnect"], capture_output=True, timeout=10, check=False)
+        log.info("WARP disconnected on shutdown")
+    except Exception:
+        pass
 
 app = FastAPI(title="OpenCode Zen v3.0 Ultra Resilient Proxy", lifespan=lifespan)
 
