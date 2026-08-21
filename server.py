@@ -1184,7 +1184,13 @@ async def stream_response(response, model_name: str, session=None) -> AsyncGener
         line_iter = response.iter_lines()
 
         while True:
-            item = await loop.run_in_executor(None, get_next_line, line_iter)
+            try:
+                item = await asyncio.wait_for(loop.run_in_executor(None, get_next_line, line_iter), timeout=4.0)
+            except asyncio.TimeoutError:
+                # Send SSE comment heartbeat to keep TCP socket active during long upstream reasoning/generation phases
+                yield b": keep-alive\n\n"
+                continue
+
             if item == "STOP_ITERATION":
                 log.info(f"[STREAM DEBUG] Upstream reached natural StopIteration for '{model_name}'. Total lines: {chunk_count}")
                 break
