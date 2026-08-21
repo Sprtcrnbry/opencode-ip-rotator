@@ -536,7 +536,12 @@ def fetch_models_dev_specs() -> Dict[str, Dict[str, Any]]:
                         "context": ctx,
                         "max_output": out,
                         "reasoning": bool(m_info.get("reasoning")),
-                        "tool_call": bool(m_info.get("tool_call")),
+                        "reasoning_options": m_info.get("reasoning_options", []),
+                        "tool_call": bool(m_info.get("tool_call", True)),
+                        "attachment": bool(m_info.get("attachment", False)),
+                        "modalities": m_info.get("modalities", {"input": ["text"], "output": ["text"]}),
+                        "structured_output": bool(m_info.get("structured_output", False)),
+                        "temperature": bool(m_info.get("temperature", True)),
                     }
                     if norm_id not in specs or provider_id == "opencode":
                         specs[norm_id] = entry
@@ -562,7 +567,12 @@ def fetch_models_dev_specs() -> Dict[str, Dict[str, Any]]:
                         "context": ctx,
                         "max_output": out,
                         "reasoning": bool(m_info.get("reasoning")),
-                        "tool_call": bool(m_info.get("tool_call")),
+                        "reasoning_options": m_info.get("reasoning_options", []),
+                        "tool_call": bool(m_info.get("tool_call", True)),
+                        "attachment": bool(m_info.get("attachment", False)),
+                        "modalities": m_info.get("modalities", {"input": ["text"], "output": ["text"]}),
+                        "structured_output": bool(m_info.get("structured_output", False)),
+                        "temperature": bool(m_info.get("temperature", True)),
                     }
     except Exception as e:
         log.debug("Error fetching models.dev/models.json: %s", e)
@@ -597,7 +607,7 @@ def fetch_router_model_specs() -> Dict[str, Dict[str, Any]]:
                         "context": int(ctx) if ctx else None,
                         "max_output": int(out) if out else None,
                         "reasoning": bool(caps.get("reasoning")),
-                        "tool_call": bool(caps.get("tools")),
+                        "tool_call": bool(caps.get("tools", True)),
                     }
             return specs
     except Exception as e:
@@ -644,7 +654,12 @@ def resolve_model_specs(model_id: str, upstream_meta: dict, dynamic_specs: Optio
     name_val = upstream_meta.get("name")
     desc_val = upstream_meta.get("description", "")
     reasoning_val = bool(caps.get("reasoning"))
-    tool_val = bool(caps.get("tools"))
+    reasoning_options_val = upstream_meta.get("reasoning_options", [])
+    tool_val = bool(caps.get("tools", True))
+    attachment_val = bool(upstream_meta.get("attachment", False))
+    modalities_val = upstream_meta.get("modalities", {"input": ["text"], "output": ["text"]})
+    structured_output_val = bool(upstream_meta.get("structured_output", False))
+    temperature_val = bool(upstream_meta.get("temperature", True))
 
     m_id_lower = model_id.lower()
     norm_id = m_id_lower.split("/")[-1]
@@ -669,8 +684,18 @@ def resolve_model_specs(model_id: str, upstream_meta: dict, dynamic_specs: Optio
                 desc_val = match_spec["description"]
             if "reasoning" in match_spec:
                 reasoning_val = match_spec["reasoning"]
+            if "reasoning_options" in match_spec:
+                reasoning_options_val = match_spec["reasoning_options"]
             if "tool_call" in match_spec:
                 tool_val = match_spec["tool_call"]
+            if "attachment" in match_spec:
+                attachment_val = match_spec["attachment"]
+            if "modalities" in match_spec:
+                modalities_val = match_spec["modalities"]
+            if "structured_output" in match_spec:
+                structured_output_val = match_spec["structured_output"]
+            if "temperature" in match_spec:
+                temperature_val = match_spec["temperature"]
 
     ctx_num = int(ctx_val) if (ctx_val and isinstance(ctx_val, (int, float))) else 128000
     out_num = int(out_val) if (out_val and isinstance(out_val, (int, float))) else 8192
@@ -683,7 +708,12 @@ def resolve_model_specs(model_id: str, upstream_meta: dict, dynamic_specs: Optio
         "max_output_tokens": out_num,
         "output_label": format_tokens_label(out_num, "Max Output", "8k Max Output"),
         "reasoning": reasoning_val,
+        "reasoning_options": reasoning_options_val,
         "tool_call": tool_val,
+        "attachment": attachment_val,
+        "modalities": modalities_val,
+        "structured_output": structured_output_val,
+        "temperature": temperature_val,
     }
 
 def fetch_models_from_server() -> Optional[List[Dict[str, Any]]]:
@@ -715,7 +745,12 @@ def fetch_models_from_server() -> Optional[List[Dict[str, Any]]]:
                         model_entry["max_output_tokens"] = specs["max_output_tokens"]
                         model_entry["output_label"] = specs["output_label"]
                         model_entry["reasoning"] = specs["reasoning"]
+                        model_entry["reasoning_options"] = specs["reasoning_options"]
                         model_entry["tool_call"] = specs["tool_call"]
+                        model_entry["attachment"] = specs["attachment"]
+                        model_entry["modalities"] = specs["modalities"]
+                        model_entry["structured_output"] = specs["structured_output"]
+                        model_entry["temperature"] = specs["temperature"]
                         new_models.append(model_entry)
                 return new_models if new_models else None
     except Exception as e:
@@ -1351,17 +1386,52 @@ async def health():
 @app.get("/v1/models")
 async def list_models():
     with _discovery_lock:
+        models_list = []
+        for m in discovered_models:
+            m_id = m.get("id", "")
+            ctx = m.get("context_tokens", 131072)
+            out = m.get("max_output_tokens", 8192)
+            modalities = m.get("modalities", {"input": ["text"], "output": ["text"]})
+            input_modalities = modalities.get("input", ["text"]) if isinstance(modalities, dict) else ["text"]
+            has_reasoning = bool(m.get("reasoning", False))
+            has_tools = bool(m.get("tool_call", True))
+            reasoning_options = m.get("reasoning_options", [])
+
+            entry = {
+                "id": m_id,
+                "name": m.get("name", m_id.replace("-", " ").title()),
+                "object": m.get("object", "model"),
+                "created": m.get("created", 1787139400),
+                "owned_by": m.get("owned_by", "opencode"),
+                "description": m.get("description", ""),
+                "context_length": ctx,
+                "max_completion_tokens": out,
+                "reasoning": has_reasoning,
+                "reasoning_options": reasoning_options,
+                "tool_call": has_tools,
+                "attachment": bool(m.get("attachment", False)),
+                "modalities": modalities,
+                "structured_output": bool(m.get("structured_output", False)),
+                "temperature": bool(m.get("temperature", True)),
+                "capabilities": {
+                    "vision": "image" in input_modalities,
+                    "pdf": "pdf" in input_modalities,
+                    "tools": has_tools,
+                    "reasoning": has_reasoning,
+                    "thinkingFormat": "openai",
+                    "thinkingCanDisable": True,
+                    "contextWindow": ctx,
+                    "maxOutput": out,
+                },
+                "limit": {
+                    "context": ctx,
+                    "output": out,
+                }
+            }
+            models_list.append(entry)
         return {
             "object": "list",
-            "data": [
-                {
-                    "id": m.get("id"),
-                    "object": m.get("object", "model"),
-                    "created": m.get("created", 1787139400),
-                    "owned_by": m.get("owned_by", "opencode"),
-                }
-                for m in discovered_models
-            ]
+            "data": models_list
         }
 
 @app.post("/v1/chat/completions")
