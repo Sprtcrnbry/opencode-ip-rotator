@@ -1,6 +1,7 @@
 import asyncio
 import json
 import logging
+from concurrent.futures import ThreadPoolExecutor
 import os
 import random
 import signal
@@ -24,7 +25,8 @@ from prometheus_client import Counter, Gauge, Histogram, REGISTRY, generate_late
 
 from curl_cffi import requests as cffi_requests
 from rate_limits import classify_upstream_429
-from rotator import flow_lock, active_flows_count, get_public_ip, get_ip_location, rotation_count
+import rotator
+from rotator import flow_lock, get_public_ip, get_ip_location
 
 # -----------------------------------------------------------------------------
 # Constants
@@ -319,8 +321,10 @@ _request_drain_event = asyncio.Event()
 _request_drain_event.set()
 
 async def wait_for_rotation_drain():
-    if _rotation_in_progress.is_set():
-        await asyncio.wait_for(_request_drain_event.wait(), timeout=15)
+    # Loop-wait instead of wait_for: the 15s wait_for timed out during long
+    # rotations and surfaced as a 500 to every request.
+    while _rotation_in_progress.is_set():
+        await asyncio.sleep(0.5)
 
 def signal_rotation_start():
     _rotation_in_progress.set()
@@ -715,13 +719,24 @@ def resolve_model_specs(model_id: str, upstream_meta: dict, dynamic_specs: Optio
         "temperature": temperature_val,
     }
 
+def enriched_default_models(dynamic_specs: dict) -> List[Dict[str, Any]]:
+    """Static free-model list enriched from models.dev/router so /v1/models keeps real context/output/thinking metadata offline."""
+    out = []
+    for m in DEFAULT_FREE_MODELS:
+        entry = dict(m)
+        entry.update(resolve_model_specs(m["id"], {}, dynamic_specs))
+        out.append(entry)
+    return out
+
+
 def fetch_models_from_server() -> Optional[List[Dict[str, Any]]]:
     """Fetches model list directly from the upstream server and enriches dynamically from models.dev / router."""
     try:
-        models_dev_specs = fetch_models_dev_specs()
-        router_specs = fetch_router_model_specs()
-        dynamic_specs = {**models_dev_specs, **router_specs}
-
+        dynamic_specs = {**fetch_models_dev_specs(), **fetch_router_model_specs()}
+    except Exception as e:
+        log.debug("Error building dynamic model specs: %s", e)
+        dynamic_specs = {}
+    try:
         req = UrlRequest(
             f"{TARGET_ZEN_BASE}/models",
             headers={"Authorization": "Bearer public", "User-Agent": "Mozilla/5.0"}
@@ -751,10 +766,10 @@ def fetch_models_from_server() -> Optional[List[Dict[str, Any]]]:
                         model_entry["structured_output"] = specs["structured_output"]
                         model_entry["temperature"] = specs["temperature"]
                         new_models.append(model_entry)
-                return new_models if new_models else None
+                return new_models if new_models else enriched_default_models(dynamic_specs)
     except Exception as e:
         log.debug("Auto-Discovery error fetching models from server: %s", e)
-        return None
+    return enriched_default_models(dynamic_specs)
 
 def discover_models_task():
     global discovered_models
@@ -776,7 +791,6 @@ async def lifespan(application: FastAPI):
 
     # Initialize in-process WARP rotator background monitor
     try:
-        import rotator
         rotator.start_rotator_background_tasks(_discovery_stop)
     except Exception as e:
         log.warning(f"Could not initialize in-process rotator: {e}")
@@ -810,17 +824,15 @@ app.add_middleware(
 
 class FlowContext:
     def __enter__(self):
-        global active_flows_count
-        with flow_lock:
-            active_flows_count += 1
-            prom_active_flows.set(active_flows_count)
+        with rotator.flow_lock:
+            rotator.active_flows_count += 1
+            prom_active_flows.set(rotator.active_flows_count)
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
-        global active_flows_count
-        with flow_lock:
-            active_flows_count = max(0, active_flows_count - 1)
-            prom_active_flows.set(active_flows_count)
+        with rotator.flow_lock:
+            rotator.active_flows_count = max(0, rotator.active_flows_count - 1)
+            prom_active_flows.set(rotator.active_flows_count)
 
 
 # Opencode CLI fingerprint (exact User-Agent from official OpenCode client).
@@ -1103,7 +1115,6 @@ def log_upstream_response(response, model_name: str, endpoint: str, attempt: int
 def rotate_egress(reason: str) -> tuple[bool, Optional[str]]:
     """Request rotation directly in-memory from rotator module or remote fallback."""
     try:
-        import rotator
         success = rotator.rotate_warp(reason=reason)
         _close_all_sessions()
         return success, rotator._current_ip
@@ -1189,13 +1200,11 @@ class EmptyStreamError(Exception):
     """Raised when upstream returns an empty or truncated stream without valid content/tool calls."""
     pass
 
-async def stream_response(response, model_name: str, session=None) -> AsyncGenerator[bytes, None]:
+async def stream_response(response, model_name: str, session=None, protocol: str = "chat") -> AsyncGenerator[bytes, None]:
     loop = asyncio.get_event_loop()
-    global active_flows_count
-
-    with flow_lock:
-        active_flows_count += 1
-        prom_active_flows.set(active_flows_count)
+    with rotator.flow_lock:
+        rotator.active_flows_count += 1
+        prom_active_flows.set(rotator.active_flows_count)
     lease_id = await asyncio.to_thread(acquire_flow_lease)
 
     async def keep_flow_lease_alive():
@@ -1210,6 +1219,7 @@ async def stream_response(response, model_name: str, session=None) -> AsyncGener
 
     chunk_count = 0
     seen_done = False
+    stream_executor: Optional[ThreadPoolExecutor] = None
 
     try:
         def get_next_line(iter_lines):
@@ -1222,14 +1232,26 @@ async def stream_response(response, model_name: str, session=None) -> AsyncGener
                 return "SOCKET_ERROR"
 
         line_iter = response.iter_lines()
+        pending_frame: List[bytes] = []  # SSE frame accumulator (Responses API: event:/data: must stay one frame)
+
+        # One dedicated thread per stream, polled via a single persistent future.
+        # The old run_in_executor(None, ...) pattern shared the default 8-thread
+        # pool and piled up a new cancelled future per stream per 4s heartbeat.
+        stream_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="sse")
+        poll_task = loop.run_in_executor(stream_executor, get_next_line, line_iter)
 
         while True:
-            try:
-                item = await asyncio.wait_for(loop.run_in_executor(None, get_next_line, line_iter), timeout=4.0)
-            except asyncio.TimeoutError:
-                # Send SSE comment heartbeat to keep TCP socket active during long upstream reasoning/generation phases
+            done, _ = await asyncio.wait({poll_task}, timeout=4.0)
+            if not done:
+                # Heartbeat; never split a partially buffered SSE frame
+                if pending_frame:
+                    chunk_count += 1
+                    yield b"\n".join(pending_frame) + b"\n\n"
+                    pending_frame = []
                 yield b": keep-alive\n\n"
                 continue
+            item = poll_task.result()
+            poll_task = loop.run_in_executor(stream_executor, get_next_line, line_iter)
 
             if item == "STOP_ITERATION":
                 log.info(f"[STREAM DEBUG] Upstream reached natural StopIteration for '{model_name}'. Total lines: {chunk_count}")
@@ -1238,10 +1260,20 @@ async def stream_response(response, model_name: str, session=None) -> AsyncGener
                 log.warning(f"[STREAM DEBUG] Upstream connection aborted via socket error for '{model_name}'. Lines sent: {chunk_count}")
                 break
 
-            line = item
-            if line:
-                raw_text = line.decode("utf-8", errors="ignore").strip()
-                if not raw_text or raw_text.startswith(":"):
+            if not item:
+                # Blank line terminates the current SSE frame
+                if pending_frame:
+                    chunk_count += 1
+                    yield b"\n".join(pending_frame) + b"\n\n"
+                    pending_frame = []
+                continue
+
+            raw_text = item.decode("utf-8", errors="ignore").strip()
+            if not raw_text:
+                continue
+
+            if protocol == "chat":
+                if raw_text.startswith(":"):
                     continue
                 if raw_text == "data: [DONE]" or raw_text.startswith("data: [DONE]"):
                     seen_done = True
@@ -1252,9 +1284,21 @@ async def stream_response(response, model_name: str, session=None) -> AsyncGener
                     if '"cost":' in raw_text and '"choices":[]' in raw_text.replace(" ", ""):
                         continue
                     chunk_count += 1
-                    yield line.strip() + b"\n\n"
+                    yield raw_text.encode("utf-8") + b"\n\n"
+                continue
 
-        if not seen_done:
+            # Responses API passthrough: preserve frame grouping (event: + data:, incl. multi-line data:)
+            if raw_text.startswith("event:") and any(l.startswith(b"data:") for l in pending_frame):
+                chunk_count += 1
+                yield b"\n".join(pending_frame) + b"\n\n"
+                pending_frame = []
+            pending_frame.append(raw_text.encode("utf-8"))
+
+        if pending_frame:
+            chunk_count += 1
+            yield b"\n".join(pending_frame) + b"\n\n"
+            pending_frame = []
+        if protocol != "responses" and not seen_done:
             yield b"data: [DONE]\n\n"
         log.info(f"Streaming completed successfully for model '{model_name}' ({chunk_count} lines sent).")
     except EmptyStreamError:
@@ -1269,9 +1313,11 @@ async def stream_response(response, model_name: str, session=None) -> AsyncGener
         lease_heartbeat.cancel()
         await asyncio.gather(lease_heartbeat, return_exceptions=True)
         await asyncio.to_thread(release_flow_lease, lease_id)
-        with flow_lock:
-            active_flows_count = max(0, active_flows_count - 1)
-            prom_active_flows.set(active_flows_count)
+        with rotator.flow_lock:
+            rotator.active_flows_count = max(0, rotator.active_flows_count - 1)
+            prom_active_flows.set(rotator.active_flows_count)
+        if stream_executor is not None:
+            stream_executor.shutdown(wait=False, cancel_futures=True)
         if session:
             try:
                 session.close()
@@ -1282,11 +1328,11 @@ async def stream_response(response, model_name: str, session=None) -> AsyncGener
 async def anthropic_stream_response(response, model_name: str, session=None) -> AsyncGenerator[bytes, None]:
     """Translate upstream OpenAI SSE chunks into Anthropic message stream events."""
     loop = asyncio.get_event_loop()
-    global active_flows_count
+    stream_executor: Optional[ThreadPoolExecutor] = None
 
-    with flow_lock:
-        active_flows_count += 1
-        prom_active_flows.set(active_flows_count)
+    with rotator.flow_lock:
+        rotator.active_flows_count += 1
+        prom_active_flows.set(rotator.active_flows_count)
     lease_id = await asyncio.to_thread(acquire_flow_lease)
 
     async def keep_flow_lease_alive():
@@ -1336,12 +1382,16 @@ async def anthropic_stream_response(response, model_name: str, session=None) -> 
                 return "SOCKET_ERROR"
 
         line_iter = response.iter_lines()
+        stream_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="sse")
+        poll_task = loop.run_in_executor(stream_executor, get_next_line, line_iter)
+
         while True:
-            try:
-                item = await asyncio.wait_for(loop.run_in_executor(None, get_next_line, line_iter), timeout=4.0)
-            except asyncio.TimeoutError:
+            done, _ = await asyncio.wait({poll_task}, timeout=4.0)
+            if not done:
                 yield b": keep-alive\n\n"
                 continue
+            item = poll_task.result()
+            poll_task = loop.run_in_executor(stream_executor, get_next_line, line_iter)
 
             if item in ("STOP_ITERATION", "SOCKET_ERROR"):
                 break
@@ -1438,9 +1488,11 @@ async def anthropic_stream_response(response, model_name: str, session=None) -> 
         lease_heartbeat.cancel()
         await asyncio.gather(lease_heartbeat, return_exceptions=True)
         await asyncio.to_thread(release_flow_lease, lease_id)
-        with flow_lock:
-            active_flows_count = max(0, active_flows_count - 1)
-            prom_active_flows.set(active_flows_count)
+        with rotator.flow_lock:
+            rotator.active_flows_count = max(0, rotator.active_flows_count - 1)
+            prom_active_flows.set(rotator.active_flows_count)
+        if stream_executor is not None:
+            stream_executor.shutdown(wait=False, cancel_futures=True)
         if session:
             try:
                 session.close()
@@ -1488,25 +1540,24 @@ async def get_metrics():
 
     rotator_ip = None
     rotator_location = None
-    rotator_rotations = rotation_count
+    rotator_rotations = rotator.rotation_count
     rotator_history = []
 
     try:
-        import rotator
         if not rotator._current_ip or rotator._current_ip == "Disconnected":
-            rotator._current_ip = get_public_ip()
+            rotator._current_ip = await asyncio.to_thread(get_public_ip)
         rotator_ip = rotator._current_ip
         rotator_rotations = rotator.rotation_count
         rotator_history = rotator.ip_history
         if rotator_ip and rotator_ip != "Disconnected":
-            rotator_location = get_ip_location(rotator_ip)
+            rotator_location = await asyncio.to_thread(get_ip_location, rotator_ip)
     except Exception:
         pass
 
     # Fallback: local IP lookup
     if not rotator_ip or rotator_ip == "Disconnected":
-        rotator_ip = get_public_ip() or "Disconnected"
-        rotator_location = get_ip_location(rotator_ip) if rotator_ip != "Disconnected" else {"country": "Unknown", "flag": "🌐"}
+        rotator_ip = await asyncio.to_thread(get_public_ip) or "Disconnected"
+        rotator_location = await asyncio.to_thread(get_ip_location, rotator_ip) if rotator_ip != "Disconnected" else {"country": "Unknown", "flag": "🌐"}
 
     # Fallback: SQLite history
     if not rotator_history:
@@ -1522,7 +1573,7 @@ async def get_metrics():
         "location": rotator_location,
         "total_rotations": rotator_rotations,
         "metrics": metrics,
-        "active_flows": active_flows_count,
+        "active_flows": rotator.active_flows_count,
         "discovered_models": discovered_models,
         "model_usage": model_usage_stats,
         "ip_history": rotator_history,
@@ -1540,7 +1591,12 @@ async def get_recent_requests():
 
 @app.get("/health")
 async def health():
-    ip = get_public_ip()
+    ip = rotator._current_ip
+    if not ip or ip == "Disconnected":
+        try:
+            ip = await asyncio.to_thread(get_public_ip)
+        except Exception:
+            ip = None
     prom_warp_health.set(1 if ip and ip != "Disconnected" else 0)
     db_ok = False
     try:
@@ -1552,8 +1608,8 @@ async def health():
         "status": "healthy" if db_ok else "degraded",
         "database": "connected" if db_ok else "unreachable",
         "uptime_seconds": int(time.time() - metrics["start_time"]),
-        "active_flows": active_flows_count,
-        "total_rotations": rotation_count,
+        "active_flows": rotator.active_flows_count,
+        "total_rotations": rotator.rotation_count,
         "warp_quality": dict(warp_quality_stats),
     }
 
@@ -1643,7 +1699,8 @@ async def chat_completions(raw_request: Request):
         try:
             proxies = get_next_outbound_proxy()
             session = create_fresh_session(is_stream)
-            response = session.post(
+            response = await asyncio.to_thread(
+                session.post,
                 TARGET_ZEN_URL,
                 json=payload,
                 headers=headers,
@@ -1805,7 +1862,7 @@ def anthropic_to_openai(body: dict) -> dict:
             btype = b.get("type")
             if btype == "text":
                 text_parts.append(b.get("text", ""))
-            elif btype == "tool_use":
+            elif btype == "tool_use" and role == "assistant":
                 tool_calls.append({
                     "id": b.get("id") or f"call_{uuid.uuid4().hex[:24]}",
                     "type": "function",
@@ -1820,18 +1877,19 @@ def anthropic_to_openai(body: dict) -> dict:
                     "tool_call_id": b.get("tool_use_id"),
                     "content": _blocks_text(b.get("content")),
                 })
-        if tool_results:
-            messages.extend(tool_results)
-        assistant_msg = {"role": "assistant"}
         joined = "\n".join(t for t in text_parts if t)
-        if joined:
-            assistant_msg["content"] = joined
-        if tool_calls:
-            assistant_msg["tool_calls"] = tool_calls
-        if len(assistant_msg) > 1:
-            messages.append(assistant_msg)
-        elif not tool_results:
-            messages.append({"role": role, "content": ""})
+        if tool_results:
+            # Anthropic user turn carrying tool results -> role=tool msgs; trailing text stays a user message
+            messages.extend(tool_results)
+            if joined:
+                messages.append({"role": role, "content": joined})
+            continue
+        out_msg = {"role": role, "content": joined or None}
+        if role == "assistant" and tool_calls:
+            out_msg["tool_calls"] = tool_calls
+        if out_msg["content"] is None and not out_msg.get("tool_calls"):
+            out_msg["content"] = ""
+        messages.append(out_msg)
 
     out["messages"] = messages
 
@@ -1932,7 +1990,8 @@ async def anthropic_messages(raw_request: Request):
         try:
             proxies = get_next_outbound_proxy()
             session = create_fresh_session(is_stream)
-            response = session.post(
+            response = await asyncio.to_thread(
+                session.post,
                 TARGET_ZEN_URL,
                 json=openai_body,
                 headers=headers,
@@ -1954,7 +2013,6 @@ async def anthropic_messages(raw_request: Request):
                     await wait_for_rotation_drain()
                     await asyncio.sleep(backoff)
                     headers = build_opencode_headers(raw_request, fresh_session=True)
-                    headers["x-api-key"] = effective_api_key
                     continue
                 return upstream_rate_limit_response(response, model_name)
 
@@ -1967,7 +2025,6 @@ async def anthropic_messages(raw_request: Request):
                         await wait_for_rotation_drain()
                         await asyncio.sleep(1.0)
                         headers = build_opencode_headers(raw_request, fresh_session=True)
-                        headers["x-api-key"] = effective_api_key
                         continue
 
             if response.status_code >= 500:
@@ -2086,7 +2143,8 @@ async def responses_endpoint(raw_request: Request):
         try:
             proxies = get_next_outbound_proxy()
             session = create_fresh_session(is_stream)
-            response = session.post(
+            response = await asyncio.to_thread(
+                session.post,
                 TARGET_ZEN_RESPONSES_URL,
                 json=body,
                 headers=headers,
@@ -2138,7 +2196,7 @@ async def responses_endpoint(raw_request: Request):
 
             if is_stream:
                 return StreamingResponse(
-                    stream_response(response, model_name, session=session),
+                    stream_response(response, model_name, session=session, protocol="responses"),
                     media_type="text/event-stream",
                     headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
                 )
