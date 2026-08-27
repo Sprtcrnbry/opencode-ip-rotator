@@ -210,6 +210,7 @@ def log_ip_rotation_to_db(ip: str, country: str, flag: str, timestamp: str, reas
             "INSERT INTO ip_history (ip, country, flag, timestamp, reason) VALUES (?, ?, ?, ?, ?)",
             (ip, country, flag, timestamp, reason)
         )
+        _db_execute("DELETE FROM ip_history WHERE id NOT IN (SELECT id FROM ip_history ORDER BY id DESC LIMIT 100)")
     except Exception as e:
         log.error(f"Failed to log IP rotation to DB: {e}")
 
@@ -272,7 +273,22 @@ except ValueError:
     prom_request_duration = getattr(REGISTRY, "_names_to_collectors", {}).get("proxy_request_duration_seconds")
     prom_warp_health = getattr(REGISTRY, "_names_to_collectors", {}).get("proxy_warp_health")
 
-# -----------------------------------------------------------------------------
+def _sanitize_model_label(model: str) -> str:
+    # ponytail: cap cardinality — unknown/injected model names collapse to "other"
+    m = (model or "").strip().lower()
+    if not m:
+        return "other"
+    # allow discovered + default ids + normalized variants
+    allowed = {x["id"].lower() for x in DEFAULT_FREE_MODELS}
+    try:
+        with _discovery_lock:
+            allowed |= {x.get("id", "").lower() for x in discovered_models}
+    except Exception:
+        pass
+    if m in allowed or m.split("/")[-1] in allowed:
+        return m.split("/")[-1]
+    return "other"
+
 # curl_cffi Session Pool
 # -----------------------------------------------------------------------------
 _session_pool: Dict[str, "SessionType"] = {}
@@ -320,10 +336,16 @@ _rotation_in_progress = threading.Event()
 _request_drain_event = asyncio.Event()
 _request_drain_event.set()
 
+ROTATION_DRAIN_TIMEOUT = float(os.environ.get("ROTATION_DRAIN_TIMEOUT", "30"))
+
 async def wait_for_rotation_drain():
-    # Loop-wait instead of wait_for: the 15s wait_for timed out during long
-    # rotations and surfaced as a 500 to every request.
+    # Loop-wait with a hard timeout so a stuck rotation flag cannot pile up
+    # unbounded coroutines (connection-exhaustion fix).
+    start = time.monotonic()
     while _rotation_in_progress.is_set():
+        if time.monotonic() - start > ROTATION_DRAIN_TIMEOUT:
+            log.warning("Rotation drain wait timed out after %.0fs; proceeding anyway.", ROTATION_DRAIN_TIMEOUT)
+            return
         await asyncio.sleep(0.5)
 
 def signal_rotation_start():
@@ -376,6 +398,9 @@ def track_token_usage(model_name: str, prompt_tokens: int = 0, completion_tokens
 
     with _model_usage_lock:
         if model_name not in model_usage_stats:
+            if len(model_usage_stats) >= 100:
+                # ponytail: drop unknown models beyond cap (cardinality guard)
+                return
             model_usage_stats[model_name] = {
                 "requests": 0, "prompt_tokens": 0, "completion_tokens": 0,
                 "total_tokens": 0, "estimated_cost_usd": 0.0
@@ -427,6 +452,9 @@ def record_warp_rotation(success: bool, latency_ms: float = 0, old_ip: str = "",
             "INSERT INTO warp_quality (timestamp, success, latency_ms, old_ip, new_ip) VALUES (?, ?, ?, ?, ?)",
             (time.strftime("%Y-%m-%d %H:%M:%S"), 1 if success else 0, latency_ms, old_ip, new_ip)
         )
+        # ponytail: keep last 200 rows, delete expired leases (uptime leak fix)
+        _db_execute("DELETE FROM warp_quality WHERE id NOT IN (SELECT id FROM warp_quality ORDER BY id DESC LIMIT 200)")
+        _db_execute("DELETE FROM active_flow_leases WHERE expires_at < ?", (time.time() - 10,))
     except Exception:
         pass
 
@@ -814,6 +842,17 @@ async def lifespan(application: FastAPI):
 
 app = FastAPI(title="OpenCode Zen v3.0 Ultra Resilient Proxy", lifespan=lifespan)
 
+# Concurrency gate: limits simultaneous upstream requests to prevent
+# thread/socket exhaustion under burst load (connection-exhaustion fix).
+MAX_CONCURRENT_UPSTREAM = int(os.environ.get("MAX_CONCURRENT_UPSTREAM", "80"))
+_upstream_semaphore: Optional[asyncio.Semaphore] = None
+
+def _get_upstream_semaphore() -> asyncio.Semaphore:
+    global _upstream_semaphore
+    if _upstream_semaphore is None:
+        _upstream_semaphore = asyncio.Semaphore(MAX_CONCURRENT_UPSTREAM)
+    return _upstream_semaphore
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=CORS_ALLOW_ORIGINS,
@@ -849,6 +888,11 @@ def _is_loopback_ip(value: str) -> bool:
 def optimize_payload_for_upstream(payload: dict) -> dict:
     """Ensures payload size stays safely within upstream OpenCode Zen's ingress limits (< 1.5MB)
     and strictly validates tool/assistant message pairings to prevent HTTP 400 Bad Request."""
+    # Upstream Zen only supports tool_choice="auto" — normalize anything else
+    tc = payload.get("tool_choice")
+    if tc is not None and tc != "auto":
+        payload["tool_choice"] = "auto"
+
     messages = payload.get("messages")
     if not isinstance(messages, list) or not messages:
         return payload
@@ -1699,21 +1743,22 @@ async def chat_completions(raw_request: Request):
         try:
             proxies = get_next_outbound_proxy()
             session = create_fresh_session(is_stream)
-            response = await asyncio.to_thread(
-                session.post,
-                TARGET_ZEN_URL,
-                json=payload,
-                headers=headers,
-                impersonate="chrome124",
-                stream=is_stream,
-                proxies=proxies,
-                timeout=STREAM_TIMEOUT if is_stream else 120
-            )
+            async with _get_upstream_semaphore():
+                response = await asyncio.to_thread(
+                    session.post,
+                    TARGET_ZEN_URL,
+                    json=payload,
+                    headers=headers,
+                    impersonate="chrome124",
+                    stream=is_stream,
+                    proxies=proxies,
+                    timeout=STREAM_TIMEOUT if is_stream else 120
+                )
             log_upstream_response(response, current_model, "chat_completions", attempt, proxies is not None)
 
             if response.status_code == 429:
                 metrics["rate_limited_requests"] += 1
-                prom_requests_rate_limited.labels(model=current_model).inc()
+                prom_requests_rate_limited.labels(model=_sanitize_model_label(current_model)).inc()
                 category, retry_seconds, _rate_limit_body = classify_upstream_429(response)
                 if attempt < MAX_RETRIES_ON_429 and category != "quota":
                     backoff = retry_seconds if (retry_seconds and retry_seconds <= 10) else compute_backoff_delay(attempt, INITIAL_BACKOFF)
@@ -1758,8 +1803,8 @@ async def chat_completions(raw_request: Request):
                     )
 
             metrics["successful_requests"] += 1
-            prom_requests_success.labels(model=current_model).inc()
-            prom_request_duration.labels(model=current_model, endpoint="chat_completions").observe(time.time() - start_time)
+            prom_requests_success.labels(model=_sanitize_model_label(current_model)).inc()
+            prom_request_duration.labels(model=_sanitize_model_label(current_model), endpoint="chat_completions").observe(time.time() - start_time)
 
             if is_stream:
                 try:
@@ -1990,21 +2035,22 @@ async def anthropic_messages(raw_request: Request):
         try:
             proxies = get_next_outbound_proxy()
             session = create_fresh_session(is_stream)
-            response = await asyncio.to_thread(
-                session.post,
-                TARGET_ZEN_URL,
-                json=openai_body,
-                headers=headers,
-                impersonate="chrome124",
-                stream=is_stream,
-                proxies=proxies,
-                timeout=STREAM_TIMEOUT if is_stream else 120,
-            )
+            async with _get_upstream_semaphore():
+                response = await asyncio.to_thread(
+                    session.post,
+                    TARGET_ZEN_URL,
+                    json=openai_body,
+                    headers=headers,
+                    impersonate="chrome124",
+                    stream=is_stream,
+                    proxies=proxies,
+                    timeout=STREAM_TIMEOUT if is_stream else 120,
+                )
             log_upstream_response(response, model_name, "messages", attempt, proxies is not None)
 
             if response.status_code == 429:
                 metrics["rate_limited_requests"] += 1
-                prom_requests_rate_limited.labels(model=model_name).inc()
+                prom_requests_rate_limited.labels(model=_sanitize_model_label(model_name)).inc()
                 category, retry_seconds, _rate_limit_body = classify_upstream_429(response)
                 if attempt < MAX_RETRIES_ON_429 and category != "quota":
                     backoff = retry_seconds if (retry_seconds and retry_seconds <= 10) else compute_backoff_delay(attempt, INITIAL_BACKOFF)
@@ -2049,8 +2095,8 @@ async def anthropic_messages(raw_request: Request):
                     )
 
             metrics["successful_requests"] += 1
-            prom_requests_success.labels(model=model_name).inc()
-            prom_request_duration.labels(model=model_name, endpoint="anthropic_messages").observe(time.time() - start_time)
+            prom_requests_success.labels(model=_sanitize_model_label(model_name)).inc()
+            prom_request_duration.labels(model=_sanitize_model_label(model_name), endpoint="anthropic_messages").observe(time.time() - start_time)
 
             if is_stream:
                 return StreamingResponse(
@@ -2143,21 +2189,22 @@ async def responses_endpoint(raw_request: Request):
         try:
             proxies = get_next_outbound_proxy()
             session = create_fresh_session(is_stream)
-            response = await asyncio.to_thread(
-                session.post,
-                TARGET_ZEN_RESPONSES_URL,
-                json=body,
-                headers=headers,
-                impersonate="chrome124",
-                stream=is_stream,
-                proxies=proxies,
-                timeout=STREAM_TIMEOUT if is_stream else 120,
-            )
+            async with _get_upstream_semaphore():
+                response = await asyncio.to_thread(
+                    session.post,
+                    TARGET_ZEN_RESPONSES_URL,
+                    json=body,
+                    headers=headers,
+                    impersonate="chrome124",
+                    stream=is_stream,
+                    proxies=proxies,
+                    timeout=STREAM_TIMEOUT if is_stream else 120,
+                )
             log_upstream_response(response, model_name, "responses", attempt, proxies is not None)
 
             if response.status_code == 429:
                 metrics["rate_limited_requests"] += 1
-                prom_requests_rate_limited.labels(model=model_name).inc()
+                prom_requests_rate_limited.labels(model=_sanitize_model_label(model_name)).inc()
                 category, retry_seconds, _rate_limit_body = classify_upstream_429(response)
                 if attempt < MAX_RETRIES_ON_429 and category != "quota":
                     backoff = retry_seconds if (retry_seconds and retry_seconds <= 10) else compute_backoff_delay(attempt, INITIAL_BACKOFF)
@@ -2191,8 +2238,8 @@ async def responses_endpoint(raw_request: Request):
                     )
 
             metrics["successful_requests"] += 1
-            prom_requests_success.labels(model=model_name).inc()
-            prom_request_duration.labels(model=model_name, endpoint="responses").observe(time.time() - start_time)
+            prom_requests_success.labels(model=_sanitize_model_label(model_name)).inc()
+            prom_request_duration.labels(model=_sanitize_model_label(model_name), endpoint="responses").observe(time.time() - start_time)
 
             if is_stream:
                 return StreamingResponse(
@@ -2255,4 +2302,12 @@ async def http_exception_handler(request: Request, exc: HTTPException):
 if __name__ == "__main__":
     load_proxy_list()
     log.info(f"Starting OpenCode IP Proxy Server on {HOST}:{PORT}...")
-    uvicorn.run(app, host=HOST, port=PORT)
+    uvicorn.run(
+        app,
+        host=HOST,
+        port=PORT,
+        limit_concurrency=int(os.environ.get("UVICORN_LIMIT_CONCURRENCY", "200")),
+        limit_max_requests=int(os.environ.get("UVICORN_LIMIT_MAX_REQUESTS", "0")) or None,
+        timeout_keep_alive=int(os.environ.get("UVICORN_KEEP_ALIVE", "5")),
+        backlog=int(os.environ.get("UVICORN_BACKLOG", "100")),
+    )
