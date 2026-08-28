@@ -31,13 +31,46 @@ COPY manager.py .
 COPY templates/ ./templates/
 
 RUN echo '#!/bin/bash\n\
+set +e\n\
 service dbus start\n\
 warp-svc &\n\
-sleep 3\n\
-warp-cli --accept-tos registration new || true\n\
+\n\
+# Wait for warp-svc to be ready (up to 30s)\n\
+echo "Waiting for warp-svc to be ready..."\n\
+for i in $(seq 1 30); do\n\
+  if warp-cli status >/dev/null 2>&1; then\n\
+    echo "warp-svc ready after ${i}s"\n\
+    break\n\
+  fi\n\
+  sleep 1\n\
+done\n\
+\n\
+# Ensure a registration exists (retry up to 5 times)\n\
+if ! warp-cli registrations 2>/dev/null | grep -q "ID"; then\n\
+  echo "No WARP registration found, creating one..."\n\
+  for i in $(seq 1 5); do\n\
+    if warp-cli --accept-tos registration new; then\n\
+      echo "WARP registration created on attempt ${i}"\n\
+      break\n\
+    fi\n\
+    echo "Registration attempt ${i} failed, retrying in 2s..."\n\
+    sleep 2\n\
+  done\n\
+fi\n\
+\n\
 warp-cli --accept-tos mode warp || true\n\
-warp-cli --accept-tos connect || true\n\
+\n\
+# Connect (retry up to 5 times)\n\
+for i in $(seq 1 5); do\n\
+  if warp-cli --accept-tos connect; then\n\
+    echo "WARP connected on attempt ${i}"\n\
+    break\n\
+  fi\n\
+  echo "Connect attempt ${i} failed, retrying in 2s..."\n\
+  sleep 2\n\
+done\n\
 sleep 2\n\
+\n\
 exec python server.py\n\
 ' > /app/entrypoint.sh && chmod +x /app/entrypoint.sh
 

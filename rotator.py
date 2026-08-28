@@ -412,6 +412,12 @@ def health_check_loop(endpoint: str, interval: int, initial_delay: int, max_retr
                 status = subprocess.run([warp_bin, "status"], capture_output=True, text=True, timeout=10, check=False)
                 if "Disconnected" in status.stdout:
                     log.warning("WARP tunnel is disconnected — auto-reconnecting...")
+                    # Ensure a registration exists before connecting (Docker case)
+                    regs = subprocess.run([warp_bin, "registrations"], capture_output=True, text=True, timeout=10, check=False)
+                    if "ID" not in regs.stdout:
+                        log.warning("No WARP registration found — creating one before reconnect...")
+                        subprocess.run([warp_bin, "--accept-tos", "registration", "new"], capture_output=True, text=True, timeout=15, check=False)
+                        time.sleep(2)
                     subprocess.run([warp_bin, "--accept-tos", "connect"], capture_output=True, text=True, timeout=15, check=False)
                     time.sleep(3)
                     new_ip = get_public_ip()
