@@ -404,6 +404,22 @@ def health_check_loop(endpoint: str, interval: int, initial_delay: int, max_retr
             if new_ip:
                 _current_ip = new_ip
                 log.info(f"WARP verified public IP updated: {_current_ip}")
+
+        # Auto-reconnect WARP if it was disconnected (e.g. after server shutdown)
+        try:
+            warp_bin = get_warp_bin()
+            if shutil.which(warp_bin) or os.path.exists(warp_bin):
+                status = subprocess.run([warp_bin, "status"], capture_output=True, text=True, timeout=10, check=False)
+                if "Disconnected" in status.stdout:
+                    log.warning("WARP tunnel is disconnected — auto-reconnecting...")
+                    subprocess.run([warp_bin, "--accept-tos", "connect"], capture_output=True, text=True, timeout=15, check=False)
+                    time.sleep(3)
+                    new_ip = get_public_ip()
+                    if new_ip:
+                        _current_ip = new_ip
+                        log.info(f"WARP reconnected. Verified IP: {new_ip}")
+        except Exception as e:
+            log.debug(f"WARP auto-reconnect check error: {e}")
         try:
             req = Request(endpoint, headers={"User-Agent": "WARP-Guard/1.0"}, method="HEAD")
             with urlopen(req, timeout=10) as resp:

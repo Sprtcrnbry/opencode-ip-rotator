@@ -817,6 +817,14 @@ async def lifespan(application: FastAPI):
     model_usage_stats = load_metrics_from_db()
     _discovery_stop.clear()
 
+    # Ensure WARP tunnel is connected on startup (shutdown disconnects it).
+    try:
+        import subprocess
+        subprocess.run([rotator.get_warp_bin(), "--accept-tos", "connect"], capture_output=True, timeout=15, check=False)
+        log.info("WARP connect requested on startup")
+    except Exception as e:
+        log.warning(f"Could not connect WARP on startup: {e}")
+
     # Initialize in-process WARP rotator background monitor
     try:
         rotator.start_rotator_background_tasks(_discovery_stop)
