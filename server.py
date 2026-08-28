@@ -5,6 +5,7 @@ from concurrent.futures import ThreadPoolExecutor
 import os
 import random
 import signal
+import subprocess
 import sqlite3
 import threading
 import time
@@ -819,7 +820,6 @@ async def lifespan(application: FastAPI):
 
     # Ensure WARP tunnel is connected on startup (shutdown disconnects it).
     try:
-        import subprocess
         subprocess.run([rotator.get_warp_bin(), "--accept-tos", "connect"], capture_output=True, timeout=15, check=False)
         log.info("WARP connect requested on startup")
     except Exception as e:
@@ -842,7 +842,6 @@ async def lifespan(application: FastAPI):
     _close_all_sessions()
     _discovery_stop.set()
     try:
-        import subprocess, rotator
         subprocess.run([rotator.get_warp_bin(), "--accept-tos", "disconnect"], capture_output=True, timeout=10, check=False)
         log.info("WARP disconnected on shutdown")
     except Exception:
