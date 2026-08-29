@@ -25,6 +25,7 @@ if [ ! -e /run/dbus/pid ] && [ ! -e /var/run/dbus/pid ]; then
 fi
 
 # --- helpers -----------------------------------------------------------------
+WARP_RESTARTS=0
 start_warp_svc() {
   pkill warp-svc 2>/dev/null || true
   sleep 1
@@ -33,17 +34,26 @@ start_warp_svc() {
     mknod /dev/net/tun c 10 200 2>/dev/null || true
     chmod 600 /dev/net/tun 2>/dev/null || true
   fi
-  echo "Starting warp-svc..."
+  echo "Starting warp-svc... (restart $((WARP_RESTARTS+1)))"
   rm -f /tmp/warp-svc.log
   warp-svc > /tmp/warp-svc.log 2>&1 &
   WARP_SVC_PID=$!
   echo "$WARP_SVC_PID" > /tmp/warp-svc.pid
+  WARP_RESTARTS=$((WARP_RESTARTS+1))
   sleep 2
 }
 
 is_warp_svc_alive() {
   if [ -n "${WARP_SVC_PID:-}" ] && kill -0 "$WARP_SVC_PID" 2>/dev/null; then return 0; fi
   if pgrep -x warp-svc >/dev/null 2>&1; then return 0; fi
+  return 1
+}
+
+is_warp_broken() {
+  # RESTARTS is the initial-wait counter; WARP_RESTARTS is global starts
+  if [ "${RESTARTS:-0}" -ge 3 ] || [ "${WARP_RESTARTS:-0}" -ge 4 ]; then return 0; fi
+  if grep -qiE "Watchdog reports that daemon has disconnected|Dropping WarpService|Failed to send message to request_sender|bus has stopped|Shutting down watchdog actor" /tmp/warp-svc.log 2>/dev/null; then return 0; fi
+  if grep -qiE "Failed to configure firewall|nft.*failed|iptables.*failed|No such file or directory.*CloudflareWARP" /tmp/warp-svc.log 2>/dev/null; then return 0; fi
   return 1
 }
 
@@ -279,13 +289,10 @@ else
 fi
 
 # --- Mode + Connect ---------------------------------------------------------
-# Detect if warp tunnel is viable: check for nft/iptables hard failures in log or repeated crashes
+# Detect if warp tunnel is viable: check for nft/iptables/watchdog hard failures or repeated crashes
 WARP_TUNNEL_BROKEN=0
-if [ "${RESTARTS:-0}" -ge 3 ]; then
-  echo "warp-svc crashed $RESTARTS times — host incompatible with WARP tunnel, skipping to proxy/direct"
-  WARP_TUNNEL_BROKEN=1
-elif grep -qiE "Failed to configure firewall|nft.*failed|iptables.*failed|No such file or directory.*CloudflareWARP" /tmp/warp-svc.log 2>/dev/null; then
-  echo "Detected firewall/nft failure in warp-svc log — skipping warp tunnel, going straight to proxy mode"
+if is_warp_broken; then
+  echo "warp-svc unstable (restarts=$WARP_RESTARTS/$RESTARTS, watchdog/nft error in log) — skipping WARP tunnel, will try proxy/wireguard"
   WARP_TUNNEL_BROKEN=1
 fi
 # Also if /dev/net/tun not functional, skip warp
@@ -300,7 +307,11 @@ if [ "$WARP_TUNNEL_BROKEN" -eq 0 ]; then
 
   echo "Connecting WARP..."
   CONNECTED=0
-  for i in $(seq 1 5); do
+  for i in $(seq 1 3); do
+    if is_warp_broken; then
+      echo "warp-svc flagged broken during connect loop (watchdog/nft, restarts=$WARP_RESTARTS) — aborting WARP attempts"
+      break
+    fi
     if ! is_warp_svc_alive; then
       echo "warp-svc died before connect attempt $i — restarting..."
       cat /tmp/warp-svc.log 2>/dev/null | tail -n 20 || true
@@ -321,6 +332,10 @@ if [ "$WARP_TUNNEL_BROKEN" -eq 0 ]; then
       cat /tmp/warp-svc.log 2>/dev/null | tail -n 15 || true
       if ! is_warp_svc_alive; then start_warp_svc; sleep 2; fi
     fi
+    if is_warp_broken; then
+      echo "watchdog/nft error detected mid-connect — aborting to WireGuard"
+      break
+    fi
     sleep 2
   done
 else
@@ -338,25 +353,38 @@ if [ "$CONNECTED" -eq 0 ]; then
     echo "WARP tunnel mode failed, falling back to proxy mode..."
   fi
   if [ "$NEED_PROXY" -eq 1 ]; then
-    # Ensure daemon alive for proxy mode
-    if ! is_warp_svc_alive; then
-      echo "warp-svc not alive for proxy mode — restarting..."
-      start_warp_svc
-      sleep 3
-    fi
-    warp-cli --accept-tos disconnect 2>&1 || true
-    sleep 1
-    warp-cli --accept-tos mode proxy 2>&1 || warp-cli --accept-tos set-mode proxy 2>&1 || true
-    warp-cli --accept-tos proxy port 40000 2>&1 || warp-cli --accept-tos set-proxy port 40000 2>&1 || true
-    sleep 1
-    warp-cli --accept-tos connect 2>&1 || true
-    sleep 3
-    if warp-cli --accept-tos status 2>&1 | grep -qi "Connected"; then
-      echo "WARP proxy mode connected on port 40000"
-      export CUSTOM_OUTBOUND_PROXY="socks5://127.0.0.1:40000"
-      echo "CUSTOM_OUTBOUND_PROXY=$CUSTOM_OUTBOUND_PROXY" > /tmp/warp-env 2>/dev/null || true
+    if is_warp_broken; then
+      echo "warp-svc flagged broken (watchdog/nft or $WARP_RESTARTS restarts) — skipping proxy mode, trying WireGuard directly..."
     else
-      echo "WARP proxy mode failed. Trying userspace WireGuard tunnel (wg-quick / wireguard-go)..."
+      # Ensure daemon alive for proxy mode
+      if ! is_warp_svc_alive; then
+        echo "warp-svc not alive for proxy mode — restarting..."
+        start_warp_svc
+        sleep 3
+      fi
+      # Only try proxy mode if daemon is actually answering
+      if warp-cli --accept-tos status 2>&1 | grep -qi "Unable to connect to CloudflareWARP daemon"; then
+        echo "warp-svc not answering for proxy mode — skipping to WireGuard"
+      else
+        warp-cli --accept-tos disconnect 2>&1 || true
+        sleep 1
+        warp-cli --accept-tos mode proxy 2>&1 || warp-cli --accept-tos set-mode proxy 2>&1 || true
+        warp-cli --accept-tos proxy port 40000 2>&1 || warp-cli --accept-tos set-proxy port 40000 2>&1 || true
+        sleep 1
+        warp-cli --accept-tos connect 2>&1 || true
+        sleep 3
+        if warp-cli --accept-tos status 2>&1 | grep -qi "Connected"; then
+          echo "WARP proxy mode connected on port 40000"
+          export CUSTOM_OUTBOUND_PROXY="socks5://127.0.0.1:40000"
+          echo "CUSTOM_OUTBOUND_PROXY=$CUSTOM_OUTBOUND_PROXY" > /tmp/warp-env 2>/dev/null || true
+          NEED_PROXY=0
+        else
+          echo "WARP proxy mode failed."
+        fi
+      fi
+    fi
+    if [ "$NEED_PROXY" -eq 1 ]; then
+      echo "Trying userspace WireGuard tunnel (wg-quick / wireguard-go)..."
       if ! start_wireguard_tunnel; then
         echo "WireGuard tunnel failed. Trying userspace WireGuard SOCKS5 (wgcf/wireproxy)..."
         if ! start_wireguard_warp; then
