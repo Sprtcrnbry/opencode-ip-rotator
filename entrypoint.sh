@@ -1,7 +1,12 @@
 #!/bin/bash
 set +e
 
-# --- D-Bus: warp-svc requires system bus -------------------------------------
+# Fix proxies.txt mount bug: if host file missing, Docker creates directory at /app/data/proxies.txt
+if [ -d /app/data/proxies.txt ]; then
+  echo "Fixing proxies.txt: is directory (missing host file), removing..."
+  rm -rf /app/data/proxies.txt
+  touch /app/data/proxies.txt 2>/dev/null || true
+fi
 mkdir -p /run/dbus /var/run/dbus 2>/dev/null || true
 if [ ! -e /run/dbus/pid ] && [ ! -e /var/run/dbus/pid ]; then
   echo "Starting D-Bus..."
@@ -39,29 +44,34 @@ is_warp_svc_alive() {
 # --- warp-svc start ----------------------------------------------------------
 start_warp_svc
 
-# Wait for warp-svc to be ready (up to 60s)
-# Must not mark ready on transient "Configuring initial firewall rules" — that means daemon still booting and may crash next.
+# Wait for warp-svc to be ready (up to 40s, max 3 restarts then fallback)
+# Must not mark ready on transient "Configuring initial firewall rules" — daemon still booting and may crash.
 echo "Waiting for warp-svc to be ready..."
 READY=0
-for i in $(seq 1 60); do
+RESTARTS=0
+for i in $(seq 1 40); do
   if ! is_warp_svc_alive; then
-    echo "warp-svc died unexpectedly after ${i}s — restarting... last log:"
-    cat /tmp/warp-svc.log 2>/dev/null | tail -n 20 || true
+    RESTARTS=$((RESTARTS+1))
+    echo "warp-svc died unexpectedly after ${i}s (restart $RESTARTS/3) — last log:"
+    cat /tmp/warp-svc.log 2>/dev/null | tail -n 30 || true
+    if [ "$RESTARTS" -ge 3 ]; then
+      echo "warp-svc crashed $RESTARTS times — host kernel/nft incompatible with WARP tunnel. Falling back to proxy/direct."
+      break
+    fi
     start_warp_svc
     sleep 2
     continue
   fi
   OUT=$(warp-cli --accept-tos status 2>&1 || true)
   if echo "$OUT" | grep -qi "Unable to connect to CloudflareWARP daemon"; then
-    # daemon not answering yet
     sleep 1
     continue
   fi
   if echo "$OUT" | grep -qi "Configuring initial firewall"; then
     echo "  still configuring firewall (${i}s)..."
-    # Check log for hard firewall failure — if warp-svc will die, it logs nft error
-    if grep -qiE "nft|firewall|Failed to configure|permission denied" /tmp/warp-svc.log 2>/dev/null; then
-      echo "  firewall error detected in log, will fallback to proxy mode shortly"
+    if grep -qiE "nft.*failed|Failed to configure firewall|permission denied|No such file or directory.*CloudflareWARP" /tmp/warp-svc.log 2>/dev/null; then
+      echo "  firewall nft error detected — WARP tunnel incompatible with this host, will fallback to proxy"
+      break
     fi
     sleep 2
     continue
@@ -73,9 +83,7 @@ for i in $(seq 1 60); do
     READY=1
     break
   fi
-  # Any other parseable Status output without Unable -> also ready (covers older CLI)
   if echo "$OUT" | grep -qiE "Status update|Trace|Mode|Account"; then
-    # but not if it's still "Connecting" without firewall — wait a bit more
     if echo "$OUT" | grep -qi "Connecting"; then
       sleep 1
       continue
@@ -87,37 +95,41 @@ for i in $(seq 1 60); do
   fi
   sleep 1
 done
-
 if [ "$READY" -eq 0 ]; then
-  echo "WARNING: warp-svc did not become ready in 60s. Last status:"
-  warp-cli --accept-tos status 2>&1 || true
+  echo "WARNING: warp-svc did not become ready (restarts=$RESTARTS). Last status:"
+  warp-cli --accept-tos status 2>&1 | head -n 10 || true
   echo "--- warp-svc log tail ---"
   cat /tmp/warp-svc.log 2>/dev/null | tail -n 40 || true
-  echo "--- is warp-svc alive? ---"
-  ps aux 2>/dev/null | grep warp || pgrep -a warp-svc 2>/dev/null || true
-  # Don't exit — try proxy mode anyway if daemon still alive, else restart in proxy
-  if ! is_warp_svc_alive; then
-    echo "warp-svc not alive — restarting for proxy fallback..."
+  # If we hit restart limit or nft error, don't loop forever — go to proxy fallback
+  if [ "$RESTARTS" -ge 3 ] || grep -qiE "nft.*failed|Failed to configure firewall|No such file or directory.*CloudflareWARP" /tmp/warp-svc.log 2>/dev/null; then
+    echo "WARP tunnel incompatible with host kernel — will use proxy/direct fallback"
+  elif ! is_warp_svc_alive; then
+    echo "warp-svc not alive — restarting once for proxy fallback..."
     start_warp_svc
     sleep 3
   fi
 fi
-
-# Check if daemon died right after ready check (race seen in user log: ready 1s then Connection refused)
+# If daemon died after ready check, don't restart infinitely — one restart then fallback
 if ! is_warp_svc_alive; then
-  echo "warp-svc died right after ready check — restarting..."
-  cat /tmp/warp-svc.log 2>/dev/null | tail -n 20 || true
-  start_warp_svc
-  sleep 3
+  if [ "$RESTARTS" -ge 3 ]; then
+    echo "warp-svc still dead after $RESTARTS restarts — skipping to proxy/direct"
+  else
+    echo "warp-svc died right after ready check — restarting..."
+    cat /tmp/warp-svc.log 2>/dev/null | tail -n 20 || true
+    start_warp_svc
+    sleep 3
+  fi
 fi
-# Final guard: if status still Connection refused, restart once more before registration
 if warp-cli --accept-tos status 2>&1 | grep -qi "Connection refused"; then
-  echo "warp-cli still Connection refused — restarting warp-svc..."
-  cat /tmp/warp-svc.log 2>/dev/null | tail -n 20 || true
-  start_warp_svc
-  sleep 3
+  if [ "$RESTARTS" -ge 3 ]; then
+    echo "warp-cli still Connection refused after $RESTARTS restarts — will try proxy/direct"
+  else
+    echo "warp-cli still Connection refused — restarting warp-svc..."
+    cat /tmp/warp-svc.log 2>/dev/null | tail -n 20 || true
+    start_warp_svc
+    sleep 3
+  fi
 fi
-
 # --- Registration: version-agnostic check -----------------------------------
 NEEDS_REG=0
 STATUS_OUT=$(warp-cli --accept-tos status 2>&1 || true)
@@ -153,9 +165,12 @@ else
 fi
 
 # --- Mode + Connect ---------------------------------------------------------
-# Detect if warp tunnel is viable: check for nft/iptables hard failures in log
+# Detect if warp tunnel is viable: check for nft/iptables hard failures in log or repeated crashes
 WARP_TUNNEL_BROKEN=0
-if grep -qiE "Failed to configure firewall|nft.*failed|iptables.*failed" /tmp/warp-svc.log 2>/dev/null; then
+if [ "${RESTARTS:-0}" -ge 3 ]; then
+  echo "warp-svc crashed $RESTARTS times — host incompatible with WARP tunnel, skipping to proxy/direct"
+  WARP_TUNNEL_BROKEN=1
+elif grep -qiE "Failed to configure firewall|nft.*failed|iptables.*failed|No such file or directory.*CloudflareWARP" /tmp/warp-svc.log 2>/dev/null; then
   echo "Detected firewall/nft failure in warp-svc log — skipping warp tunnel, going straight to proxy mode"
   WARP_TUNNEL_BROKEN=1
 fi
@@ -164,7 +179,6 @@ if [ ! -c /dev/net/tun ]; then
   echo "/dev/net/tun not present — skipping warp tunnel"
   WARP_TUNNEL_BROKEN=1
 fi
-
 if [ "$WARP_TUNNEL_BROKEN" -eq 0 ]; then
   echo "Setting WARP mode to warp..."
   warp-cli --accept-tos mode warp 2>&1 || warp-cli --accept-tos set-mode warp 2>&1 || true
