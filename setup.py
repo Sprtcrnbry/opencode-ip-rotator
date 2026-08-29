@@ -26,8 +26,8 @@ def log(msg: str, status: str = "INFO"):
 
 def check_python_version():
     log("Checking Python version...")
-    if sys.version_info < (3, 8):
-        log("Python 3.8 or higher is required.", "ERROR")
+    if sys.version_info < (3, 10):
+        log("Python 3.10 or higher is required (pyproject.toml).", "ERROR")
         sys.exit(1)
     log("Python version OK.")
 
@@ -105,7 +105,8 @@ def main():
     print("=" * 60)
     print(" Setup completed successfully!")
     print(" You can now launch the service using:")
-    print("   python server.py (and python rotator.py)")
+    print("   python server.py  # unified proxy + rotator (recommended)")
+    print("   # or legacy split: python rotator.py in one terminal, python server.py in another")
     print(" Or using Docker:")
     print("   docker compose up -d --build")
     print("=" * 60)

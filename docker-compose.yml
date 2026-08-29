@@ -7,15 +7,18 @@ services:
       - "8000:8000"
     init: true
     privileged: true
+    # privileged already covers NET_ADMIN/SYS_ADMIN/NET_RAW and lets the
+    # entrypoint mknod /dev/net/tun when the host has no TUN device. Keep
+    # cap_add for documentation; drop the host devices mapping so the stack
+    # also starts on Docker Desktop (Mac/Win) where /dev/net/tun is absent and
+    # the wireproxy SOCKS5 fallback (no TUN needed) can still provide WARP
+    # egress.
     cap_add:
       - NET_ADMIN
       - SYS_ADMIN
       - NET_RAW
-    devices:
-      - /dev/net/tun:/dev/net/tun
     volumes:
       - ./data:/app/data
-      - ./proxies.txt:/app/proxies.txt:ro
     tmpfs:
       - /tmp
     sysctls:
@@ -39,4 +42,4 @@ services:
       interval: 30s
       timeout: 10s
       retries: 3
-      start_period: 40s
+      start_period: 60s

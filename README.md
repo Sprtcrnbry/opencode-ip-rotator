@@ -22,6 +22,7 @@ A microservice-architected Cloudflare WARP IP rotator and proxy server for OpenC
 - **In-Memory Active Flow Locking**: Protects active SSE streams from being interrupted during IP rotation.
 - **Anthropic & Responses API Compatibility**: Native `/v1/messages` and `/v1/responses` endpoints.
 - **Custom Proxy Pool Support**: Round-robin outbound proxy pool via `data/proxies.txt` or `PROXY_LIST` environment variable.
+- **Resilient Egress Fallback Chain**: If the WARP daemon cannot run (missing `/dev/net/tun`, host firewall incompatibility, repeated crashes), the container automatically falls back — first to a real WireGuard tunnel (`wg-quick` on a `wgcf`-generated profile, using the host kernel module or the userspace `wireguard-go` dataplane), then to a pure-userspace SOCKS5 proxy (`wgcf` + `wireproxy`) that needs no kernel WireGuard or `NET_ADMIN`.
 
 ---
 
@@ -30,7 +31,7 @@ A microservice-architected Cloudflare WARP IP rotator and proxy server for OpenC
 ```
 [OpenCode Client] ──(HTTP/2)──> [Unified Proxy & WARP Node (Port 8000)] ──(SQLite)──> [metrics.db]
                                            │
-                                  (Cloudflare WARP Tunnel)
+                        (WARP tunnel → WARP proxy → WireGuard tunnel → WireGuard SOCKS5 → proxies → direct)
                                            ▼
                               [OpenCode Zen API Endpoint]
 ```
@@ -98,9 +99,11 @@ python manager.py
 ### Option 2: Local Native Execution
 
 #### Prerequisites
-- Python 3.8 or higher
+- Python 3.10 or higher
 - Cloudflare WARP CLI (`warp-cli`) installed and added to system PATH
 - Administrative privileges (required for `warp-cli` operations on Windows)
+
+> The `wgcf`/`wireproxy`/`wireguard-go` fallback stack is bundled in the Docker image and used there only. Native mode relies on the local `warp-cli` (and falls back to the custom proxy pool / direct).
 
 #### Steps
 
@@ -191,6 +194,16 @@ PROXY_LIST="http://proxy1:8080,socks5://proxy2:1080" docker compose up -d
 
 The proxy pool rotates in round-robin order across all outbound requests.
 
+### Egress Fallback Chain
+
+The container selects the first working egress path, in order:
+
+1. **Cloudflare WARP tunnel** (`warp-svc` / `warp-cli`, full TUN mode).
+2. **WARP proxy mode** — the WARP daemon exposed as a local SOCKS5 proxy on `127.0.0.1:40000`.
+3. **WireGuard tunnel** (`wg-quick` on the `wgcf` profile) — when the WARP daemon cannot run at all (no TUN device, kernel/`nft` incompatibility, daemon crashes). `wgcf` registers a WARP account and generates a WireGuard profile. `wg-quick` brings up a real `wgcf0` interface — the host kernel module when present, otherwise the userspace `wireguard-go` dataplane (built into the image).
+4. **WireGuard SOCKS5** (`wgcf` + `wireproxy`) — if even the TUN-based tunnel fails, `wireproxy` (Go userspace WireGuard) exposes the same profile as a SOCKS5 proxy on `127.0.0.1:41000`. The account and profile persist in `/app/wireguard` across container restarts. IP rotation through this path restarts the `wireproxy` tunnel.
+5. **Custom proxy pool** / direct connection — last resort.
+
 ---
 
 ## API Endpoints Reference
@@ -217,26 +230,31 @@ The proxy pool rotates in round-robin order across all outbound requests.
 | `AUTO_RECYCLE_THRESHOLD` | `50` | Maximum rotations before triggering container environment refresh. |
 | `CORS_ALLOW_ORIGINS` | `http://127.0.0.1:8000,http://localhost:8000` | Comma-separated browser origins allowed to call the proxy. |
 | `WARP_ROTATOR_URL` | `http://127.0.0.1:8001` | Internal rotator endpoint. Do not expose port 8001 publicly. |
+| `PROXY_LIST_FILE` | `/app/data/proxies.txt` | Path to the custom proxy pool file (one proxy per line). |
+| `PROXY_LIST` | *(empty)* | Comma-separated custom proxies, merged with `PROXY_LIST_FILE`. |
+| `CUSTOM_OUTBOUND_PROXY` | *(empty)* | Single outbound proxy (e.g. `socks5://127.0.0.1:41000`), set automatically by the fallback chain. |
 
 ### Rate-limit behavior
 
-The proxy preserves upstream `429` responses, including `Retry-After`, and does not treat them as a signal to bypass account, model, provider, or subscription limits. The dashboard can trigger manual WARP rotation. In Docker, the proxy shares the rotator's network namespace so the egress path being checked is the path used for upstream requests.
+The proxy preserves upstream `429` responses, including `Retry-After`, and does not treat them as a signal to bypass account, model, provider, or subscription limits. The dashboard can trigger manual WARP rotation. Everything runs in a single container, so the egress path used for upstream requests is the same path verified by health checks and rotation logic.
+
+---
+
 ## Deploy from GitHub Container Registry
 
-Every push to `master` publishes prebuilt images to GHCR (no local build needed):
+Every push to `master` publishes a single all-in-one image to GHCR (no local build needed):
 
-- `ghcr.io/sprtcrnbry/opencode-ip-rotator:latest` — proxy server (`Dockerfile` target `proxy`)
-- `ghcr.io/sprtcrnbry/opencode-ip-rotator:warp` — WARP rotator (`Dockerfile` target `warp`)
+- `ghcr.io/sprtcrnbry/opencode-ip-rotator:latest` — unified proxy + rotator + WARP/WireGuard fallback container (built from the root `Dockerfile`)
 
 Log in once, then run. The default `docker-compose.yml` already references the
-published images, so no local build is needed:
+published image, so no local build is needed:
 
 ```bash
 docker login ghcr.io -u Sprtcrnbry
 docker compose up -d
 ```
-First run still needs `proxies.txt` (see Configuration); WARP registration happens
-inside the rotator container on startup.
+
+On first start the container registers a Cloudflare WARP account automatically (via `warp-cli`, or `wgcf` when running on the WireGuard fallback). `data/proxies.txt` is optional — only needed when you want a custom proxy pool.
 
 
 ---

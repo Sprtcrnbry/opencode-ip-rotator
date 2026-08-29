@@ -65,10 +65,10 @@ jobs:
       - name: Pull published image from GHCR
         run: docker pull ghcr.io/sprtcrnbry/opencode-ip-rotator:latest
 
-      - name: Verify warp-cli binary and dependencies in image
+      - name: Verify binaries and dependencies in image
         run: |
           docker run --rm --entrypoint '' ghcr.io/sprtcrnbry/opencode-ip-rotator:latest \
-            sh -c "which warp-cli && warp-cli --version && python -c \"import server, rotator; print('imports ok')\""
+            sh -c "which warp-cli && which wgcf && which wireproxy && which wireguard-go && which wg-quick && warp-cli --version && python -c \"import server, rotator; print('imports ok')\""
 
       - name: Smoke-test proxy health endpoint
         run: |
@@ -76,9 +76,9 @@ jobs:
             -e OPENCODE_ZEN_HOST=0.0.0.0 \
             ghcr.io/sprtcrnbry/opencode-ip-rotator:latest
           ok=0
-          for i in $(seq 1 15); do
+          for i in $(seq 1 45); do
             if curl -sf http://127.0.0.1:18000/metrics >/dev/null 2>&1; then ok=1; break; fi
-            sleep 1
+            sleep 2
           done
           if [ "$ok" -ne 1 ]; then
             echo "::error::proxy smoketest failed — dumping container logs"

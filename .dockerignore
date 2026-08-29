@@ -4,6 +4,7 @@ __pycache__
 .gitignore
 .env
 data/
+proxies.txt
 README.md
 LICENSE
 *.md

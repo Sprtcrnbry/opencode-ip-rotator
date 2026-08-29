@@ -1,18 +1,11 @@
 #!/bin/bash
 set +e
 
-# Fix proxies.txt mounts: data bind + root fallback until direct
-# - ./data:/app/data  -> /app/data/proxies.txt (primary, README)
-# - ./proxies.txt:/app/proxies.txt (fallback, root convenience)
-# Docker creates directory at /app/data/proxies.txt if host root file missing — remove it
+# Single proxies.txt source: ./data:/app/data -> /app/data/proxies.txt (README).
+# Docker creates a directory at the bind target when the host file is missing — remove it.
 if [ -d /app/data/proxies.txt ]; then
   echo "Fixing proxies.txt: is directory (missing host file), removing..."
   rm -rf /app/data/proxies.txt
-fi
-# Fallback: if primary empty/missing but root fallback exists, copy it
-if [ ! -s /app/data/proxies.txt ] && [ -f /app/proxies.txt ] && [ -s /app/proxies.txt ]; then
-  echo "Using fallback proxies from /app/proxies.txt -> /app/data/proxies.txt"
-  cp /app/proxies.txt /app/data/proxies.txt 2>/dev/null || cat /app/proxies.txt > /app/data/proxies.txt 2>/dev/null || true
 fi
 # Ensure file exists for rotator/server (avoids Is a directory)
 touch /app/data/proxies.txt 2>/dev/null || true
@@ -51,6 +44,114 @@ start_warp_svc() {
 is_warp_svc_alive() {
   if [ -n "${WARP_SVC_PID:-}" ] && kill -0 "$WARP_SVC_PID" 2>/dev/null; then return 0; fi
   if pgrep -x warp-svc >/dev/null 2>&1; then return 0; fi
+  return 1
+}
+
+# --- wgcf/wireguard userspace WireGuard fallbacks ---------------------------------
+# When warp-svc / warp-cli cannot run (missing TUN, host nft incompatibility, daemon
+# crashes), fall back to a pure-userspace WARP tunnel. wgcf registers a Cloudflare
+# account and generates a WireGuard profile. Two tiers on top of that profile:
+#   1. wg-quick tunnel (kernel WireGuard if the host module is present, otherwise the
+#      userspace wireguard-go binary) — a real wg0 interface, no proxy hop.
+#   2. wireproxy (Go userspace WireGuard) — SOCKS5 proxy, no /dev/net/tun needed.
+WG_DIR=/app/wireguard
+WG_IFACE=wgcf0
+WIREPROXY_PORT=41000
+
+ensure_wgcf_profile() {
+  mkdir -p "$WG_DIR"
+  if ! command -v wgcf >/dev/null 2>&1; then
+    echo "  wgcf binary missing — skipping WireGuard fallback"
+    return 1
+  fi
+  # wgcf writes wgcf-account.toml in the current directory — run it inside WG_DIR without leaking cwd for the caller (exec python server.py must still find /app/server.py).
+  if [ ! -f "$WG_DIR/wgcf-account.toml" ]; then
+    echo "  Registering Cloudflare WARP account via wgcf..."
+    if ! (cd "$WG_DIR" && wgcf register --accept-tos >/tmp/wgcf-register.log 2>&1); then
+      echo "  wgcf register failed:"
+      tail -n 5 /tmp/wgcf-register.log 2>/dev/null || true
+      return 1
+    fi
+  fi
+  if [ ! -f "$WG_DIR/wgcf-profile.conf" ]; then
+    echo "  Generating WireGuard profile via wgcf..."
+    if ! (cd "$WG_DIR" && wgcf generate --profile wgcf-profile.conf >/tmp/wgcf-generate.log 2>&1); then
+      echo "  wgcf generate failed:"
+      tail -n 5 /tmp/wgcf-generate.log 2>/dev/null || true
+      return 1
+    fi
+  fi
+  return 0
+}
+
+start_wireguard_tunnel() {
+  # Full TUN tunnel via wg-quick. wg-quick uses the host kernel module when present
+  # and auto-falls back to the userspace wireguard-go binary otherwise (needs TUN + NET_ADMIN).
+  if [ ! -c /dev/net/tun ]; then
+    echo "  no /dev/net/tun — skipping WireGuard tunnel"
+    return 1
+  fi
+  if ! command -v wg-quick >/dev/null 2>&1 || ! command -v wireguard-go >/dev/null 2>&1; then
+    echo "  wg-quick/wireguard-go missing — skipping WireGuard tunnel"
+    return 1
+  fi
+  ensure_wgcf_profile || return 1
+  # Strip the DNS line: resolvconf is not installed and container DNS stays authoritative.
+  mkdir -p /etc/wireguard
+  grep -vi '^[[:space:]]*DNS[[:space:]]*=' "$WG_DIR/wgcf-profile.conf" > /etc/wireguard/wgcf0.conf
+  chmod 600 /etc/wireguard/wgcf0.conf
+  pkill -f "wireguard-go $WG_IFACE" 2>/dev/null || true
+  wg-quick down wgcf0 >/dev/null 2>&1 || true
+  echo "  Bringing up WireGuard tunnel $WG_IFACE (kernel module or wireguard-go)..."
+  if ! wg-quick up /etc/wireguard/wgcf0.conf >/tmp/wg-quick.log 2>&1; then
+    echo "  wg-quick failed:"
+    tail -n 15 /tmp/wg-quick.log 2>/dev/null || true
+    wg-quick down wgcf0 >/dev/null 2>&1 || true
+    pkill -f "wireguard-go $WG_IFACE" 2>/dev/null || true
+    return 1
+  fi
+  local ip
+  ip=$(curl -s --max-time 8 https://cloudflare.com/cdn-cgi/trace 2>/dev/null | grep "^ip=" | cut -d= -f2)
+  if [ -n "$ip" ]; then
+    echo "  WireGuard tunnel ($WG_IFACE) egress OK — IP: $ip"
+    return 0
+  fi
+  echo "  WireGuard tunnel egress verification failed — tearing down"
+  wg-quick down wgcf0 >/dev/null 2>&1 || true
+  pkill -f "wireguard-go $WG_IFACE" 2>/dev/null || true
+  return 1
+}
+
+start_wireguard_warp() {
+  # SOCKS5 fallback: no TUN, purely userspace via wireproxy.
+  if ! command -v wgcf >/dev/null 2>&1 || ! command -v wireproxy >/dev/null 2>&1; then
+    echo "  wgcf/wireproxy binaries missing — skipping WireGuard SOCKS5 fallback"
+    return 1
+  fi
+  ensure_wgcf_profile || return 1
+  # wireproxy.conf imports the wgcf profile and exposes SOCKS5.
+  cat > "$WG_DIR/wireproxy.conf" <<EOF
+WGConfig = $WG_DIR/wgcf-profile.conf
+
+[Socks5]
+BindAddress = 127.0.0.1:$WIREPROXY_PORT
+EOF
+  # Start wireproxy (kill stale instance first).
+  pkill -f "wireproxy -c $WG_DIR/wireproxy.conf" 2>/dev/null || true
+  sleep 1
+  nohup wireproxy -c "$WG_DIR/wireproxy.conf" >/tmp/wireproxy.log 2>&1 &
+  sleep 3
+  # Verify egress through the tunnel before advertising it.
+  local ip
+  ip=$(curl -s --max-time 8 --proxy "socks5h://127.0.0.1:$WIREPROXY_PORT" https://cloudflare.com/cdn-cgi/trace 2>/dev/null | grep "^ip=" | cut -d= -f2)
+  if [ -n "$ip" ]; then
+    echo "  WireGuard (wgcf/wireproxy) egress OK — IP: $ip"
+    export CUSTOM_OUTBOUND_PROXY="socks5://127.0.0.1:$WIREPROXY_PORT"
+    echo "CUSTOM_OUTBOUND_PROXY=$CUSTOM_OUTBOUND_PROXY" > /tmp/warp-env
+    return 0
+  fi
+  echo "  WireGuard SOCKS5 egress verification failed"
+  tail -n 20 /tmp/wireproxy.log 2>/dev/null || true
   return 1
 }
 
@@ -255,14 +356,20 @@ if [ "$CONNECTED" -eq 0 ]; then
       export CUSTOM_OUTBOUND_PROXY="socks5://127.0.0.1:40000"
       echo "CUSTOM_OUTBOUND_PROXY=$CUSTOM_OUTBOUND_PROXY" > /tmp/warp-env 2>/dev/null || true
     else
-      echo "WARNING: WARP could not connect in any mode. Using direct connection."
-      echo "--- warp-svc log tail ---"
-      cat /tmp/warp-svc.log 2>/dev/null | tail -n 40 || true
-      echo "--- warp-cli status ---"
-      warp-cli --accept-tos status 2>&1 || true
-      echo "--- ip link / nft check ---"
-      ip link show 2>/dev/null | head -n 20 || true
-      nft list ruleset 2>&1 | head -n 20 || iptables -L 2>&1 | head -n 20 || true
+      echo "WARP proxy mode failed. Trying userspace WireGuard tunnel (wg-quick / wireguard-go)..."
+      if ! start_wireguard_tunnel; then
+        echo "WireGuard tunnel failed. Trying userspace WireGuard SOCKS5 (wgcf/wireproxy)..."
+        if ! start_wireguard_warp; then
+          echo "WARNING: WARP could not connect in any mode. Using direct connection."
+          echo "--- warp-svc log tail ---"
+          cat /tmp/warp-svc.log 2>/dev/null | tail -n 40 || true
+          echo "--- warp-cli status ---"
+          warp-cli --accept-tos status 2>&1 || true
+          echo "--- ip link / nft check ---"
+          ip link show 2>/dev/null | head -n 20 || true
+          nft list ruleset 2>&1 | head -n 20 || iptables -L 2>&1 | head -n 20 || true
+        fi
+      fi
     fi
   fi
 else

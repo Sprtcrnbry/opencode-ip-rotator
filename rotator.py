@@ -25,6 +25,12 @@ INITIAL_RETRY_DELAY = int(os.environ.get("WARP_RETRY_DELAY", "3"))
 MAX_RETRIES = int(os.environ.get("WARP_MAX_RETRIES", "5"))
 AUTO_RECYCLE_THRESHOLD = int(os.environ.get("AUTO_RECYCLE_THRESHOLD", "50"))
 CUSTOM_OUTBOUND_PROXY = os.environ.get("CUSTOM_OUTBOUND_PROXY", "").strip()
+WG_DIR = Path("/app/wireguard")
+WG_ACCOUNT = WG_DIR / "wgcf-account.toml"
+WG_PROFILE = WG_DIR / "wgcf-profile.conf"
+WG_QUICK_CONF = Path("/etc/wireguard/wgcf0.conf")
+WIREPROXY_CONFIG = WG_DIR / "wireproxy.conf"
+WIREPROXY_PORT = 41000
 
 # Proxy Pool Configuration
 PROXY_LIST_FILE = os.environ.get("PROXY_LIST_FILE", "/app/data/proxies.txt")
@@ -183,6 +189,281 @@ def get_public_ip_via_proxy(proxy: Dict[str, str]) -> Optional[str]:
 
 
 ip_history: List[Dict[str, Any]] = []
+
+# --- WireGuard rotation helpers (must match entrypoint's WG setup) ----------------
+def _wireguard_tunnel_capable() -> bool:
+    return Path("/dev/net/tun").exists() and bool(shutil.which("wg-quick")) and bool(shutil.which("wireguard-go"))
+
+
+def _is_wireguard_tunnel_active() -> bool:
+    try:
+        r = subprocess.run(["wg", "show", "interfaces"], capture_output=True, text=True, timeout=5, check=False)
+        if "wgcf0" in r.stdout:
+            return True
+        r2 = subprocess.run(["ip", "link", "show", "dev", "wgcf0"], capture_output=True, text=True, timeout=3, check=False)
+        return r2.returncode == 0
+    except Exception:
+        return False
+
+
+def _is_wireproxy_active() -> bool:
+    try:
+        r = subprocess.run(["pgrep", "-f", "wireproxy"], capture_output=True, text=True, timeout=3, check=False)
+        return r.returncode == 0 and bool(r.stdout.strip())
+    except Exception:
+        return False
+
+
+def _current_wireproxy_url() -> str:
+    # env may be mutated at runtime after entrypoint; read live
+    live = os.environ.get("CUSTOM_OUTBOUND_PROXY", "").strip()
+    if live and str(WIREPROXY_PORT) in live:
+        return live
+    if CUSTOM_OUTBOUND_PROXY and str(WIREPROXY_PORT) in CUSTOM_OUTBOUND_PROXY:
+        return CUSTOM_OUTBOUND_PROXY
+    return live or CUSTOM_OUTBOUND_PROXY
+
+
+def _teardown_wireguard_backends() -> None:
+    for cmd in (["pkill", "-f", "wireproxy"], ["wg-quick", "down", "wgcf0"]):
+        try:
+            subprocess.run(cmd, capture_output=True, timeout=8, check=False)
+        except Exception:
+            pass
+    try:
+        subprocess.run(["pkill", "-f", "wireguard-go wgcf0"], capture_output=True, timeout=5, check=False)
+    except Exception:
+        pass
+    time.sleep(1)
+
+
+def _bring_up_wireguard_tunnel() -> bool:
+    try:
+        WG_QUICK_CONF.parent.mkdir(parents=True, exist_ok=True)
+        # strip DNS — container has no resolvconf (case-insensitive, handles "DNS=1.1.1.1")
+        with open(WG_PROFILE, "r", encoding="utf-8") as src:
+            lines = [l for l in src if not l.strip().lower().startswith("dns")]
+        WG_QUICK_CONF.write_text("".join(lines), encoding="utf-8")
+        WG_QUICK_CONF.chmod(0o600)
+    except Exception as e:
+        log.warning("Failed to stage %s: %s", WG_QUICK_CONF, e)
+        return False
+    try:
+        r = subprocess.run(["wg-quick", "up", str(WG_QUICK_CONF)], capture_output=True, text=True, timeout=20, check=False)
+        if r.returncode != 0:
+            log.warning("wg-quick up failed: %s %s", r.stdout.strip()[:300], r.stderr.strip()[:300])
+            return False
+    except Exception as e:
+        log.warning("wg-quick up error: %s", e)
+        return False
+    # verify egress via tunnel (no proxy)
+    for _ in range(3):
+        time.sleep(2)
+        ip = get_public_ip()
+        if ip:
+            return True
+    return _is_wireguard_tunnel_active()
+
+
+def _bring_up_wireproxy() -> bool:
+    try:
+        WG_DIR.mkdir(parents=True, exist_ok=True)
+        WIREPROXY_CONFIG.write_text(
+            f"WGConfig = {WG_PROFILE}\n\n[Socks5]\nBindAddress = 127.0.0.1:{WIREPROXY_PORT}\n",
+            encoding="utf-8",
+        )
+    except Exception as e:
+        log.warning("Failed to write %s: %s", WIREPROXY_CONFIG, e)
+        return False
+    try:
+        subprocess.run(["pkill", "-f", "wireproxy"], capture_output=True, timeout=5, check=False)
+        time.sleep(1)
+        subprocess.Popen(["wireproxy", "-c", str(WIREPROXY_CONFIG)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except Exception as e:
+        log.warning("Failed to start wireproxy: %s", e)
+        return False
+    time.sleep(3)
+    proxy = {"http": f"socks5://127.0.0.1:{WIREPROXY_PORT}", "https": f"socks5://127.0.0.1:{WIREPROXY_PORT}"}
+    ip = get_public_ip_via_proxy(proxy)
+    if ip:
+        env_url = f"socks5://127.0.0.1:{WIREPROXY_PORT}"
+        os.environ["CUSTOM_OUTBOUND_PROXY"] = env_url
+        # keep module-level var in sync for any stale check
+        globals()["CUSTOM_OUTBOUND_PROXY"] = env_url
+        return True
+    return False
+
+
+def _record_wireguard_success(new_ip: str, reason: str) -> None:
+    global _current_ip, rotation_count
+    _current_ip = new_ip
+    rotation_count += 1
+    loc = get_ip_location(new_ip)
+    ts = time.strftime("%H:%M:%S", time.localtime())
+    ip_history.append({"ip": new_ip, "country": loc.get("country", "Unknown"), "flag": loc.get("flag", "🌐"), "timestamp": ts, "reason": reason})
+    if len(ip_history) > 20:
+        ip_history.pop(0)
+    try:
+        db_path = Path(os.environ.get("METRICS_DB_PATH", "/app/data/metrics.db"))
+        if db_path.exists():
+            conn = sqlite3.connect(str(db_path))
+            conn.execute("INSERT INTO ip_history (ip, country, flag, timestamp, reason) VALUES (?, ?, ?, ?, ?)", (new_ip, loc.get("country", "Unknown"), loc.get("flag", "🌐"), ts, reason))
+            conn.commit()
+            conn.close()
+    except Exception as err:
+        log.error(f"Failed to write WG rotation to DB: {err}")
+    if rotation_count >= AUTO_RECYCLE_THRESHOLD:
+        log.warning(f"Auto-recycle threshold reached ({rotation_count}/{AUTO_RECYCLE_THRESHOLD}). Triggering container refresh...")
+        trigger_container_recycle()
+    log.info("WireGuard rotation successful (%s)! New IP: %s %s (%s) (Total Rotations: %s)", reason, new_ip, loc.get("flag"), loc.get("country"), rotation_count)
+
+
+def _rotate_wireguard_account(old_ip: Optional[str]) -> bool:
+    """WireGuard rotation with two phases:
+    1) light restart with the existing wgcf profile (no new account) — cheap, keeps quota;
+    2) if IP didn't change, re-register a fresh WARP account via wgcf and bring up the best backend.
+    Returns True iff the public IP actually changed."""
+    global _current_ip, rotation_count
+    if not shutil.which("wgcf"):
+        return False
+    WG_DIR.mkdir(parents=True, exist_ok=True)
+
+    # Keep backups so a failed re-register doesn't brick a working tunnel.
+    bak_account: Optional[bytes] = None
+    bak_profile: Optional[bytes] = None
+    bak_quick: Optional[bytes] = None
+    try:
+        if WG_ACCOUNT.exists():
+            bak_account = WG_ACCOUNT.read_bytes()
+        if WG_PROFILE.exists():
+            bak_profile = WG_PROFILE.read_bytes()
+        if WG_QUICK_CONF.exists():
+            bak_quick = WG_QUICK_CONF.read_bytes()
+    except Exception:
+        pass
+
+    # Phase 1: light restart with the existing profile (no new account). WARP
+    # often hands out a new egress colo on reconnect, so this succeeds without
+    # burning a new device registration.
+    if WG_PROFILE.exists():
+        was_tunnel = _is_wireguard_tunnel_active()
+        was_proxy = _is_wireproxy_active()
+        _teardown_wireguard_backends()
+        # Prefer the backend that was active before; otherwise prefer tunnel when capable.
+        prefer_tunnel = _wireguard_tunnel_capable() and (was_tunnel or not was_proxy)
+        if prefer_tunnel:
+            if _bring_up_wireguard_tunnel():
+                new_ip = get_public_ip()
+                if new_ip and new_ip != old_ip:
+                    os.environ.pop("CUSTOM_OUTBOUND_PROXY", None)
+                    try:
+                        globals()["CUSTOM_OUTBOUND_PROXY"] = ""
+                    except Exception:
+                        pass
+                    _record_wireguard_success(new_ip, "WireGuard tunnel restart")
+                    return True
+                log.info("WireGuard light tunnel restart kept IP %s — will re-register", new_ip)
+                _teardown_wireguard_backends()
+        if shutil.which("wireproxy"):
+            if _bring_up_wireproxy():
+                proxy = {"http": f"socks5://127.0.0.1:{WIREPROXY_PORT}", "https": f"socks5://127.0.0.1:{WIREPROXY_PORT}"}
+                new_ip = get_public_ip_via_proxy(proxy)
+                if new_ip and new_ip != old_ip:
+                    _record_wireguard_success(new_ip, "WireGuard SOCKS5 restart")
+                    return True
+                log.info("WireGuard light SOCKS5 restart kept IP %s — will re-register", new_ip)
+                _teardown_wireguard_backends()
+        # light restart didn't change IP — fall through to re-register
+        log.info("WireGuard light restart did not change IP — re-registering WARP account...")
+
+    # Phase 2: re-register a fresh WARP account
+    log.info("WireGuard rotation: re-registering WARP account via wgcf...")
+    _teardown_wireguard_backends()
+    for p in (WG_ACCOUNT, WG_PROFILE):
+        try:
+            if p.exists():
+                p.unlink()
+        except Exception:
+            pass
+    try:
+        if WG_QUICK_CONF.exists():
+            WG_QUICK_CONF.unlink()
+    except Exception:
+        pass
+
+    try:
+        r1 = subprocess.run(["wgcf", "register", "--accept-tos"], cwd=str(WG_DIR), capture_output=True, text=True, timeout=30, check=False)
+        if r1.returncode != 0:
+            log.warning("wgcf register failed: %s %s", r1.stdout.strip()[:400], r1.stderr.strip()[:400])
+            raise RuntimeError("wgcf register failed")
+        r2 = subprocess.run(["wgcf", "generate", "--profile", str(WG_PROFILE)], cwd=str(WG_DIR), capture_output=True, text=True, timeout=20, check=False)
+        if r2.returncode != 0:
+            log.warning("wgcf generate failed: %s %s", r2.stdout.strip()[:400], r2.stderr.strip()[:400])
+            raise RuntimeError("wgcf generate failed")
+    except Exception as e:
+        log.warning("wgcf register/generate error: %s — restoring previous profile", e)
+        # restore backups so the old tunnel can be brought back up
+        try:
+            if bak_account is not None:
+                WG_ACCOUNT.write_bytes(bak_account)
+            if bak_profile is not None:
+                WG_PROFILE.write_bytes(bak_profile)
+            if bak_quick is not None:
+                WG_QUICK_CONF.parent.mkdir(parents=True, exist_ok=True)
+                WG_QUICK_CONF.write_bytes(bak_quick)
+        except Exception:
+            pass
+        # try to restore previous backend so we don't leave the system without egress
+        try:
+            if bak_profile is not None:
+                if _wireguard_tunnel_capable() and bak_quick is not None:
+                    _bring_up_wireguard_tunnel()
+                elif shutil.which("wireproxy"):
+                    _bring_up_wireproxy()
+        except Exception:
+            pass
+        return False
+
+    # Prefer real tunnel (kernel or wireguard-go) when TUN is available; else SOCKS5.
+    tried_tunnel = False
+    if _wireguard_tunnel_capable():
+        tried_tunnel = True
+        if _bring_up_wireguard_tunnel():
+            new_ip = get_public_ip()
+            if new_ip and new_ip != old_ip:
+                os.environ.pop("CUSTOM_OUTBOUND_PROXY", None)
+                try:
+                    globals()["CUSTOM_OUTBOUND_PROXY"] = ""
+                except Exception:
+                    pass
+                _record_wireguard_success(new_ip, "WireGuard tunnel rotation")
+                return True
+            log.warning("WireGuard tunnel came up but IP did not change (old=%s new=%s) — falling through to SOCKS5", old_ip, new_ip)
+            _teardown_wireguard_backends()
+        else:
+            log.warning("WireGuard tunnel bring-up failed — trying SOCKS5 fallback")
+
+    if shutil.which("wireproxy"):
+        if _bring_up_wireproxy():
+            proxy = {"http": f"socks5://127.0.0.1:{WIREPROXY_PORT}", "https": f"socks5://127.0.0.1:{WIREPROXY_PORT}"}
+            new_ip = get_public_ip_via_proxy(proxy)
+            if new_ip and new_ip != old_ip:
+                _record_wireguard_success(new_ip, "WireGuard SOCKS5 rotation")
+                return True
+            log.warning("WireGuard SOCKS5 brought up but IP did not change (old=%s new=%s)", old_ip, new_ip)
+        else:
+            log.warning("WireGuard SOCKS5 bring-up failed")
+    elif tried_tunnel:
+        log.warning("wireproxy not installed, and tunnel rotation did not yield a new IP")
+
+    return False
+
+
+def restart_wireguard_proxy() -> bool:
+    """Back-compat shim — now re-registers the WARP account so the IP actually rotates.
+    Kept for any external caller that still imports it."""
+    old_ip = _current_ip or get_public_ip()
+    return _rotate_wireguard_account(old_ip)
 
 _ip_location_cache: Dict[str, Dict[str, str]] = {}
 
@@ -377,6 +658,10 @@ def rotate_warp(reason: str = "Triggered") -> bool:
                     log.warning("WARP CLI/daemon not available — skipping to proxy fallback.")
                 else:
                     log.warning("WARP daemon not ready — skipping to proxy fallback.")
+            # Userspace WireGuard fallback: re-register via wgcf and bring up tunnel or SOCKS5.
+            # _rotate_wireguard_account already verifies the IP changed and records history.
+            if _rotate_wireguard_account(old_ip):
+                return True
             # Try remote rotator service as fallback
             rotator_endpoints = ["http://warp-rotator:8001/rotate", "http://127.0.0.1:8001/rotate"]
             for endpoint in rotator_endpoints:
@@ -425,8 +710,11 @@ def rotate_warp(reason: str = "Triggered") -> bool:
 
 def trigger_container_recycle():
     """Triggers self-destruction/recycle script if inside container."""
+    if not shutil.which("docker") and not os.path.exists("/var/run/docker.sock"):
+        log.warning("Auto-recycle skipped: docker CLI/socket not available here. Run 'python manager.py' on the host to recycle the container.")
+        return
     try:
-        subprocess.Popen(["python3", "manager.py"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        subprocess.Popen([sys.executable, "manager.py"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     except Exception as e:
         log.error(f"Failed to trigger auto-recycle: {e}")
 
@@ -541,6 +829,11 @@ def start_rotator_http_server():
         log.error(f"Failed to start rotator HTTP listener: {e}")
 
 def _cleanup_warp():
+    # Teardown WireGuard backends first (no warp-cli needed)
+    try:
+        _teardown_wireguard_backends()
+    except Exception:
+        pass
     warp_bin = get_warp_bin()
     if not shutil.which(warp_bin) and not os.path.exists(warp_bin):
         return
