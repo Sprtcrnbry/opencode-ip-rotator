@@ -1,11 +1,11 @@
 # OpenCode IP Rotator & Proxy Server
 
 [![GitHub release](https://img.shields.io/github/v/release/alztrk/opencode-ip-rotator?style=flat-square&color=blue)](https://github.com/alztrk/opencode-ip-rotator)
-[![Docker Image](https://img.shields.io/badge/docker-microservices-blue.svg?style=flat-square&logo=docker)](https://github.com/alztrk/opencode-ip-rotator)
+[![Docker Image](https://img.shields.io/badge/docker-unified-blue.svg?style=flat-square&logo=docker)](https://github.com/Sprtcrnbry/opencode-ip-rotator/pkgs/container/opencode-ip-rotator)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg?style=flat-square)](https://opensource.org/licenses/MIT)
 [![Python 3.11](https://img.shields.io/badge/python-3.11-brightgreen.svg?style=flat-square&logo=python)](https://python.org)
 
-A microservice-architected Cloudflare WARP IP rotator and proxy server for OpenCode Zen. Designed to prevent HTTP 429 rate limits, guarantee unique IP rotation per cycle, log usage metrics into SQLite, and display real-time statistics on a clean web dashboard.
+Unified Cloudflare WARP IP rotator and OpenAI/Anthropic/Responses proxy for OpenCode Zen. Single container (`warp-svc` + `wireguard-go`/`wireproxy` fallbacks + FastAPI) with verified IP rotation, SQLite persistence, and a live dashboard. Built to survive hosts without TUN or with broken `nft` — it falls back automatically to real WireGuard (`wg-quick` → kernel or `wireguard-go`) and then to a userspace SOCKS5 (`wgcf` + `wireproxy`) before proxies/direct.
 
 ![OpenCode IP Rotator Dashboard Preview](docs/dashboard_preview.jpg)
 
@@ -13,258 +13,225 @@ A microservice-architected Cloudflare WARP IP rotator and proxy server for OpenC
 
 ## Key Features
 
-- **Unified Single Container**: High-performance, all-in-one container combining Cloudflare WARP and FastAPI server with zero IPC overhead and in-memory flow locking.
-- **Zero-Latency TTFT**: Immediate token streaming with HTTP/2 keep-alive connection pooling to maximize prompt generation speed.
-- **Clean Management Dashboard**: Lightweight Web UI displaying active connections, current location, token statistics, and manual rotation controls.
-- **SQLite Data Persistence**: Stores token consumption, model request counts, and historical IP rotation logs on disk.
-- **USD Savings Calculator**: Estimates cost savings per model based on prompt and completion token rates.
-- **Table Pagination**: Built-in 5-item pagination for model usage and IP rotation log tables.
-- **In-Memory Active Flow Locking**: Protects active SSE streams from being interrupted during IP rotation.
-- **Anthropic & Responses API Compatibility**: Native `/v1/messages` and `/v1/responses` endpoints.
-- **Custom Proxy Pool Support**: Round-robin outbound proxy pool via `data/proxies.txt` or `PROXY_LIST` environment variable.
-- **Resilient Egress Fallback Chain**: If the WARP daemon cannot run (missing `/dev/net/tun`, host firewall incompatibility, repeated crashes), the container automatically falls back — first to a real WireGuard tunnel (`wg-quick` on a `wgcf`-generated profile, using the host kernel module or the userspace `wireguard-go` dataplane), then to a pure-userspace SOCKS5 proxy (`wgcf` + `wireproxy`) that needs no kernel WireGuard or `NET_ADMIN`.
+- **Unified single container** — `warp-svc`/`wireguard-go`/`wireproxy` + FastAPI in one image, no IPC, in-memory flow locking.
+- **Resilient egress chain** — `WARP tunnel → WARP proxy (40000) → WireGuard tunnel (wgcf0, kernel or wireguard-go) → WireGuard SOCKS5 (wgcf+wireproxy :41000) → custom proxies → direct` — verified via `cloudflare.com/cdn-cgi/trace`.
+- **Zero-latency streaming** — SSE passthrough with lease-guarded rotation, HTTP/2 keep-alive pool (`curl_cffi` `chrome124`).
+- **Dashboard** (`/dashboard`) — IP, location, active flows, rotations, model usage, inspector for recent requests.
+- **SQLite persistence** — `data/metrics.db` (WAL) stores model usage, `ip_history` (20 in-mem, 100 on disk), warp quality.
+- **Model auto-discovery** — `models.dev` + upstream `/v1/models` enrich every model with context/output/reasoning/tool/attachment metadata; `big-pickle` + `*-free` filtered.
+- **OpenAI / Anthropic / Responses compat** — `/v1/chat/completions`, `/v1/messages`, `/v1/responses`, `/v1/models`.
+- **Custom proxy pool** — `data/proxies.txt` or `PROXY_LIST` env, round-robin, used as last fallback and as outbound proxy for upstream calls.
+- **Safety** — flow-lease + `rotation_lock` prevents stream truncation, `ROTATION_DRAIN_TIMEOUT`, idempotent warp re-registration, Prometheus metrics.
 
 ---
 
-## Architecture Overview
+## Architecture
 
 ```
-[OpenCode Client] ──(HTTP/2)──> [Unified Proxy & WARP Node (Port 8000)] ──(SQLite)──> [metrics.db]
+[OpenCode Client] ──(HTTP/2)──> [Unified Proxy & WARP Node :8000] ──(SQLite)──> data/metrics.db
                                            │
-                        (WARP tunnel → WARP proxy → WireGuard tunnel → WireGuard SOCKS5 → proxies → direct)
+          WARP tunnel → WARP proxy → WireGuard tunnel → WireGuard SOCKS5 → proxies → direct
                                            ▼
-                              [OpenCode Zen API Endpoint]
+                              [opencode.ai/zen/v1]
 ```
 
-### Core Architecture Components
+**Components**
 
-1. **Proxy Server (`server.py`):** An OpenAI, Anthropic, and Responses compatible proxy server running on `http://127.0.0.1:8000`. It processes requests, forwards headers dynamically, handles streaming SSE responses, and presents a Web Management Dashboard.
-2. **Rotator Module (`rotator.py`):** Manages WARP tunnel rotation, health monitoring, and IP verification directly in-process.
-3. **Container Manager (`manager.py`):** Provides automated ephemeral container lifecycle management.
-
----
-
-## Detailed Features
-
-- **OpenAI Standard Compatibility:** Fully exposes `/v1/chat/completions` and `/v1/models` endpoints to integrate with standard clients.
-- **Dynamic Header Forwarding:** Captures and forwards all incoming client metadata including `x-opencode-*` headers and injects `Authorization: Bearer public` credentials required by the upstream API.
-- **Verified Public IP Rotation:** Validates public IP changes via external IP lookup services to guarantee a distinct IP allocation after every disconnection cycle.
-- **Active Flow Locking:** Prevents IP rotations during active Server-Sent Events (SSE) streaming sessions to prevent connection truncation and stream drops.
-- **Dynamic Model Auto-Discovery:** Periodically queries the upstream API to discover newly available free models without requiring code changes or static lists.
-- **Web Management Dashboard:** Includes a clean, dark-themed web interface accessible at `http://127.0.0.1:8000/dashboard` for monitoring public IP status, active connections, total rotations, and triggering manual rotations.
+1. **`server.py`** — FastAPI on `127.0.0.1:8000` ( `0.0.0.0` in Docker). Forwards `x-opencode-*`, `Authorization: Bearer public`, streams SSE, exposes `/dashboard`, `/metrics`, `/health`, `/api/rotate`.
+2. **`rotator.py`** — In-process WARP rotation, health checks (`WARP_CHECK_INTERVAL`), periodic rotation, two-phase WireGuard rotation (light restart → `wgcf` re-register), lease DB `active_flow_leases`.
+3. **`entrypoint.sh`** — Starts `dbus`/`warp-svc`, waits for daemon (caps restarts at 3, detects `nft` failures), registers WARP, connects `warp` → `proxy` → `wg-quick/wireguard-go` → `wireproxy`; writes `/tmp/warp-env` (`CUSTOM_OUTBOUND_PROXY`) for `server.py`.
+4. **`manager.py`** — `docker compose down -v && up -d --build` recycle when `AUTO_RECYCLE_THRESHOLD` hit.
 
 ---
 
-## Quick Automated Setup
-
-Run the automated installer script to install Python dependencies, verify system requirements, and automatically configure `~/.config/opencode/opencode.jsonc`:
+## Quick Start
 
 ```bash
-python setup.py
+python setup.py   # pip install, warp-cli check, writes ~/.config/opencode/opencode.jsonc
 ```
 
 ---
 
-## Installation & Deployment
+## Installation
 
-### Option 1: Docker Container Deployment (Recommended)
+### Docker (recommended)
 
-Running the project in Docker isolates the execution environment, preventing local network configuration changes and ensuring a new environment identity (`/etc/machine-id`) on every initialization.
+Isolates WARP/WireGuard, gives a fresh `/etc/machine-id` on each recreate, and works on Docker Desktop (Mac/Win) via the `wireproxy` fallback even without host TUN.
 
-#### Prerequisites
-- Docker Engine 20.10+
-- Docker Compose v2+
+**Prereqs:** Docker Engine 20.10+, Compose v2+.
 
-#### Pull and Launch
-
-Images publish to GHCR on every push to `master` (see *Deploy from GitHub Container Registry* below). Log in once, then start — no local build required:
+**Pull and launch** — images publish to GHCR on every `master` push, no local build needed:
 
 ```bash
 docker login ghcr.io
 docker compose up -d
 ```
 
-#### Access Web Dashboard
-Open your browser and navigate to:
-`http://127.0.0.1:8000/dashboard`
+Dashboard: `http://127.0.0.1:8000/dashboard`
 
-#### Environment Re-creation
-To manually trigger environment self-destruction and re-create a container with fresh hardware identifiers:
+**Recreate with fresh identity:**
+
 ```bash
 python manager.py
+# or
+docker compose down && docker compose up -d --build
 ```
 
----
+No `proxies.txt` required — WARP/WireGuard is the primary egress. Add `data/proxies.txt` only for a custom pool.
 
-### Option 2: Local Native Execution
+### Native (Linux / Windows)
 
-#### Prerequisites
-- Python 3.10 or higher
-- Cloudflare WARP CLI (`warp-cli`) installed and added to system PATH
-- Administrative privileges (required for `warp-cli` operations on Windows)
+**Prereqs:** Python 3.10+, Cloudflare WARP installed (`warp-cli` on PATH), admin/root for WARP daemon. `wgcf`/`wireproxy`/`wireguard-go` are Docker-only; native falls back to `warp-cli` → custom proxies → direct.
 
-> The `wgcf`/`wireproxy`/`wireguard-go` fallback stack is bundled in the Docker image and used there only. Native mode relies on the local `warp-cli` (and falls back to the custom proxy pool / direct).
-
-#### Steps
-
-1. Install Python dependencies:
-   ```bash
-   pip install -r requirements.txt
-   ```
-
-2. Start the rotator background service:
-   ```bash
-   python rotator.py
-   ```
-
-3. Launch the proxy server:
-   ```bash
-   python server.py
-   ```
+```bash
+pip install -r requirements.txt
+python server.py          # unified proxy + in-process rotator
+# legacy split (still works):
+# python rotator.py       # in another terminal
+# python server.py
+```
 
 ---
 
 ## Configuration
 
-### API Key Requirement
+### API key
 
-Always configure your client or SDK to use **`public`** as the API key (e.g. `Authorization: Bearer public` or `x-api-key: public`). The proxy uses this key to interface with upstream public free-tier models.
+Always use `public`:
 
----
+```
+Authorization: Bearer public
+# or x-api-key: public
+```
 
-### OpenAI-Compatible Provider (Default)
+The proxy maps dummy keys (`any`, `test`, `dummy`, etc.) to `Bearer public` and forwards `x-opencode-*` headers.
 
-To use the local proxy server within OpenCode, update your configuration file at `~/.config/opencode/opencode.jsonc`:
+### OpenAI-compatible provider (`opencode.jsonc`)
 
 ```jsonc
 {
   "provider": {
     "opencode-zen-local": {
       "npm": "@ai-sdk/openai-compatible",
-      "options": {
-        "baseURL": "http://127.0.0.1:8000/v1",
-        "apiKey": "public"
-      },
+      "options": { "baseURL": "http://127.0.0.1:8000/v1", "apiKey": "public" },
       "name": "OpenCode Zen Local Proxy"
     }
   }
 }
 ```
 
-> **Note:** Models are automatically discovered from the proxy server's `/v1/models` endpoint. You do not need to hardcode model names manually.
-
----
-
-### Anthropic API Provider
-
-The proxy exposes a native Anthropic-compatible `/v1/messages` endpoint. To use it with OpenCode's Anthropic provider:
+### Anthropic provider
 
 ```jsonc
 {
   "provider": {
     "my-anthropic-proxy": {
       "npm": "@ai-sdk/anthropic",
-      "options": {
-        "baseURL": "http://127.0.0.1:8000",
-        "apiKey": "public"
-      }
+      "options": { "baseURL": "http://127.0.0.1:8000", "apiKey": "public" }
     }
   }
 }
 ```
 
-> Requests sent to `/v1/messages` are translated to OpenAI format internally and routed through the same WARP-protected upstream.
+`/v1/messages` is translated to OpenAI internally and uses the same egress chain.
 
----
+### Custom proxy pool
 
-### Custom Outbound Proxy Pool
+**File:** `data/proxies.txt` (one per line, single source — the old root `proxies.txt:/app/proxies.txt` double-mount is removed):
 
-If you want to use your own HTTP/SOCKS5 proxies instead of (or in addition to) Cloudflare WARP:
-
-**Option 1 — File:** Create `data/proxies.txt` with one proxy per line:
 ```
 http://user:pass@proxy1.example.com:8080
 socks5://proxy2.example.com:1080
 ```
 
-**Option 2 — Environment variable:**
-```bash
-PROXY_LIST="http://proxy1:8080,socks5://proxy2:1080" docker compose up -d
-```
+**Env:** `PROXY_LIST="http://proxy1:8080,socks5://proxy2:1080" docker compose up -d`
 
-The proxy pool rotates in round-robin order across all outbound requests.
+Merged file+env, deduped, round-robin. Consumed as `{"http": url, "https": url}` for `curl_cffi`.
 
-### Egress Fallback Chain
+### Egress fallback chain
 
-The container selects the first working egress path, in order:
+Container picks the first working egress:
 
-1. **Cloudflare WARP tunnel** (`warp-svc` / `warp-cli`, full TUN mode).
-2. **WARP proxy mode** — the WARP daemon exposed as a local SOCKS5 proxy on `127.0.0.1:40000`.
-3. **WireGuard tunnel** (`wg-quick` on the `wgcf` profile) — when the WARP daemon cannot run at all (no TUN device, kernel/`nft` incompatibility, daemon crashes). `wgcf` registers a WARP account and generates a WireGuard profile. `wg-quick` brings up a real `wgcf0` interface — the host kernel module when present, otherwise the userspace `wireguard-go` dataplane (built into the image).
-4. **WireGuard SOCKS5** (`wgcf` + `wireproxy`) — if even the TUN-based tunnel fails, `wireproxy` (Go userspace WireGuard) exposes the same profile as a SOCKS5 proxy on `127.0.0.1:41000`. The account and profile persist in `/app/wireguard` across container restarts. IP rotation through this path restarts the `wireproxy` tunnel.
-5. **Custom proxy pool** / direct connection — last resort.
+1. **WARP tunnel** `warp-svc` + `warp-cli` `mode warp` (needs TUN + `NET_ADMIN` + working `nft`).
+2. **WARP proxy** `warp-cli` `mode proxy` `127.0.0.1:40000` (same daemon, SOCKS5).
+3. **WireGuard tunnel** `wgcf` profile → `wg-quick` `wgcf0` (kernel if present, else `wireguard-go` userspace, still needs TUN).
+4. **WireGuard SOCKS5** `wgcf` + `wireproxy` `127.0.0.1:41000` (pure userspace, no TUN) — account/profile in `/app/wireguard` (ephemeral layer, survives `restart` but not `down`).
+5. **Custom proxies / direct**.
+
+Rotation mirrors the chain. WARP does `disconnect/connect` then `registration delete/new` only when IP didn't change (proxy mode skips delete). WireGuard does light restart with the same profile first, then `wgcf register --accept-tos` + `generate` if still stuck, then tunnel → SOCKS5. All paths verify `cloudflare.com/cdn-cgi/trace` IP changed and record to `ip_history`.
 
 ---
 
-## API Endpoints Reference
+## API Endpoints
 
 | Endpoint | Method | Description |
-| :--- | :--- | :--- |
-| `/v1/chat/completions` | `POST` | OpenAI-compatible chat completion endpoint with automatic retry and IP rotation. |
-| `/v1/messages` | `POST` | Anthropic-compatible endpoint (`/v1/messages`) for Claude clients and `@ai-sdk/anthropic`. |
-| `/v1/models` | `GET` | Returns list of currently discovered active free models. |
-| `/dashboard` | `GET` | Renders the HTML Web Management Dashboard. |
-| `/metrics` | `GET` | Returns structured JSON metrics including verified IP, uptime, and request counters. |
-| `/api/rotate` | `POST` | Triggers an immediate manual IP rotation cycle. |
+|---|---:|---|
+| `/v1/chat/completions` | `POST` | OpenAI chat, retries on 429/5xx, rotates IP, SSE streaming. |
+| `/v1/messages` | `POST` | Anthropic compat (translated to OpenAI). |
+| `/v1/responses` | `POST` | Responses API (`/v1/responses`). |
+| `/v1/models` | `GET` | Discovered `big-pickle` + `*-free` models with context/output/flag metadata. |
+| `/dashboard` | `GET` | HTML dashboard. |
+| `/metrics` | `GET` | JSON: `verified_public_ip`, `uptime`, `model_usage`, `ip_history`, `warp_quality`, `recent_requests`. |
+| `/metrics-prometheus` | `GET` | Prometheus exposition. |
+| `/health` | `GET` | `{"status":"healthy","database":"connected",...}` + `proxy_warp_health` gauge. |
+| `/api/rotate` | `POST` | Manual rotation (lease-guarded). |
+| `/api/recent-requests` | `GET` | Ring buffer (50) of redacted headers + payload summaries. |
+
+Upstream `429` is preserved with `Retry-After`/`X-Rate-Limit-Reason`; 429 triggers async rotation with 10s cooldown (`ROTATION_429_COOLDOWN_SECONDS`) and `ROTATION_DRAIN_TIMEOUT` (30s) to avoid coroutine pile-up.
 
 ---
 
-## Technical Specifications & Environment Variables
+## Environment Variables
 
-| Variable | Default Value | Description |
-| :--- | :--- | :--- |
-| `OPENCODE_ZEN_PORT` | `8000` | Local port for the proxy server. |
-| `OPENCODE_ZEN_HOST` | `127.0.0.1` | Host address for binding the server (`0.0.0.0` in Docker). |
-| `WARP_CHECK_INTERVAL` | `15` | Health check interval in seconds (set `0` to disable). |
-| `WARP_ROTATION_INTERVAL` | `300` | Periodic timed IP rotation interval in seconds (set `0` to disable timed rotation). |
-| `AUTO_RECYCLE_THRESHOLD` | `50` | Maximum rotations before triggering container environment refresh. |
-| `CORS_ALLOW_ORIGINS` | `http://127.0.0.1:8000,http://localhost:8000` | Comma-separated browser origins allowed to call the proxy. |
-| `WARP_ROTATOR_URL` | `http://127.0.0.1:8001` | Internal rotator endpoint. Do not expose port 8001 publicly. |
-| `PROXY_LIST_FILE` | `/app/data/proxies.txt` | Path to the custom proxy pool file (one proxy per line). |
-| `PROXY_LIST` | *(empty)* | Comma-separated custom proxies, merged with `PROXY_LIST_FILE`. |
-| `CUSTOM_OUTBOUND_PROXY` | *(empty)* | Single outbound proxy (e.g. `socks5://127.0.0.1:41000`), set automatically by the fallback chain. |
+| Variable | Default | Description |
+|---|---:|---|
+| `OPENCODE_ZEN_PORT` | `8000` | Proxy listen port. |
+| `OPENCODE_ZEN_HOST` | `127.0.0.1` (`0.0.0.0` in compose) | Bind host. |
+| `OPENCODE_ZEN_TARGET_BASE` | `https://opencode.ai/zen/v1` | Upstream base. |
+| `WARP_CHECK_ENDPOINT` | `https://opencode.ai` | Health-check HEAD target. |
+| `WARP_CHECK_INTERVAL` | `15` | Healthcheck secs (`0` disable). |
+| `WARP_ROTATION_INTERVAL` | `300` | Periodic rotation secs (`0` disable). |
+| `WARP_RETRY_DELAY` / `WARP_MAX_RETRIES` | `3` / `5` | Healthcheck retry knobs. |
+| `AUTO_RECYCLE_THRESHOLD` | `50` | Rotations before `manager.py` recycle (needs `docker` or `/var/run/docker.sock`). |
+| `MAX_RETRIES_ON_429` / `INITIAL_BACKOFF` | `8` / `1` | Per-request upstream retry. |
+| `ROTATION_429_COOLDOWN_SECONDS` | `10` | Cooldown for auto-rotation on 429. |
+| `ROTATION_DRAIN_TIMEOUT` | `30` | Max wait for in-flight rotation before proceeding. |
+| `MAX_CONCURRENT_UPSTREAM` | `80` | Semaphore for upstream `curl_cffi` calls. |
+| `FLOW_LEASE_TTL_SECONDS` / `FLOW_LEASE_HEARTBEAT_SECONDS` | `90` / `15` | SSE lease TTL/heartbeat (SQLite `active_flow_leases`). |
+| `METRICS_DB_PATH` | `/app/data/metrics.db` | SQLite file (WAL). |
+| `PROXY_LIST_FILE` | `/app/data/proxies.txt` | Custom pool file. |
+| `PROXY_LIST` | *(empty)* | Comma-separated custom proxies (merged with file). |
+| `CUSTOM_OUTBOUND_PROXY` | *(empty)* | Enforced outbound `socks5://…` (set by entrypoint fallback to `:40000` or `:41000`; also read live in rotator). |
+| `CORS_ALLOW_ORIGINS` | `http://127.0.0.1:8000,http://localhost:8000` | CORS allowlist. |
+| `LOG_LEVEL` / `LOG_FORMAT` | `INFO` / `text` | `text` or `json`. |
+| `ENABLE_HTTP2` | `false` | `true` to use HTTP/2 upstream (default `V1_1`). |
+| `WARP_ROTATOR_URL` | `http://127.0.0.1:8001` | Legacy split-rotator HTTP fallback; unused in unified mode. |
 
-### Rate-limit behavior
-
-The proxy preserves upstream `429` responses, including `Retry-After`, and does not treat them as a signal to bypass account, model, provider, or subscription limits. The dashboard can trigger manual WARP rotation. Everything runs in a single container, so the egress path used for upstream requests is the same path verified by health checks and rotation logic.
+Compose healthcheck: `curl -sf http://localhost:8000/health | grep '"status"'` `interval:30s` `start_period:60s` (covers WARP+WireGuard startup).
 
 ---
 
-## Deploy from GitHub Container Registry
+## Deploy from GHCR
 
-Every push to `master` publishes a single all-in-one image to GHCR (no local build needed):
+Every `master` push builds a single unified image:
 
-- `ghcr.io/sprtcrnbry/opencode-ip-rotator:latest` — unified proxy + rotator + WARP/WireGuard fallback container (built from the root `Dockerfile`)
-
-Log in once, then run. The default `docker-compose.yml` already references the
-published image, so no local build is needed:
+- `ghcr.io/Sprtcrnbry/opencode-ip-rotator:latest` — proxy + rotator + WARP/WireGuard (root `Dockerfile`, multi-arch `amd64`/`arm64`/`arm` for `wgcf`/`wireproxy` + `wireguard-go` via `go install`).
 
 ```bash
-docker login ghcr.io -u Sprtcrnbry
-docker compose up -d
+docker login ghcr.io
+docker compose up -d   # compose already references the published image
 ```
 
-On first start the container registers a Cloudflare WARP account automatically (via `warp-cli`, or `wgcf` when running on the WireGuard fallback). `data/proxies.txt` is optional — only needed when you want a custom proxy pool.
-
+First start registers a WARP account automatically (`warp-cli` or `wgcf` on fallback). `data/proxies.txt` optional.
 
 ---
 
 ## Responsibility Disclaimer
 
-This project is intended for educational, research, and infrastructure resilience testing purposes. Users are responsible for ensuring their usage complies with applicable terms of service and acceptable use policies of third-party service providers. The maintainers assume no liability for account suspensions, service interruptions, or misuse.
+Educational / research / resilience-testing use only. You are responsible for complying with upstream ToS and acceptable-use policies. Maintainers assume no liability for suspensions or misuse.
 
 ---
 
 ## License
 
-This software is released under the [MIT License](LICENSE).
+[MIT](LICENSE)
