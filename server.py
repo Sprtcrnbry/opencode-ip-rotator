@@ -1114,7 +1114,13 @@ def summarize_payload_for_log(payload: dict) -> dict:
         elif k == "tools" and isinstance(v, list):
             summary["tools_count"] = len(v)
             summary["tool_names"] = [
-                (t.get("function", {}).get("name") if isinstance(t, dict) else str(t))
+                (
+                    ((t.get("function") or {}).get("name") if isinstance(t.get("function"), dict) else None)
+                    or t.get("name")
+                    or "unknown"
+                )
+                if isinstance(t, dict)
+                else str(t)
                 for t in v
             ][:10]
         elif k == "system" and isinstance(v, str):
