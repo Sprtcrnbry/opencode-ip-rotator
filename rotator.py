@@ -120,6 +120,7 @@ def has_active_flow_leases() -> bool:
         conn = sqlite3.connect(str(FLOW_LEASE_DB_PATH), timeout=5)
         try:
             conn.execute("DELETE FROM active_flow_leases WHERE expires_at <= ?", (time.time(),))
+            conn.commit()
             row = conn.execute("SELECT 1 FROM active_flow_leases LIMIT 1").fetchone()
             return row is not None
         finally:
@@ -530,11 +531,11 @@ def get_warp_bin() -> str:
 # -----------------------------------------------------------------------------
 # WARP Controller with IP Verification & Auto-Recycle Trigger
 # -----------------------------------------------------------------------------
-def rotate_warp(reason: str = "Triggered") -> bool:
+def rotate_warp(reason: str = "Triggered", force: bool = False) -> bool:
     global _current_ip, rotation_count
     with rotation_lock:
         with flow_lock:
-            if active_flows_count > 0 or has_active_flow_leases():
+            if not force and (active_flows_count > 0 or has_active_flow_leases()):
                 log.info("IP rotation skipped — an active streaming flow lease is in progress.")
                 return False
 
@@ -816,8 +817,8 @@ def start_rotator_http_server():
             return {"status": "healthy", "current_ip": _current_ip, "rotations": rotation_count}
 
         @rotator_app.post("/rotate")
-        def http_rotate():
-            success = rotate_warp(reason="Remote HTTP Dashboard Trigger")
+        def http_rotate(force: bool = True):
+            success = rotate_warp(reason="Remote HTTP Dashboard Trigger", force=force)
             return {"status": "success" if success else "failed", "verified_ip": _current_ip}
         
         @rotator_app.get("/status")

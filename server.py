@@ -46,8 +46,8 @@ DASHBOARD_REFRESH_INTERVAL = 3
 STARTUP_TIME = time.time()
 ENABLE_HTTP2 = os.environ.get("ENABLE_HTTP2", "false").lower() in ("true", "1", "yes")
 STREAM_TIMEOUT = 600
-FLOW_LEASE_TTL_SECONDS = int(os.environ.get("FLOW_LEASE_TTL_SECONDS", "90"))
-FLOW_LEASE_HEARTBEAT_SECONDS = int(os.environ.get("FLOW_LEASE_HEARTBEAT_SECONDS", "15"))
+FLOW_LEASE_TTL_SECONDS = int(os.environ.get("FLOW_LEASE_TTL_SECONDS", "30"))
+FLOW_LEASE_HEARTBEAT_SECONDS = int(os.environ.get("FLOW_LEASE_HEARTBEAT_SECONDS", "5"))
 
 # -----------------------------------------------------------------------------
 # JSON Structured Logging
@@ -1293,16 +1293,16 @@ def log_upstream_response(response, model_name: str, endpoint: str, attempt: int
     )
 
 
-def rotate_egress(reason: str) -> tuple[bool, Optional[str]]:
+def rotate_egress(reason: str, force: bool = True) -> tuple[bool, Optional[str]]:
     """Request rotation directly in-memory from rotator module or remote fallback."""
     try:
-        success = rotator.rotate_warp(reason=reason)
+        success = rotator.rotate_warp(reason=reason, force=force)
         _close_all_sessions()
         return success, rotator._current_ip
     except Exception as exc:
         log.warning("In-process rotation failed, attempting HTTP fallback: %s", exc)
         try:
-            response = cffi_requests.post(f"{WARP_ROTATOR_URL}/rotate", timeout=35)
+            response = cffi_requests.post(f"{WARP_ROTATOR_URL}/rotate?force={str(force).lower()}", timeout=35)
             data = response.json() if response.headers.get("content-type", "").startswith("application/json") else {}
             if response.status_code == 200 and data.get("status") == "success":
                 _close_all_sessions()
