@@ -1,15 +1,28 @@
 #!/bin/bash
 set +e
 
-# Fix proxies.txt mount bug: if host file missing, Docker creates directory at /app/data/proxies.txt
+# Fix proxies.txt mounts: data bind + root fallback until direct
+# - ./data:/app/data  -> /app/data/proxies.txt (primary, README)
+# - ./proxies.txt:/app/proxies.txt (fallback, root convenience)
+# Docker creates directory at /app/data/proxies.txt if host root file missing — remove it
 if [ -d /app/data/proxies.txt ]; then
   echo "Fixing proxies.txt: is directory (missing host file), removing..."
   rm -rf /app/data/proxies.txt
-  touch /app/data/proxies.txt 2>/dev/null || true
+fi
+# Fallback: if primary empty/missing but root fallback exists, copy it
+if [ ! -s /app/data/proxies.txt ] && [ -f /app/proxies.txt ] && [ -s /app/proxies.txt ]; then
+  echo "Using fallback proxies from /app/proxies.txt -> /app/data/proxies.txt"
+  cp /app/proxies.txt /app/data/proxies.txt 2>/dev/null || cat /app/proxies.txt > /app/data/proxies.txt 2>/dev/null || true
+fi
+# Ensure file exists for rotator/server (avoids Is a directory)
+touch /app/data/proxies.txt 2>/dev/null || true
+if [ -f /app/data/proxies.txt ] && [ -s /app/data/proxies.txt ]; then
+  echo "Proxy pool: $(wc -l < /app/data/proxies.txt 2>/dev/null | tr -d ' ') proxies in /app/data/proxies.txt"
+else
+  echo "Proxy pool: none (direct fallback)"
 fi
 mkdir -p /run/dbus /var/run/dbus 2>/dev/null || true
 if [ ! -e /run/dbus/pid ] && [ ! -e /var/run/dbus/pid ]; then
-  echo "Starting D-Bus..."
   if command -v service >/dev/null 2>&1; then
     service dbus start 2>/dev/null || dbus-daemon --system --fork 2>/dev/null || true
   else

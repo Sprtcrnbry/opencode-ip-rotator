@@ -15,9 +15,8 @@ services:
       - /dev/net/tun:/dev/net/tun
     volumes:
       - ./data:/app/data
-      - ./proxies.txt:/app/data/proxies.txt:ro
+      - ./proxies.txt:/app/proxies.txt:ro
     tmpfs:
-      - /run
       - /tmp
     sysctls:
       - net.ipv4.ip_forward=1
