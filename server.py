@@ -1108,9 +1108,14 @@ def redact_headers_for_log(headers_dict: Dict[str, str]) -> Dict[str, str]:
 def summarize_payload_for_log(payload: dict) -> dict:
     summary = {}
     for k, v in payload.items():
-        if k == "messages" and isinstance(v, list):
-            summary["messages_count"] = len(v)
-            summary["message_roles"] = [m.get("role") for m in v if isinstance(m, dict)][:10]
+        if k in ("messages", "input") and isinstance(v, list):
+            # OpenAI messages or Responses input
+            summary[f"{k}_count"] = len(v)
+            summary[f"{k}_roles"] = [m.get("role") for m in v if isinstance(m, dict)][:10]
+            # alias for dashboard compat
+            if k == "input":
+                summary["messages_count"] = summary["input_count"]
+                summary["message_roles"] = summary["input_roles"]
         elif k == "tools" and isinstance(v, list):
             summary["tools_count"] = len(v)
             summary["tool_names"] = [
@@ -1123,8 +1128,40 @@ def summarize_payload_for_log(payload: dict) -> dict:
                 else str(t)
                 for t in v
             ][:10]
-        elif k == "system" and isinstance(v, str):
-            summary["system_prompt_len"] = len(v)
+        elif k == "system":
+            if isinstance(v, str):
+                summary["system_prompt_len"] = len(v)
+            elif isinstance(v, list):
+                # Anthropic: [{type:"text", text:"..."}] — extract preview
+                try:
+                    parts = []
+                    for b in v:
+                        if isinstance(b, dict) and b.get("type") == "text":
+                            parts.append(b.get("text", ""))
+                        elif isinstance(b, str):
+                            parts.append(b)
+                    txt = "\n".join(p for p in parts if p)
+                    summary["system_prompt_len"] = len(txt)
+                    if txt:
+                        summary["system_preview"] = txt[:120]
+                except Exception:
+                    summary["system"] = f"list(len={len(v)})"
+            elif isinstance(v, dict):
+                summary["system"] = list(v.keys())
+            else:
+                summary["system"] = f"[{type(v).__name__}]"
+        elif k == "tool_choice":
+            if isinstance(v, str):
+                summary[k] = v
+            elif isinstance(v, dict):
+                # OpenAI: "auto" or {"type":"function","function":{"name":"..."}} ; Anthropic: {"type":"auto"/"any"/"tool", "name":...}
+                fn = v.get("function")
+                if isinstance(fn, dict) and fn.get("name"):
+                    summary["tool_choice"] = f"tool:{fn.get('name')}"
+                else:
+                    summary["tool_choice"] = v.get("type") or v.get("name") or str(v)[:80]
+            else:
+                summary[k] = str(v)[:200]
         elif isinstance(v, (str, int, float, bool, type(None))):
             summary[k] = v
         elif isinstance(v, dict):
@@ -2042,7 +2079,7 @@ def anthropic_to_openai(body: dict) -> dict:
                     "id": b.get("id") or f"call_{uuid.uuid4().hex[:24]}",
                     "type": "function",
                     "function": {
-                        "name": b.get("name"),
+                        "name": b.get("name") or "unknown",
                         "arguments": json.dumps(b.get("input") or {}, separators=(",", ":")),
                     },
                 })
@@ -2070,10 +2107,11 @@ def anthropic_to_openai(body: dict) -> dict:
 
     tools = []
     for t in body.get("tools") or []:
+        # Anthropic tools use flat {name, description, input_schema}; guard missing name
         tools.append({
             "type": "function",
             "function": {
-                "name": t.get("name"),
+                "name": t.get("name") or "unknown",
                 "description": t.get("description", ""),
                 "parameters": t.get("input_schema") or {"type": "object", "properties": {}},
             },
@@ -2113,7 +2151,7 @@ def openai_to_anthropic(res: dict, model_name: str) -> dict:
         content_blocks.append({
             "type": "tool_use",
             "id": call.get("id") or f"toolu_{uuid.uuid4().hex[:24]}",
-            "name": fn.get("name"),
+            "name": fn.get("name") or "unknown",
             "input": args,
         })
     finish = choice.get("finish_reason")
