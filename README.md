@@ -190,7 +190,7 @@ Upstream `429` is preserved with `Retry-After`/`X-Rate-Limit-Reason`; 429 trigge
 | `OPENCODE_ZEN_TARGET_BASE` | `https://opencode.ai/zen/v1` | Upstream base. |
 | `WARP_CHECK_ENDPOINT` | `https://opencode.ai` | Health-check HEAD target. |
 | `WARP_CHECK_INTERVAL` | `15` | Healthcheck secs (`0` disable). |
-| `WARP_ROTATION_INTERVAL` | `300` | Periodic rotation secs (`0` disable). |
+| `WARP_ROTATION_INTERVAL` | `86400` | Periodic rotation secs (`0` disable, 86400 = 24h). |
 | `WARP_RETRY_DELAY` / `WARP_MAX_RETRIES` | `3` / `5` | Healthcheck retry knobs. |
 | `AUTO_RECYCLE_THRESHOLD` | `50` | Rotations before `manager.py` recycle (needs `docker` or `/var/run/docker.sock`). |
 | `MAX_RETRIES_ON_429` / `INITIAL_BACKOFF` | `8` / `1` | Per-request upstream retry. |

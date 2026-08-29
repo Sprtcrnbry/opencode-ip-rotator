@@ -31,7 +31,7 @@ services:
       - OPENCODE_ZEN_TARGET_BASE=https://opencode.ai/zen/v1
       - WARP_CHECK_ENDPOINT=https://opencode.ai
       - WARP_CHECK_INTERVAL=15
-      - WARP_ROTATION_INTERVAL=300
+      - WARP_ROTATION_INTERVAL=86400
       - METRICS_DB_PATH=/app/data/metrics.db
       - PROXY_LIST_FILE=/app/data/proxies.txt
       - PROXY_LIST=${PROXY_LIST:-}

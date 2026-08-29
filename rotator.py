@@ -19,7 +19,7 @@ from urllib.request import Request, urlopen
 # -----------------------------------------------------------------------------
 CHECK_ENDPOINT = os.environ.get("WARP_CHECK_ENDPOINT", "https://opencode.ai")
 CHECK_INTERVAL = int(os.environ.get("WARP_CHECK_INTERVAL", "15"))
-PERIODIC_ROTATION_INTERVAL = int(os.environ.get("WARP_ROTATION_INTERVAL", "300"))
+PERIODIC_ROTATION_INTERVAL = int(os.environ.get("WARP_ROTATION_INTERVAL", "86400"))
 
 INITIAL_RETRY_DELAY = int(os.environ.get("WARP_RETRY_DELAY", "3"))
 MAX_RETRIES = int(os.environ.get("WARP_MAX_RETRIES", "5"))
