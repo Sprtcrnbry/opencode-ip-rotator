@@ -43,10 +43,10 @@ class RateLimitClassificationTests(unittest.TestCase):
                 self.assertFalse(rotator.has_active_flow_leases())
                 connection = rotator.sqlite3.connect(str(rotator.FLOW_LEASE_DB_PATH))
                 connection.close()
-                self.assertTrue(rotator.has_active_flow_leases())
+                # Fixed: missing table must NOT deadlock rotation (old code returned True)
+                self.assertFalse(rotator.has_active_flow_leases())
             finally:
                 rotator.FLOW_LEASE_DB_PATH = original_path
-
     def test_upstream_rate_limit_response_and_rotation(self):
         import asyncio
         from unittest.mock import patch, MagicMock

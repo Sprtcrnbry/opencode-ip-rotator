@@ -1,17 +1,27 @@
 services:
   opencode-ip-rotator:
     image: ghcr.io/sprtcrnbry/opencode-ip-rotator:latest
+    build: .
     container_name: opencode_ip_rotator
     ports:
       - "8000:8000"
+    init: true
     privileged: true
     cap_add:
       - NET_ADMIN
+      - SYS_ADMIN
+      - NET_RAW
     devices:
       - /dev/net/tun:/dev/net/tun
     volumes:
       - ./data:/app/data
       - ./proxies.txt:/app/data/proxies.txt:ro
+    tmpfs:
+      - /run
+      - /tmp
+    sysctls:
+      - net.ipv4.ip_forward=1
+      - net.ipv6.conf.all.forwarding=1
     restart: unless-stopped
     environment:
       - OPENCODE_ZEN_PORT=8000
@@ -26,8 +36,8 @@ services:
       - CORS_ALLOW_ORIGINS=${CORS_ALLOW_ORIGINS:-http://127.0.0.1:8000,http://localhost:8000}
       - LOG_LEVEL=INFO
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      test: ["CMD-SHELL", "curl -sf http://localhost:8000/health | grep -q '\"status\"'"]
       interval: 30s
       timeout: 10s
       retries: 3
-      start_period: 15s
+      start_period: 40s

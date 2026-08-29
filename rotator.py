@@ -119,12 +119,12 @@ def has_active_flow_leases() -> bool:
         finally:
             conn.close()
     except sqlite3.OperationalError as exc:
-        # During proxy startup the table may not exist yet; never turn a DB
-        # read race into an unguarded rotation.
-        if "no such table" not in str(exc).lower():
-            log.warning("Unable to inspect active stream leases: %s", exc)
-        return True
-
+        # During startup table may not exist yet — do NOT block rotation.
+        # Old code returned True here, which deadlocked rotations on fresh DB.
+        if "no such table" in str(exc).lower():
+            return False
+        log.warning("Unable to inspect active stream leases: %s", exc)
+        return False
 
 def get_public_ip() -> Optional[str]:
     """Fetches current public IP using Cloudflare trace or multi-provider fallbacks."""
@@ -262,64 +262,110 @@ def rotate_warp(reason: str = "Triggered") -> bool:
 
             # Try local WARP CLI rotation first
             warp_bin = get_warp_bin()
-            if shutil.which(warp_bin) or os.path.exists(warp_bin):
+            warp_available = shutil.which(warp_bin) or os.path.exists(warp_bin)
+            # Check daemon actually answering — avoids 4× delete/new loops when warp-svc dead
+            daemon_ok = False
+            daemon_proxy_mode = False
+            if warp_available:
+                try:
+                    st = subprocess.run([warp_bin, "status"], capture_output=True, text=True, timeout=8, check=False)
+                    out = (st.stdout + st.stderr).lower()
+                    if "unable to connect to cloudflarewarp daemon" in out:
+                        log.warning("WARP daemon not answering — skipping WARP rotation, using proxy fallback.")
+                        warp_available = False
+                    else:
+                        daemon_ok = True
+                        daemon_proxy_mode = "proxy" in out
+                        if st.returncode != 0 and "no registration" in out:
+                            log.warning("WARP status: no registration — will recreate on next attempt.")
+                except Exception as e:
+                    log.warning(f"WARP status check failed: {e} — skipping WARP rotation.")
+                    warp_available = False
+            if warp_available and daemon_ok:
                 max_attempts = 4
                 for attempt in range(1, max_attempts + 1):
                     try:
-                        log.info(f"WARP rotation attempt {attempt}/{max_attempts}...")
-                        subprocess.run([warp_bin, "--accept-tos", "disconnect"], capture_output=True, text=True, timeout=10, check=False)
+                        log.info(f"WARP rotation attempt {attempt}/{max_attempts}... (proxy_mode={daemon_proxy_mode})")
+                        # Light reconnect first; only cycle registration if IP doesn't change or daemon says missing
+                        r1 = subprocess.run([warp_bin, "--accept-tos", "disconnect"], capture_output=True, text=True, timeout=10, check=False)
+                        if r1.returncode != 0:
+                            log.debug(f"disconnect stderr: {r1.stderr.strip()[:200]}")
                         time.sleep(1)
 
-                        subprocess.run([warp_bin, "--accept-tos", "registration", "delete"], capture_output=True, text=True, timeout=10, check=False)
-                        time.sleep(1)
-                        subprocess.run([warp_bin, "--accept-tos", "registration", "new"], capture_output=True, text=True, timeout=10, check=False)
-                        time.sleep(1)
+                        # In proxy mode disconnect+connect is enough; skip delete/new unless forced
+                        need_new_reg = False
+                        if not daemon_proxy_mode and attempt > 1:
+                            need_new_reg = True
+                        # Check if last connect complained about registration
+                        if need_new_reg:
+                            d = subprocess.run([warp_bin, "--accept-tos", "registration", "delete"], capture_output=True, text=True, timeout=10, check=False)
+                            log.debug(f"registration delete: rc={d.returncode} {d.stderr.strip()[:150]}")
+                            time.sleep(1)
+                            n = subprocess.run([warp_bin, "--accept-tos", "registration", "new"], capture_output=True, text=True, timeout=12, check=False)
+                            log.debug(f"registration new: rc={n.returncode} {n.stdout.strip()[:150]} {n.stderr.strip()[:150]}")
+                            if n.returncode != 0 and "already registered" not in (n.stdout + n.stderr).lower():
+                                log.warning(f"registration new failed: {n.stderr.strip()[:200]}")
+                            time.sleep(1)
 
-                        res = subprocess.run([warp_bin, "--accept-tos", "connect"], capture_output=True, text=True, timeout=10, check=False)
+                        res = subprocess.run([warp_bin, "--accept-tos", "connect"], capture_output=True, text=True, timeout=12, check=False)
+                        if res.returncode != 0:
+                            log.warning(f"warp connect rc={res.returncode}: {res.stderr.strip()[:200]} {res.stdout.strip()[:200]}")
+                            # If registration missing, force recreate next loop
+                            if "registration" in (res.stdout + res.stderr).lower():
+                                daemon_proxy_mode = False
+                                continue
 
-                        if res.returncode == 0:
-                            time.sleep(3)
-                            new_ip = get_public_ip()
+                        time.sleep(3)
+                        # Refresh daemon mode flag after connect
+                        try:
+                            st2 = subprocess.run([warp_bin, "status"], capture_output=True, text=True, timeout=8, check=False)
+                            if "connected" not in st2.stdout.lower() and "connected" not in st2.stderr.lower():
+                                log.warning(f"warp status after connect not Connected: {st2.stdout.strip()[:200]}")
+                                # still check IP — some versions report Connecting but IP already rotated
+                        except Exception:
+                            pass
+                        new_ip = get_public_ip()
 
-                            if new_ip and new_ip != old_ip:
-                                _current_ip = new_ip
-                                rotation_count += 1
-                                loc = get_ip_location(new_ip)
+                        if new_ip and new_ip != old_ip:
+                            _current_ip = new_ip
+                            rotation_count += 1
+                            loc = get_ip_location(new_ip)
 
-                                timestamp_str = time.strftime("%H:%M:%S", time.localtime())
-                                ip_history.append({
-                                    "ip": new_ip,
-                                    "country": loc.get("country", "Unknown"),
-                                    "flag": loc.get("flag", "🌐"),
-                                    "timestamp": timestamp_str,
-                                    "reason": reason
-                                })
-                                if len(ip_history) > 20:
-                                    ip_history.pop(0)
+                            timestamp_str = time.strftime("%H:%M:%S", time.localtime())
+                            ip_history.append({
+                                "ip": new_ip,
+                                "country": loc.get("country", "Unknown"),
+                                "flag": loc.get("flag", "🌐"),
+                                "timestamp": timestamp_str,
+                                "reason": reason
+                            })
+                            if len(ip_history) > 20:
+                                ip_history.pop(0)
 
-                                try:
-                                    db_path = Path(os.environ.get("METRICS_DB_PATH", "/app/data/metrics.db"))
-                                    if db_path.exists():
-                                        conn = sqlite3.connect(str(db_path))
-                                        cursor = conn.cursor()
-                                        cursor.execute(
-                                            "INSERT INTO ip_history (ip, country, flag, timestamp, reason) VALUES (?, ?, ?, ?, ?)",
-                                            (new_ip, loc.get("country", "Unknown"), loc.get("flag", "🌐"), timestamp_str, reason)
-                                        )
-                                        conn.commit()
-                                        conn.close()
-                                except Exception as err:
-                                    log.error(f"Failed to write IP rotation to SQLite DB: {err}")
+                            try:
+                                db_path = Path(os.environ.get("METRICS_DB_PATH", "/app/data/metrics.db"))
+                                if db_path.exists():
+                                    conn = sqlite3.connect(str(db_path))
+                                    cursor = conn.cursor()
+                                    cursor.execute(
+                                        "INSERT INTO ip_history (ip, country, flag, timestamp, reason) VALUES (?, ?, ?, ?, ?)",
+                                        (new_ip, loc.get("country", "Unknown"), loc.get("flag", "🌐"), timestamp_str, reason)
+                                    )
+                                    conn.commit()
+                                    conn.close()
+                            except Exception as err:
+                                log.error(f"Failed to write IP rotation to SQLite DB: {err}")
 
-                                log.info(f"Guaranteed WARP IP rotation successful! New Verified IP: {new_ip} {loc.get('flag')} ({loc.get('country')}) (Total Rotations: {rotation_count})")
+                            log.info(f"Guaranteed WARP IP rotation successful! New Verified IP: {new_ip} {loc.get('flag')} ({loc.get('country')}) (Total Rotations: {rotation_count})")
 
-                                if rotation_count >= AUTO_RECYCLE_THRESHOLD:
-                                    log.warning(f"Auto-recycle threshold reached ({rotation_count}/{AUTO_RECYCLE_THRESHOLD}). Triggering container refresh...")
-                                    trigger_container_recycle()
+                            if rotation_count >= AUTO_RECYCLE_THRESHOLD:
+                                log.warning(f"Auto-recycle threshold reached ({rotation_count}/{AUTO_RECYCLE_THRESHOLD}). Triggering container refresh...")
+                                trigger_container_recycle()
 
-                                return True
-                            else:
-                                log.warning(f"Attempt {attempt}: Assigned IP ({new_ip}) was identical to old IP ({old_ip}). Retrying fresh registration...")
+                            return True
+                        else:
+                            log.warning(f"Attempt {attempt}: Assigned IP ({new_ip}) was identical to old IP ({old_ip}). Retrying fresh registration...")
+                            daemon_proxy_mode = False  # force registration cycle next attempt
                     except FileNotFoundError:
                         log.error(f"Cloudflare WARP CLI ('{warp_bin}') was not found. Please install Cloudflare WARP and add warp-cli to PATH.")
                         break
@@ -327,8 +373,10 @@ def rotate_warp(reason: str = "Triggered") -> bool:
                         log.error(f"Error during WARP rotation attempt {attempt}: {e}")
                         time.sleep(1)
             else:
-                log.warning("WARP CLI not available locally. Trying remote rotator service...")
-
+                if not warp_available:
+                    log.warning("WARP CLI/daemon not available — skipping to proxy fallback.")
+                else:
+                    log.warning("WARP daemon not ready — skipping to proxy fallback.")
             # Try remote rotator service as fallback
             rotator_endpoints = ["http://warp-rotator:8001/rotate", "http://127.0.0.1:8001/rotate"]
             for endpoint in rotator_endpoints:
@@ -410,14 +458,23 @@ def health_check_loop(endpoint: str, interval: int, initial_delay: int, max_retr
             warp_bin = get_warp_bin()
             if shutil.which(warp_bin) or os.path.exists(warp_bin):
                 status = subprocess.run([warp_bin, "status"], capture_output=True, text=True, timeout=10, check=False)
-                if "Disconnected" in status.stdout:
+                out = status.stdout + status.stderr
+                if "Unable to connect to CloudflareWARP daemon" in out:
+                    log.debug("WARP daemon not answering — health check skip reconnect.")
+                elif "Disconnected" in out:
                     log.warning("WARP tunnel is disconnected — auto-reconnecting...")
-                    # Ensure a registration exists before connecting (Docker case)
-                    regs = subprocess.run([warp_bin, "registrations"], capture_output=True, text=True, timeout=10, check=False)
-                    if "ID" not in regs.stdout:
+                    # Version-agnostic registration check: status tells us if missing
+                    if "No registration" in out or "Registration missing" in out or "not registered" in out.lower():
                         log.warning("No WARP registration found — creating one before reconnect...")
                         subprocess.run([warp_bin, "--accept-tos", "registration", "new"], capture_output=True, text=True, timeout=15, check=False)
                         time.sleep(2)
+                    else:
+                        # Double-check via registration show for new CLI
+                        rs = subprocess.run([warp_bin, "--accept-tos", "registration", "show"], capture_output=True, text=True, timeout=8, check=False)
+                        if rs.returncode != 0 and "Device ID" not in rs.stdout:
+                            # Old CLI fallback: try plural, ignore failure
+                            subprocess.run([warp_bin, "--accept-tos", "registration", "new"], capture_output=True, text=True, timeout=15, check=False)
+                            time.sleep(2)
                     subprocess.run([warp_bin, "--accept-tos", "connect"], capture_output=True, text=True, timeout=15, check=False)
                     time.sleep(3)
                     new_ip = get_public_ip()

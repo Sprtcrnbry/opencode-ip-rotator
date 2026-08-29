@@ -8,20 +8,24 @@ ENV DEBIAN_FRONTEND=noninteractive \
 WORKDIR /app
 
 # Install iptables, nftables, dbus, ca-certificates, and cloudflare-warp
+# Added: iproute2 (ip link for TUN debug), procps (ps/pkill), tini (init)
 RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
     gnupg \
     lsb-release \
     iptables \
     nftables \
+    iproute2 \
+    procps \
     dbus \
+    tini \
     ca-certificates \
     && curl -fsSL https://pkg.cloudflareclient.com/pubkey.gpg | gpg --yes --dearmor --output /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg \
     && echo "deb [signed-by=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg] https://pkg.cloudflareclient.com/ $(lsb_release -cs) main" | tee /etc/apt/sources.list.d/cloudflare-client.list \
     && apt-get update \
     && apt-get install -y cloudflare-warp \
-    && rm -rf /var/lib/apt/lists/*
-
+    && rm -rf /var/lib/apt/lists/* \
+    && mkdir -p /run/dbus /var/run/dbus /app/data
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
