@@ -290,43 +290,63 @@ def _sanitize_model_label(model: str) -> str:
         return m.split("/")[-1]
     return "other"
 
-# curl_cffi Session Pool
+# curl_cffi Session Pool (reuse for non-stream, fresh per stream)
 # -----------------------------------------------------------------------------
-_session_pool: Dict[str, "SessionType"] = {}
+_session_pool: Dict[str, List[Any]] = {}
 _session_pool_lock = threading.Lock()
 SessionType = None  # resolved at first use
+_STREAM_EXECUTOR = ThreadPoolExecutor(max_workers=20, thread_name_prefix="sse")
 
-def _get_session(endpoint: str):
+def _make_session():
     global SessionType
     if SessionType is None:
-        from curl_cffi.requests import Session as SessionType
-    with _session_pool_lock:
-        if endpoint not in _session_pool:
-            kwargs = {}
-            if not ENABLE_HTTP2:
-                from curl_cffi import CurlHttpVersion
-                kwargs["http_version"] = CurlHttpVersion.V1_1
-            _session_pool[endpoint] = SessionType(**kwargs)
-        return _session_pool[endpoint]
-
-def create_fresh_session(is_stream: bool):
-    global SessionType
-    if SessionType is None:
-        from curl_cffi.requests import Session as SessionType
-    kwargs = {}
+        from curl_cffi.requests import Session as SessionType  # type: ignore
+    kwargs: Dict[str, Any] = {}
     if not ENABLE_HTTP2:
         from curl_cffi import CurlHttpVersion
+
         kwargs["http_version"] = CurlHttpVersion.V1_1
     return SessionType(**kwargs)
 
-def _close_all_sessions():
+def _get_session(endpoint: str):
+    # legacy alias — now acquires from pool (caller must release)
+    return _acquire_pooled_session(endpoint)
+
+def _acquire_pooled_session(endpoint: str):
     with _session_pool_lock:
-        for ep, sess in _session_pool.items():
+        lst = _session_pool.get(endpoint)
+        if lst:
+            return lst.pop()
+    return _make_session()
+
+def _release_pooled_session(endpoint: str, sess) -> None:
+    if sess is None:
+        return
+    with _session_pool_lock:
+        lst = _session_pool.setdefault(endpoint, [])
+        # cap pool to avoid unbounded growth under burst
+        if len(lst) < 8:
+            lst.append(sess)
+        else:
             try:
                 sess.close()
             except Exception:
                 pass
+
+def create_fresh_session(is_stream: bool):
+    # streams hold the session for the lifetime of the SSE — must not be pooled
+    return _make_session()
+
+def _close_all_sessions():
+    with _session_pool_lock:
+        for lst in _session_pool.values():
+            for sess in lst:
+                try:
+                    sess.close()
+                except Exception:
+                    pass
         _session_pool.clear()
+    # do NOT shutdown _STREAM_EXECUTOR here — streams still in flight
 
 _discovery_stop = threading.Event()
 
@@ -340,14 +360,12 @@ _request_drain_event.set()
 ROTATION_DRAIN_TIMEOUT = float(os.environ.get("ROTATION_DRAIN_TIMEOUT", "30"))
 
 async def wait_for_rotation_drain():
-    # Loop-wait with a hard timeout so a stuck rotation flag cannot pile up
-    # unbounded coroutines (connection-exhaustion fix).
-    start = time.monotonic()
-    while _rotation_in_progress.is_set():
-        if time.monotonic() - start > ROTATION_DRAIN_TIMEOUT:
-            log.warning("Rotation drain wait timed out after %.0fs; proceeding anyway.", ROTATION_DRAIN_TIMEOUT)
-            return
-        await asyncio.sleep(0.5)
+    if not _rotation_in_progress.is_set():
+        return
+    try:
+        await asyncio.wait_for(_request_drain_event.wait(), timeout=ROTATION_DRAIN_TIMEOUT)
+    except asyncio.TimeoutError:
+        log.warning("Rotation drain wait timed out after %.0fs; proceeding anyway.", ROTATION_DRAIN_TIMEOUT)
 
 def signal_rotation_start():
     _rotation_in_progress.set()
@@ -389,6 +407,61 @@ MODEL_PRICING = {
 }
 
 _model_usage_lock = threading.Lock()
+_token_pending: List[tuple] = []
+_token_pending_lock = threading.Lock()
+_token_writer_started = False
+_token_writer_stop = threading.Event()
+_TOKEN_FLUSH_INTERVAL = 5.0
+
+def _ensure_token_writer():
+    global _token_writer_started
+    if _token_writer_started:
+        return
+    _token_writer_started = True
+
+    def _loop():
+        while not _token_writer_stop.is_set():
+            _token_writer_stop.wait(_TOKEN_FLUSH_INTERVAL)
+            _flush_token_pending()
+        _flush_token_pending()
+
+    threading.Thread(target=_loop, daemon=True, name="token-writer").start()
+
+def _flush_token_pending():
+    with _token_pending_lock:
+        if not _token_pending:
+            return
+        batch = _token_pending[:]
+        _token_pending.clear()
+    # aggregate per model to collapse 100× same-model writes into 1 DB row
+    agg: Dict[str, List[float]] = {}
+    for model_name, req, prompt, comp, total, cost in batch:
+        if model_name not in agg:
+            agg[model_name] = [0, 0, 0, 0, 0.0]
+        agg[model_name][0] += req
+        agg[model_name][1] += prompt
+        agg[model_name][2] += comp
+        agg[model_name][3] += total
+        agg[model_name][4] += cost
+    for model_name, vals in agg.items():
+        try:
+            _db_execute(
+                """
+            INSERT INTO model_usage (model_name, requests, prompt_tokens, completion_tokens, total_tokens, estimated_cost_usd)
+            VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(model_name) DO UPDATE SET
+                requests = requests + excluded.requests,
+                prompt_tokens = prompt_tokens + excluded.prompt_tokens,
+                completion_tokens = completion_tokens + excluded.completion_tokens,
+                total_tokens = total_tokens + excluded.total_tokens,
+                estimated_cost_usd = estimated_cost_usd + excluded.estimated_cost_usd,
+                updated_at = CURRENT_TIMESTAMP
+        """,
+                (model_name, int(vals[0]), int(vals[1]), int(vals[2]), int(vals[3]), float(vals[4])),
+            )
+        except Exception as e:
+            log.error(f"Failed to persist metrics to SQLite: {e}")
+
 
 def track_token_usage(model_name: str, prompt_tokens: int = 0, completion_tokens: int = 0):
     global model_usage_stats
@@ -400,32 +473,29 @@ def track_token_usage(model_name: str, prompt_tokens: int = 0, completion_tokens
     with _model_usage_lock:
         if model_name not in model_usage_stats:
             if len(model_usage_stats) >= 100:
-                # ponytail: drop unknown models beyond cap (cardinality guard)
                 return
             model_usage_stats[model_name] = {
-                "requests": 0, "prompt_tokens": 0, "completion_tokens": 0,
-                "total_tokens": 0, "estimated_cost_usd": 0.0
+                "requests": 0,
+                "prompt_tokens": 0,
+                "completion_tokens": 0,
+                "total_tokens": 0,
+                "estimated_cost_usd": 0.0,
             }
         model_usage_stats[model_name]["requests"] += 1
         model_usage_stats[model_name]["prompt_tokens"] += prompt_tokens
         model_usage_stats[model_name]["completion_tokens"] += completion_tokens
-        model_usage_stats[model_name]["total_tokens"] += (prompt_tokens + completion_tokens)
+        model_usage_stats[model_name]["total_tokens"] += prompt_tokens + completion_tokens
         model_usage_stats[model_name]["estimated_cost_usd"] += cost
 
-    try:
-        _db_execute("""
-            INSERT INTO model_usage (model_name, requests, prompt_tokens, completion_tokens, total_tokens, estimated_cost_usd)
-            VALUES (?, ?, ?, ?, ?, ?)
-            ON CONFLICT(model_name) DO UPDATE SET
-                requests = requests + excluded.requests,
-                prompt_tokens = prompt_tokens + excluded.prompt_tokens,
-                completion_tokens = completion_tokens + excluded.completion_tokens,
-                total_tokens = total_tokens + excluded.total_tokens,
-                estimated_cost_usd = estimated_cost_usd + excluded.estimated_cost_usd,
-                updated_at = CURRENT_TIMESTAMP
-        """, (model_name, 1, prompt_tokens, completion_tokens, prompt_tokens + completion_tokens, cost))
-    except Exception as e:
-        log.error(f"Failed to persist metrics to SQLite: {e}")
+    _ensure_token_writer()
+    with _token_pending_lock:
+        _token_pending.append((model_name, 1, prompt_tokens, completion_tokens, prompt_tokens + completion_tokens, cost))
+        # flush early under burst to bound memory
+        if len(_token_pending) >= 100:
+            # release lock before flushing to avoid deadlock
+            pass
+    if len(_token_pending) >= 100:
+        _flush_token_pending()
 
 # -----------------------------------------------------------------------------
 # WARP Quality Metrics
@@ -837,9 +907,12 @@ async def lifespan(application: FastAPI):
             discovered_models = initial_models
             metrics["discovered_models_count"] = len(discovered_models)
         log.info(f"Initial server model sync complete: {len(discovered_models)} active model(s) loaded.")
+    _ensure_token_writer()
     threading.Thread(target=discover_models_task, daemon=True).start()
     yield
     _close_all_sessions()
+    _token_writer_stop.set()
+    _flush_token_pending()
     _discovery_stop.set()
     try:
         subprocess.run([rotator.get_warp_bin(), "--accept-tos", "disconnect"], capture_output=True, timeout=10, check=False)
@@ -1270,7 +1343,6 @@ async def stream_response(response, model_name: str, session=None, protocol: str
 
     chunk_count = 0
     seen_done = False
-    stream_executor: Optional[ThreadPoolExecutor] = None
 
     try:
         def get_next_line(iter_lines):
@@ -1285,11 +1357,8 @@ async def stream_response(response, model_name: str, session=None, protocol: str
         line_iter = response.iter_lines()
         pending_frame: List[bytes] = []  # SSE frame accumulator (Responses API: event:/data: must stay one frame)
 
-        # One dedicated thread per stream, polled via a single persistent future.
-        # The old run_in_executor(None, ...) pattern shared the default 8-thread
-        # pool and piled up a new cancelled future per stream per 4s heartbeat.
-        stream_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="sse")
-        poll_task = loop.run_in_executor(stream_executor, get_next_line, line_iter)
+        # Shared bounded pool (20 threads) — avoids thread-per-stream explosion under burst.
+        poll_task = loop.run_in_executor(_STREAM_EXECUTOR, get_next_line, line_iter)
 
         while True:
             done, _ = await asyncio.wait({poll_task}, timeout=4.0)
@@ -1302,7 +1371,7 @@ async def stream_response(response, model_name: str, session=None, protocol: str
                 yield b": keep-alive\n\n"
                 continue
             item = poll_task.result()
-            poll_task = loop.run_in_executor(stream_executor, get_next_line, line_iter)
+            poll_task = loop.run_in_executor(_STREAM_EXECUTOR, get_next_line, line_iter)
 
             if item == "STOP_ITERATION":
                 log.info(f"[STREAM DEBUG] Upstream reached natural StopIteration for '{model_name}'. Total lines: {chunk_count}")
@@ -1367,8 +1436,6 @@ async def stream_response(response, model_name: str, session=None, protocol: str
         with rotator.flow_lock:
             rotator.active_flows_count = max(0, rotator.active_flows_count - 1)
             prom_active_flows.set(rotator.active_flows_count)
-        if stream_executor is not None:
-            stream_executor.shutdown(wait=False, cancel_futures=True)
         if session:
             try:
                 session.close()
@@ -1379,7 +1446,6 @@ async def stream_response(response, model_name: str, session=None, protocol: str
 async def anthropic_stream_response(response, model_name: str, session=None) -> AsyncGenerator[bytes, None]:
     """Translate upstream OpenAI SSE chunks into Anthropic message stream events."""
     loop = asyncio.get_event_loop()
-    stream_executor: Optional[ThreadPoolExecutor] = None
 
     with rotator.flow_lock:
         rotator.active_flows_count += 1
@@ -1433,8 +1499,7 @@ async def anthropic_stream_response(response, model_name: str, session=None) -> 
                 return "SOCKET_ERROR"
 
         line_iter = response.iter_lines()
-        stream_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="sse")
-        poll_task = loop.run_in_executor(stream_executor, get_next_line, line_iter)
+        poll_task = loop.run_in_executor(_STREAM_EXECUTOR, get_next_line, line_iter)
 
         while True:
             done, _ = await asyncio.wait({poll_task}, timeout=4.0)
@@ -1442,7 +1507,7 @@ async def anthropic_stream_response(response, model_name: str, session=None) -> 
                 yield b": keep-alive\n\n"
                 continue
             item = poll_task.result()
-            poll_task = loop.run_in_executor(stream_executor, get_next_line, line_iter)
+            poll_task = loop.run_in_executor(_STREAM_EXECUTOR, get_next_line, line_iter)
 
             if item in ("STOP_ITERATION", "SOCKET_ERROR"):
                 break
@@ -1542,8 +1607,6 @@ async def anthropic_stream_response(response, model_name: str, session=None) -> 
         with rotator.flow_lock:
             rotator.active_flows_count = max(0, rotator.active_flows_count - 1)
             prom_active_flows.set(rotator.active_flows_count)
-        if stream_executor is not None:
-            stream_executor.shutdown(wait=False, cancel_futures=True)
         if session:
             try:
                 session.close()
@@ -1747,9 +1810,14 @@ async def chat_completions(raw_request: Request):
 
     for attempt in range(1, MAX_RETRIES_ON_429 + 1):
         session = None
+        pooled = False
         try:
             proxies = get_next_outbound_proxy()
-            session = create_fresh_session(is_stream)
+            if is_stream:
+                session = create_fresh_session(is_stream)
+            else:
+                session = _acquire_pooled_session(TARGET_ZEN_URL)
+                pooled = True
             async with _get_upstream_semaphore():
                 response = await asyncio.to_thread(
                     session.post,
@@ -1761,6 +1829,11 @@ async def chat_completions(raw_request: Request):
                     proxies=proxies,
                     timeout=STREAM_TIMEOUT if is_stream else 120
                 )
+            # pooled non-stream sessions can be returned immediately after the request
+            if pooled and not is_stream:
+                _release_pooled_session(TARGET_ZEN_URL, session)
+                session = None
+                pooled = False
             log_upstream_response(response, current_model, "chat_completions", attempt, proxies is not None)
 
             if response.status_code == 429:
@@ -1770,11 +1843,23 @@ async def chat_completions(raw_request: Request):
                 if attempt < MAX_RETRIES_ON_429 and category != "quota":
                     backoff = retry_seconds if (retry_seconds and retry_seconds <= 10) else compute_backoff_delay(attempt, INITIAL_BACKOFF)
                     log.warning("Upstream 429 (%s) for '%s' (attempt %s/%s). Rotating IP and retrying in %.2fs...", category, current_model, attempt, MAX_RETRIES_ON_429, backoff)
+                    if session and not pooled:
+                        try:
+                            session.close()
+                        except Exception:
+                            pass
+                        session = None
                     await schedule_rotation_on_429(f"429 rate limit ({category}) on attempt {attempt}")
                     await wait_for_rotation_drain()
                     await asyncio.sleep(backoff)
                     headers = build_opencode_headers(raw_request, fresh_session=True)
                     continue
+                if session and not pooled:
+                    try:
+                        session.close()
+                    except Exception:
+                        pass
+                    session = None
                 return upstream_rate_limit_response(response, current_model)
 
             if response.status_code == 401:
@@ -1782,6 +1867,12 @@ async def chat_completions(raw_request: Request):
                 if "is not supported" in raw_err_text or "Rate limit" in raw_err_text or "FreeUsageLimit" in raw_err_text:
                     if attempt < MAX_RETRIES_ON_429:
                         log.warning("Upstream 401 ('%s') for '%s' (attempt %s/%s). Auto-rotating IP and retrying...", raw_err_text[:80], current_model, attempt, MAX_RETRIES_ON_429)
+                        if session and not pooled:
+                            try:
+                                session.close()
+                            except Exception:
+                                pass
+                            session = None
                         await schedule_rotation_on_429(f"401 error ({raw_err_text[:40]}) on attempt {attempt}")
                         await wait_for_rotation_drain()
                         await asyncio.sleep(1.0)
@@ -1789,12 +1880,24 @@ async def chat_completions(raw_request: Request):
                         continue
 
             if response.status_code >= 500:
+                if session and not pooled:
+                    try:
+                        session.close()
+                    except Exception:
+                        pass
+                    session = None
                 delay = compute_backoff_delay(attempt, INITIAL_BACKOFF)
                 log.warning("Upstream HTTP %s for '%s'; retrying without egress rotation in %.2fs.", response.status_code, current_model, delay)
                 await asyncio.sleep(delay)
                 continue
 
             if response.status_code != 200:
+                if session and not pooled:
+                    try:
+                        session.close()
+                    except Exception:
+                        pass
+                    session = None
                 raw_err_text = extract_response_body(response)
                 log.warning("Upstream returned HTTP %s for '%s': %s", response.status_code, current_model, raw_err_text[:500])
                 if req_entry:
@@ -1817,6 +1920,8 @@ async def chat_completions(raw_request: Request):
                 try:
                     stream_gen = stream_response(response, current_model, session=session)
                     track_token_usage(current_model, prompt_tokens=100, completion_tokens=150)
+                    # ownership transferred to stream_response — prevent outer cleanup
+                    session = None
                     return StreamingResponse(
                         stream_gen,
                         media_type="text/event-stream",
@@ -1824,6 +1929,12 @@ async def chat_completions(raw_request: Request):
                     )
                 except EmptyStreamError:
                     log.warning("Empty stream for '%s'; retrying without egress rotation (%s/%s).", current_model, attempt, MAX_RETRIES_ON_429)
+                    if session and not pooled:
+                        try:
+                            session.close()
+                        except Exception:
+                            pass
+                        session = None
                     delay = compute_backoff_delay(attempt, INITIAL_BACKOFF)
                     await asyncio.sleep(delay)
                     continue
@@ -1849,17 +1960,23 @@ async def chat_completions(raw_request: Request):
                         })
                     finally:
                         if session:
-                            try:
-                                session.close()
-                            except Exception:
-                                pass
+                            if pooled:
+                                _release_pooled_session(TARGET_ZEN_URL, session)
+                            else:
+                                try:
+                                    session.close()
+                                except Exception:
+                                    pass
 
         except Exception as e:
             if session:
-                try:
-                    session.close()
-                except Exception:
-                    pass
+                if pooled:
+                    _release_pooled_session(TARGET_ZEN_URL, session)
+                else:
+                    try:
+                        session.close()
+                    except Exception:
+                        pass
             log.error(f"[Attempt {attempt}/{MAX_RETRIES_ON_429}] Connection error for model '{current_model}': {type(e).__name__}: {e}")
             if attempt < MAX_RETRIES_ON_429:
                 await asyncio.sleep(min(2 ** attempt, BACKOFF_CAP))
@@ -2039,9 +2156,14 @@ async def anthropic_messages(raw_request: Request):
 
     for attempt in range(1, MAX_RETRIES_ON_429 + 1):
         session = None
+        pooled = False
         try:
             proxies = get_next_outbound_proxy()
-            session = create_fresh_session(is_stream)
+            if is_stream:
+                session = create_fresh_session(is_stream)
+            else:
+                session = _acquire_pooled_session(TARGET_ZEN_URL)
+                pooled = True
             async with _get_upstream_semaphore():
                 response = await asyncio.to_thread(
                     session.post,
@@ -2053,6 +2175,10 @@ async def anthropic_messages(raw_request: Request):
                     proxies=proxies,
                     timeout=STREAM_TIMEOUT if is_stream else 120,
                 )
+            if pooled and not is_stream:
+                _release_pooled_session(TARGET_ZEN_URL, session)
+                session = None
+                pooled = False
             log_upstream_response(response, model_name, "messages", attempt, proxies is not None)
 
             if response.status_code == 429:
@@ -2062,11 +2188,23 @@ async def anthropic_messages(raw_request: Request):
                 if attempt < MAX_RETRIES_ON_429 and category != "quota":
                     backoff = retry_seconds if (retry_seconds and retry_seconds <= 10) else compute_backoff_delay(attempt, INITIAL_BACKOFF)
                     log.warning("Upstream 429 (%s) for '%s' (attempt %s/%s). Rotating IP and retrying in %.2fs...", category, model_name, attempt, MAX_RETRIES_ON_429, backoff)
+                    if session and not pooled:
+                        try:
+                            session.close()
+                        except Exception:
+                            pass
+                        session = None
                     await schedule_rotation_on_429(f"429 rate limit ({category}) on attempt {attempt}")
                     await wait_for_rotation_drain()
                     await asyncio.sleep(backoff)
                     headers = build_opencode_headers(raw_request, fresh_session=True)
                     continue
+                if session and not pooled:
+                    try:
+                        session.close()
+                    except Exception:
+                        pass
+                    session = None
                 return upstream_rate_limit_response(response, model_name)
 
             if response.status_code == 401:
@@ -2074,6 +2212,12 @@ async def anthropic_messages(raw_request: Request):
                 if "is not supported" in raw_err_text or "Rate limit" in raw_err_text or "FreeUsageLimit" in raw_err_text:
                     if attempt < MAX_RETRIES_ON_429:
                         log.warning("Upstream 401 ('%s') for '%s' (attempt %s/%s). Auto-rotating IP and retrying...", raw_err_text[:80], model_name, attempt, MAX_RETRIES_ON_429)
+                        if session and not pooled:
+                            try:
+                                session.close()
+                            except Exception:
+                                pass
+                            session = None
                         await schedule_rotation_on_429(f"401 error ({raw_err_text[:40]}) on attempt {attempt}")
                         await wait_for_rotation_drain()
                         await asyncio.sleep(1.0)
@@ -2081,12 +2225,24 @@ async def anthropic_messages(raw_request: Request):
                         continue
 
             if response.status_code >= 500:
+                if session and not pooled:
+                    try:
+                        session.close()
+                    except Exception:
+                        pass
+                    session = None
                 delay = compute_backoff_delay(attempt, INITIAL_BACKOFF)
                 log.warning("Upstream HTTP %s for '%s'; retrying without egress rotation in %.2fs.", response.status_code, model_name, delay)
                 await asyncio.sleep(delay)
                 continue
 
             if response.status_code != 200:
+                if session and not pooled:
+                    try:
+                        session.close()
+                    except Exception:
+                        pass
+                    session = None
                 raw_err_text = extract_response_body(response)
                 log.warning("Upstream returned HTTP %s for '%s': %s", response.status_code, model_name, raw_err_text[:500])
                 if req_entry:
@@ -2106,8 +2262,11 @@ async def anthropic_messages(raw_request: Request):
             prom_request_duration.labels(model=_sanitize_model_label(model_name), endpoint="anthropic_messages").observe(time.time() - start_time)
 
             if is_stream:
+                # ownership transferred to anthropic_stream_response
+                _sess = session
+                session = None
                 return StreamingResponse(
-                    anthropic_stream_response(response, model_name, session=session),
+                    anthropic_stream_response(response, model_name, session=_sess),
                     media_type="text/event-stream",
                     headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
                 )
@@ -2135,17 +2294,23 @@ async def anthropic_messages(raw_request: Request):
                         })
                     finally:
                         if session:
-                            try:
-                                session.close()
-                            except Exception:
-                                pass
+                            if pooled:
+                                _release_pooled_session(TARGET_ZEN_URL, session)
+                            else:
+                                try:
+                                    session.close()
+                                except Exception:
+                                    pass
 
         except Exception as e:
             if session:
-                try:
-                    session.close()
-                except Exception:
-                    pass
+                if pooled:
+                    _release_pooled_session(TARGET_ZEN_URL, session)
+                else:
+                    try:
+                        session.close()
+                    except Exception:
+                        pass
             log.error(f"[Attempt {attempt}/{MAX_RETRIES_ON_429}] Anthropic endpoint error for model '{model_name}': {type(e).__name__}: {e}")
             if attempt < MAX_RETRIES_ON_429:
                 await asyncio.sleep(min(2 ** attempt, BACKOFF_CAP))
@@ -2193,9 +2358,14 @@ async def responses_endpoint(raw_request: Request):
 
     for attempt in range(1, MAX_RETRIES_ON_429 + 1):
         session = None
+        pooled = False
         try:
             proxies = get_next_outbound_proxy()
-            session = create_fresh_session(is_stream)
+            if is_stream:
+                session = create_fresh_session(is_stream)
+            else:
+                session = _acquire_pooled_session(TARGET_ZEN_RESPONSES_URL)
+                pooled = True
             async with _get_upstream_semaphore():
                 response = await asyncio.to_thread(
                     session.post,
@@ -2207,6 +2377,10 @@ async def responses_endpoint(raw_request: Request):
                     proxies=proxies,
                     timeout=STREAM_TIMEOUT if is_stream else 120,
                 )
+            if pooled and not is_stream:
+                _release_pooled_session(TARGET_ZEN_RESPONSES_URL, session)
+                session = None
+                pooled = False
             log_upstream_response(response, model_name, "responses", attempt, proxies is not None)
 
             if response.status_code == 429:
@@ -2216,20 +2390,44 @@ async def responses_endpoint(raw_request: Request):
                 if attempt < MAX_RETRIES_ON_429 and category != "quota":
                     backoff = retry_seconds if (retry_seconds and retry_seconds <= 10) else compute_backoff_delay(attempt, INITIAL_BACKOFF)
                     log.warning("Upstream 429 (%s) for '%s' (attempt %s/%s). Rotating IP and retrying in %.2fs...", category, model_name, attempt, MAX_RETRIES_ON_429, backoff)
+                    if session and not pooled:
+                        try:
+                            session.close()
+                        except Exception:
+                            pass
+                        session = None
                     await schedule_rotation_on_429(f"429 rate limit ({category}) on attempt {attempt}")
                     await wait_for_rotation_drain()
                     await asyncio.sleep(backoff)
                     headers = build_opencode_headers(raw_request)
                     continue
+                if session and not pooled:
+                    try:
+                        session.close()
+                    except Exception:
+                        pass
+                    session = None
                 return upstream_rate_limit_response(response, model_name)
 
             if response.status_code >= 500:
+                if session and not pooled:
+                    try:
+                        session.close()
+                    except Exception:
+                        pass
+                    session = None
                 delay = compute_backoff_delay(attempt, INITIAL_BACKOFF)
                 log.warning("Upstream HTTP %s for '%s'; retrying without egress rotation in %.2fs.", response.status_code, model_name, delay)
                 await asyncio.sleep(delay)
                 continue
 
             if response.status_code != 200:
+                if session and not pooled:
+                    try:
+                        session.close()
+                    except Exception:
+                        pass
+                    session = None
                 raw_err_text = extract_response_body(response)
                 log.warning("Upstream returned HTTP %s for '%s': %s", response.status_code, model_name, raw_err_text[:500])
                 if req_entry:
@@ -2249,8 +2447,10 @@ async def responses_endpoint(raw_request: Request):
             prom_request_duration.labels(model=_sanitize_model_label(model_name), endpoint="responses").observe(time.time() - start_time)
 
             if is_stream:
+                _sess = session
+                session = None
                 return StreamingResponse(
-                    stream_response(response, model_name, session=session, protocol="responses"),
+                    stream_response(response, model_name, session=_sess, protocol="responses"),
                     media_type="text/event-stream",
                     headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
                 )
@@ -2267,17 +2467,23 @@ async def responses_endpoint(raw_request: Request):
                         })
                     finally:
                         if session:
-                            try:
-                                session.close()
-                            except Exception:
-                                pass
+                            if pooled:
+                                _release_pooled_session(TARGET_ZEN_RESPONSES_URL, session)
+                            else:
+                                try:
+                                    session.close()
+                                except Exception:
+                                    pass
 
         except Exception as e:
             if session:
-                try:
-                    session.close()
-                except Exception:
-                    pass
+                if pooled:
+                    _release_pooled_session(TARGET_ZEN_RESPONSES_URL, session)
+                else:
+                    try:
+                        session.close()
+                    except Exception:
+                        pass
             log.error(f"[Attempt {attempt}/{MAX_RETRIES_ON_429}] Responses endpoint error for model '{model_name}': {type(e).__name__}: {e}")
             if attempt < MAX_RETRIES_ON_429:
                 await asyncio.sleep(min(2 ** attempt, BACKOFF_CAP))
