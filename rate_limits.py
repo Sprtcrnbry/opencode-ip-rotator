@@ -12,10 +12,14 @@ def classify_upstream_429(response) -> tuple[str, int | None, object]:
         payload = {"error": {"type": "upstream_rate_limit", "message": response.text}}
 
     error = payload.get("error", {}) if isinstance(payload, dict) else {}
-    error_type = str(error.get("type", "upstream_rate_limit"))
-    if error_type in {"FreeUsageLimitError", "GoUsageLimitError", "BlackUsageLimitError"}:
+    # Upstream varies: type vs code vs message text
+    raw_type = str(error.get("type") or error.get("code") or "upstream_rate_limit")
+    # message fallback for providers that only put quota text in message
+    raw_msg = str(error.get("message") or payload.get("message") or "")
+    combined = f"{raw_type} {raw_msg}"
+    if any(k in raw_type for k in ("FreeUsageLimit", "GoUsageLimit", "BlackUsageLimit")) or any(k in combined for k in ("FreeUsageLimit", "GoUsageLimit", "BlackUsageLimit", "quota exceeded", "billing")):
         category = "quota"
-    elif error_type == "RateLimitError":
+    elif raw_type == "RateLimitError" or "rate limit" in combined.lower():
         category = "rate_limit"
     else:
         category = "upstream_rate_limit"

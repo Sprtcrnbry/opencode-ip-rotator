@@ -968,9 +968,9 @@ def _is_loopback_ip(value: str) -> bool:
 def optimize_payload_for_upstream(payload: dict) -> dict:
     """Ensures payload size stays safely within upstream OpenCode Zen's ingress limits (< 1.5MB)
     and strictly validates tool/assistant message pairings to prevent HTTP 400 Bad Request."""
-    # Upstream Zen only supports tool_choice="auto" — normalize anything else
+    # Upstream Zen only supports tool_choice="auto" / "required" / {"type":"function",...} — normalize bare strings only
     tc = payload.get("tool_choice")
-    if tc is not None and tc != "auto":
+    if isinstance(tc, str) and tc not in ("auto", "required", "none"):
         payload["tool_choice"] = "auto"
 
     messages = payload.get("messages")
@@ -1116,6 +1116,20 @@ def summarize_payload_for_log(payload: dict) -> dict:
             if k == "input":
                 summary["messages_count"] = summary["input_count"]
                 summary["message_roles"] = summary["input_roles"]
+        elif k == "instructions" and isinstance(v, (str, list)):
+            # Responses API system prompt
+            if isinstance(v, str):
+                summary["instructions_len"] = len(v)
+                if v:
+                    summary["instructions_preview"] = v[:120]
+            elif isinstance(v, list):
+                try:
+                    txt = " ".join(b.get("text", "") if isinstance(b, dict) else str(b) for b in v if isinstance(b, (dict, str)))
+                    summary["instructions_len"] = len(txt)
+                    if txt:
+                        summary["instructions_preview"] = txt[:120]
+                except Exception:
+                    summary["instructions"] = f"list(len={len(v)})"
         elif k == "tools" and isinstance(v, list):
             summary["tools_count"] = len(v)
             summary["tool_names"] = [
@@ -2040,8 +2054,13 @@ def _blocks_text(content) -> str:
         return content
     parts = []
     for b in content or []:
-        if isinstance(b, dict) and b.get("type") == "text":
-            parts.append(b.get("text", ""))
+        if isinstance(b, dict):
+            if b.get("type") == "text":
+                parts.append(b.get("text", ""))
+            elif b.get("type") == "image":
+                parts.append("[image]")
+        elif isinstance(b, str):
+            parts.append(b)
     return "\n".join(p for p in parts if p)
 
 
@@ -2139,9 +2158,19 @@ def openai_to_anthropic(res: dict, model_name: str) -> dict:
     reasoning = msg.get("reasoning_content")
     if reasoning:
         content_blocks.append({"type": "thinking", "thinking": reasoning})
-    text = msg.get("content")
-    if text:
-        content_blocks.append({"type": "text", "text": text})
+    content = msg.get("content")
+    if isinstance(content, str) and content:
+        content_blocks.append({"type": "text", "text": content})
+    elif isinstance(content, list):
+        for part in content:
+            if not isinstance(part, dict):
+                continue
+            ptype = part.get("type")
+            if ptype == "text" and part.get("text"):
+                content_blocks.append({"type": "text", "text": part["text"]})
+            elif ptype == "image_url":
+                # OpenAI image_url -> Anthropic image (best-effort, drop if not base64)
+                content_blocks.append({"type": "text", "text": "[image]"})
     for call in msg.get("tool_calls") or []:
         fn = call.get("function") or {}
         try:
