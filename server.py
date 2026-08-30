@@ -1435,6 +1435,9 @@ async def stream_response(response, model_name: str, session=None, protocol: str
                 break
             if item == "SOCKET_ERROR":
                 log.warning(f"[STREAM DEBUG] Upstream connection aborted via socket error for '{model_name}'. Lines sent: {chunk_count}")
+                err_json = json.dumps({"error": {"message": f"Upstream connection closed abruptly for model '{model_name}'.", "type": "upstream_connection_error", "code": 502}})
+                yield f"data: {err_json}\n\n".encode("utf-8")
+                seen_done = True
                 break
 
             if not item:
@@ -1485,6 +1488,8 @@ async def stream_response(response, model_name: str, session=None, protocol: str
     except Exception as e:
         log.error(f"Stream exception caught for model '{model_name}': {type(e).__name__}: {e}", exc_info=True)
         if not seen_done:
+            err_json = json.dumps({"error": {"message": f"Upstream stream error: {e}", "type": "stream_error", "code": 500}})
+            yield f"data: {err_json}\n\n".encode("utf-8")
             yield b"data: [DONE]\n\n"
     finally:
         lease_heartbeat.cancel()
@@ -1566,7 +1571,11 @@ async def anthropic_stream_response(response, model_name: str, session=None) -> 
             item = poll_task.result()
             poll_task = loop.run_in_executor(_STREAM_EXECUTOR, get_next_line, line_iter)
 
-            if item in ("STOP_ITERATION", "SOCKET_ERROR"):
+            if item == "STOP_ITERATION":
+                break
+            if item == "SOCKET_ERROR":
+                log.warning(f"[STREAM DEBUG] Upstream socket error for Anthropic model '{model_name}'.")
+                yield sse({"type": "error", "error": {"type": "api_error", "message": f"Upstream socket error for model '{model_name}'"}})
                 break
 
             raw_text = item.decode("utf-8", errors="ignore").strip() if isinstance(item, bytes) else str(item).strip()
@@ -1657,6 +1666,7 @@ async def anthropic_stream_response(response, model_name: str, session=None) -> 
         log.warning(f"[STREAM DEBUG] Client closed SSE connection for '{model_name}' after {chunk_count} chunks.")
     except Exception as e:
         log.error(f"Anthropic stream exception for model '{model_name}': {type(e).__name__}: {e}", exc_info=True)
+        yield sse({"type": "error", "error": {"type": "api_error", "message": f"Stream error: {e}"}})
     finally:
         lease_heartbeat.cancel()
         await asyncio.gather(lease_heartbeat, return_exceptions=True)
@@ -1864,6 +1874,8 @@ async def chat_completions(raw_request: Request):
         payload["safety_identifier"] = payload.get("user", "opencode-user")
 
     headers = build_opencode_headers(raw_request, fresh_session=True)
+    last_error_resp: Optional[JSONResponse] = None
+    last_error_detail: str = ""
 
     for attempt in range(1, MAX_RETRIES_ON_429 + 1):
         session = None
@@ -1897,6 +1909,8 @@ async def chat_completions(raw_request: Request):
                 metrics["rate_limited_requests"] += 1
                 prom_requests_rate_limited.labels(model=_sanitize_model_label(current_model)).inc()
                 category, retry_seconds, _rate_limit_body = classify_upstream_429(response)
+                last_error_resp = upstream_rate_limit_response(response, current_model)
+                last_error_detail = f"Upstream 429 ({category})"
                 if attempt < MAX_RETRIES_ON_429 and category != "quota":
                     backoff = retry_seconds if (retry_seconds and retry_seconds <= 10) else compute_backoff_delay(attempt, INITIAL_BACKOFF)
                     log.warning("Upstream 429 (%s) for '%s' (attempt %s/%s). Rotating IP and retrying in %.2fs...", category, current_model, attempt, MAX_RETRIES_ON_429, backoff)
@@ -1917,10 +1931,12 @@ async def chat_completions(raw_request: Request):
                     except Exception:
                         pass
                     session = None
-                return upstream_rate_limit_response(response, current_model)
+                return last_error_resp
 
             if response.status_code == 401:
                 raw_err_text = extract_response_body(response)
+                last_error_resp = JSONResponse(status_code=401, content={"error": {"message": raw_err_text or "Unauthorized", "type": "unauthorized", "code": 401}})
+                last_error_detail = raw_err_text or "Unauthorized"
                 if "is not supported" in raw_err_text or "Rate limit" in raw_err_text or "FreeUsageLimit" in raw_err_text:
                     if attempt < MAX_RETRIES_ON_429:
                         log.warning("Upstream 401 ('%s') for '%s' (attempt %s/%s). Auto-rotating IP and retrying...", raw_err_text[:80], current_model, attempt, MAX_RETRIES_ON_429)
@@ -1937,6 +1953,12 @@ async def chat_completions(raw_request: Request):
                         continue
 
             if response.status_code >= 500:
+                raw_err_text = extract_response_body(response)
+                last_error_resp = JSONResponse(
+                    status_code=response.status_code,
+                    content={"error": {"message": raw_err_text or f"Upstream HTTP {response.status_code}", "type": "upstream_server_error", "code": response.status_code}}
+                )
+                last_error_detail = raw_err_text or f"HTTP {response.status_code}"
                 if session and not pooled:
                     try:
                         session.close()
@@ -2034,15 +2056,21 @@ async def chat_completions(raw_request: Request):
                         session.close()
                     except Exception:
                         pass
-            log.error(f"[Attempt {attempt}/{MAX_RETRIES_ON_429}] Connection error for model '{current_model}': {type(e).__name__}: {e}")
+            last_error_detail = f"{type(e).__name__}: {e}"
+            log.error(f"[Attempt {attempt}/{MAX_RETRIES_ON_429}] Connection error for model '{current_model}': {last_error_detail}")
             if attempt < MAX_RETRIES_ON_429:
                 await asyncio.sleep(min(2 ** attempt, BACKOFF_CAP))
             continue
 
-    log.error(f"All {MAX_RETRIES_ON_429} attempts exhausted for model '{current_model}'. Returning 503.")
+    if last_error_resp is not None:
+        log.error(f"All {MAX_RETRIES_ON_429} attempts exhausted for model '{current_model}'. Passing through last upstream error response.")
+        return last_error_resp
+
+    status = 504 if "timeout" in last_error_detail.lower() else 502
+    log.error(f"All {MAX_RETRIES_ON_429} attempts exhausted for model '{current_model}': {last_error_detail}. Returning {status}.")
     return JSONResponse(
-        status_code=503,
-        content={"error": {"message": f"Upstream unavailable after {MAX_RETRIES_ON_429} attempts. Please retry.", "type": "upstream_error", "code": 503}},
+        status_code=status,
+        content={"error": {"message": f"Upstream connection failed after {MAX_RETRIES_ON_429} attempts: {last_error_detail or 'Connection failed'}", "type": "upstream_error", "code": status}},
         headers={"Retry-After": "10"}
     )
 
@@ -2226,6 +2254,8 @@ async def anthropic_messages(raw_request: Request):
     req_entry = record_client_request("/v1/messages", model_name, is_stream, raw_request, body)
 
     headers = build_opencode_headers(raw_request, fresh_session=True)
+    last_error_resp: Optional[JSONResponse] = None
+    last_error_detail: str = ""
 
     for attempt in range(1, MAX_RETRIES_ON_429 + 1):
         session = None
@@ -2258,6 +2288,8 @@ async def anthropic_messages(raw_request: Request):
                 metrics["rate_limited_requests"] += 1
                 prom_requests_rate_limited.labels(model=_sanitize_model_label(model_name)).inc()
                 category, retry_seconds, _rate_limit_body = classify_upstream_429(response)
+                last_error_resp = upstream_rate_limit_response(response, model_name)
+                last_error_detail = f"Upstream 429 ({category})"
                 if attempt < MAX_RETRIES_ON_429 and category != "quota":
                     backoff = retry_seconds if (retry_seconds and retry_seconds <= 10) else compute_backoff_delay(attempt, INITIAL_BACKOFF)
                     log.warning("Upstream 429 (%s) for '%s' (attempt %s/%s). Rotating IP and retrying in %.2fs...", category, model_name, attempt, MAX_RETRIES_ON_429, backoff)
@@ -2278,10 +2310,12 @@ async def anthropic_messages(raw_request: Request):
                     except Exception:
                         pass
                     session = None
-                return upstream_rate_limit_response(response, model_name)
+                return last_error_resp
 
             if response.status_code == 401:
                 raw_err_text = extract_response_body(response)
+                last_error_resp = JSONResponse(status_code=401, content={"error": {"message": raw_err_text or "Unauthorized", "type": "unauthorized", "code": 401}})
+                last_error_detail = raw_err_text or "Unauthorized"
                 if "is not supported" in raw_err_text or "Rate limit" in raw_err_text or "FreeUsageLimit" in raw_err_text:
                     if attempt < MAX_RETRIES_ON_429:
                         log.warning("Upstream 401 ('%s') for '%s' (attempt %s/%s). Auto-rotating IP and retrying...", raw_err_text[:80], model_name, attempt, MAX_RETRIES_ON_429)
@@ -2298,6 +2332,12 @@ async def anthropic_messages(raw_request: Request):
                         continue
 
             if response.status_code >= 500:
+                raw_err_text = extract_response_body(response)
+                last_error_resp = JSONResponse(
+                    status_code=response.status_code,
+                    content={"error": {"message": raw_err_text or f"Upstream HTTP {response.status_code}", "type": "upstream_server_error", "code": response.status_code}}
+                )
+                last_error_detail = raw_err_text or f"HTTP {response.status_code}"
                 if session and not pooled:
                     try:
                         session.close()
@@ -2384,15 +2424,21 @@ async def anthropic_messages(raw_request: Request):
                         session.close()
                     except Exception:
                         pass
-            log.error(f"[Attempt {attempt}/{MAX_RETRIES_ON_429}] Anthropic endpoint error for model '{model_name}': {type(e).__name__}: {e}")
+            last_error_detail = f"{type(e).__name__}: {e}"
+            log.error(f"[Attempt {attempt}/{MAX_RETRIES_ON_429}] Anthropic endpoint error for model '{model_name}': {last_error_detail}")
             if attempt < MAX_RETRIES_ON_429:
                 await asyncio.sleep(min(2 ** attempt, BACKOFF_CAP))
             continue
 
-    log.error(f"All {MAX_RETRIES_ON_429} attempts exhausted for Anthropic model '{model_name}'. Returning 503.")
+    if last_error_resp is not None:
+        log.error(f"All {MAX_RETRIES_ON_429} attempts exhausted for Anthropic model '{model_name}'. Passing through last upstream error response.")
+        return last_error_resp
+
+    status = 504 if "timeout" in last_error_detail.lower() else 502
+    log.error(f"All {MAX_RETRIES_ON_429} attempts exhausted for Anthropic model '{model_name}': {last_error_detail}. Returning {status}.")
     return JSONResponse(
-        status_code=503,
-        content={"error": {"message": f"Upstream unavailable after {MAX_RETRIES_ON_429} attempts. Please retry.", "type": "upstream_error", "code": 503}},
+        status_code=status,
+        content={"error": {"message": f"Upstream connection failed after {MAX_RETRIES_ON_429} attempts: {last_error_detail or 'Connection failed'}", "type": "upstream_error", "code": status}},
         headers={"Retry-After": "10"}
     )
 
@@ -2428,6 +2474,8 @@ async def responses_endpoint(raw_request: Request):
         body["safety_identifier"] = body.get("user", "opencode-user")
 
     headers = build_opencode_headers(raw_request, fresh_session=True)
+    last_error_resp: Optional[JSONResponse] = None
+    last_error_detail: str = ""
 
     for attempt in range(1, MAX_RETRIES_ON_429 + 1):
         session = None
@@ -2460,6 +2508,8 @@ async def responses_endpoint(raw_request: Request):
                 metrics["rate_limited_requests"] += 1
                 prom_requests_rate_limited.labels(model=_sanitize_model_label(model_name)).inc()
                 category, retry_seconds, _rate_limit_body = classify_upstream_429(response)
+                last_error_resp = upstream_rate_limit_response(response, model_name)
+                last_error_detail = f"Upstream 429 ({category})"
                 if attempt < MAX_RETRIES_ON_429 and category != "quota":
                     backoff = retry_seconds if (retry_seconds and retry_seconds <= 10) else compute_backoff_delay(attempt, INITIAL_BACKOFF)
                     log.warning("Upstream 429 (%s) for '%s' (attempt %s/%s). Rotating IP and retrying in %.2fs...", category, model_name, attempt, MAX_RETRIES_ON_429, backoff)
@@ -2472,7 +2522,7 @@ async def responses_endpoint(raw_request: Request):
                     await schedule_rotation_on_429(f"429 rate limit ({category}) on attempt {attempt}")
                     await wait_for_rotation_drain()
                     await asyncio.sleep(backoff)
-                    headers = build_opencode_headers(raw_request)
+                    headers = build_opencode_headers(raw_request, fresh_session=True)
                     continue
                 if session and not pooled:
                     try:
@@ -2480,9 +2530,15 @@ async def responses_endpoint(raw_request: Request):
                     except Exception:
                         pass
                     session = None
-                return upstream_rate_limit_response(response, model_name)
+                return last_error_resp
 
             if response.status_code >= 500:
+                raw_err_text = extract_response_body(response)
+                last_error_resp = JSONResponse(
+                    status_code=response.status_code,
+                    content={"error": {"message": raw_err_text or f"Upstream HTTP {response.status_code}", "type": "upstream_server_error", "code": response.status_code}}
+                )
+                last_error_detail = raw_err_text or f"HTTP {response.status_code}"
                 if session and not pooled:
                     try:
                         session.close()
@@ -2557,15 +2613,21 @@ async def responses_endpoint(raw_request: Request):
                         session.close()
                     except Exception:
                         pass
-            log.error(f"[Attempt {attempt}/{MAX_RETRIES_ON_429}] Responses endpoint error for model '{model_name}': {type(e).__name__}: {e}")
+            last_error_detail = f"{type(e).__name__}: {e}"
+            log.error(f"[Attempt {attempt}/{MAX_RETRIES_ON_429}] Responses endpoint error for model '{model_name}': {last_error_detail}")
             if attempt < MAX_RETRIES_ON_429:
                 await asyncio.sleep(min(2 ** attempt, BACKOFF_CAP))
             continue
 
-    log.error(f"All {MAX_RETRIES_ON_429} attempts exhausted for Responses model '{model_name}'. Returning 503.")
+    if last_error_resp is not None:
+        log.error(f"All {MAX_RETRIES_ON_429} attempts exhausted for Responses model '{model_name}'. Passing through last upstream error response.")
+        return last_error_resp
+
+    status = 504 if "timeout" in last_error_detail.lower() else 502
+    log.error(f"All {MAX_RETRIES_ON_429} attempts exhausted for Responses model '{model_name}': {last_error_detail}. Returning {status}.")
     return JSONResponse(
-        status_code=503,
-        content={"error": {"message": f"Upstream unavailable after {MAX_RETRIES_ON_429} attempts. Please retry.", "type": "upstream_error", "code": 503}},
+        status_code=status,
+        content={"error": {"message": f"Upstream connection failed after {MAX_RETRIES_ON_429} attempts: {last_error_detail or 'Connection failed'}", "type": "upstream_error", "code": status}},
         headers={"Retry-After": "10"}
     )
 
