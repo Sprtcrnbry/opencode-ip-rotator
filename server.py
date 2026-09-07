@@ -552,6 +552,7 @@ TARGET_ZEN_URL = f"{TARGET_ZEN_BASE}/chat/completions"
 TARGET_ZEN_RESPONSES_URL = f"{TARGET_ZEN_BASE}/responses"
 
 MAX_RETRIES_ON_429 = int(os.environ.get("MAX_RETRIES_ON_429", "8"))
+MAX_RETRIES_ON_5XX = int(os.environ.get("MAX_RETRIES_ON_5XX", "2"))
 INITIAL_BACKOFF = float(os.environ.get("INITIAL_BACKOFF", "1"))
 WARP_ROTATOR_URL = os.environ.get("WARP_ROTATOR_URL", "http://127.0.0.1:8001").rstrip("/")
 CORS_ALLOW_ORIGINS = [
@@ -1706,6 +1707,543 @@ async def anthropic_stream_response(response, model_name: str, session=None) -> 
         except Exception:
             pass
 
+
+async def stream_responses_to_chat(response, model_name: str, session=None) -> AsyncGenerator[bytes, None]:
+    """Translate upstream OpenAI Responses API SSE events into OpenAI Chat Completion SSE chunks."""
+    loop = asyncio.get_running_loop()
+    try:
+        lease_id = await asyncio.to_thread(acquire_flow_lease)
+    except Exception as e:
+        log.warning("Flow lease acquire failed for '%s': %s — streaming without lease.", model_name, e)
+        lease_id = None
+    rotator.flow_acquired()
+    prom_active_flows.set(rotator.active_flows_count)
+    last_lease_touch = time.monotonic()
+    poll_task = None
+
+    chunk_count = 0
+    seen_done = False
+    resp_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
+    created = int(time.time())
+    tool_calls_map: Dict[int, int] = {}  # output_index -> tool_index
+    pending_lines: List[str] = []
+
+    try:
+        def get_next_line(iter_lines):
+            try:
+                return next(iter_lines)
+            except StopIteration:
+                return "STOP_ITERATION"
+            except Exception as exc:
+                log.error(f"[STREAM DEBUG] Upstream socket error for '{model_name}': {type(exc).__name__}: {exc}")
+                return "SOCKET_ERROR"
+
+        line_iter = response.iter_lines()
+        poll_task = loop.run_in_executor(_STREAM_EXECUTOR, get_next_line, line_iter)
+
+        while True:
+            done, _ = await asyncio.wait({poll_task}, timeout=4.0)
+            if lease_id is not None and time.monotonic() - last_lease_touch >= FLOW_LEASE_HEARTBEAT_SECONDS:
+                try:
+                    await asyncio.to_thread(touch_flow_lease, lease_id)
+                except Exception:
+                    pass
+                last_lease_touch = time.monotonic()
+            if not done:
+                yield b": keep-alive\n\n"
+                continue
+
+            item = poll_task.result()
+            poll_task = loop.run_in_executor(_STREAM_EXECUTOR, get_next_line, line_iter)
+
+            if item == "STOP_ITERATION":
+                break
+            if item == "SOCKET_ERROR":
+                err_json = json.dumps({"error": {"message": f"Upstream connection closed abruptly for '{model_name}'.", "type": "upstream_connection_error", "code": 502}})
+                yield f"data: {err_json}\n\n".encode("utf-8")
+                seen_done = True
+                break
+
+            line_str = item.decode("utf-8", errors="ignore").strip() if isinstance(item, bytes) else str(item).strip()
+            if not line_str:
+                if not pending_lines:
+                    continue
+                event_name = ""
+                data_lines = []
+                for pl in pending_lines:
+                    if pl.startswith("event:"):
+                        event_name = pl[6:].strip()
+                    elif pl.startswith("data:"):
+                        data_lines.append(pl[5:].strip())
+                pending_lines = []
+                data_body = "\n".join(data_lines)
+                if not data_body:
+                    continue
+                if data_body == "[DONE]":
+                    seen_done = True
+                    yield b"data: [DONE]\n\n"
+                    break
+
+                try:
+                    ev_data = json.loads(data_body)
+                except Exception:
+                    continue
+
+                chunk_count += 1
+                if isinstance(ev_data, dict) and "choices" in ev_data:
+                    yield f"data: {data_body}\n\n".encode("utf-8")
+                    continue
+
+                if event_name == "response.created":
+                    resp_id = ev_data.get("response", {}).get("id") or resp_id
+                    c = {
+                        "id": resp_id,
+                        "object": "chat.completion.chunk",
+                        "created": created,
+                        "model": model_name,
+                        "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}]
+                    }
+                    yield f"data: {json.dumps(c)}\n\n".encode("utf-8")
+                elif event_name in ("response.text.delta", "response.content_part.delta"):
+                    delta_val = ev_data.get("delta")
+                    delta_text = delta_val.get("text", "") if isinstance(delta_val, dict) else (delta_val or "")
+                    if delta_text:
+                        c = {
+                            "id": resp_id,
+                            "object": "chat.completion.chunk",
+                            "created": created,
+                            "model": model_name,
+                            "choices": [{"index": 0, "delta": {"content": delta_text}, "finish_reason": None}]
+                        }
+                        yield f"data: {json.dumps(c)}\n\n".encode("utf-8")
+                elif event_name == "response.output_item.added":
+                    item = ev_data.get("item") or {}
+                    if item.get("type") == "function_call":
+                        out_idx = ev_data.get("output_index", 0)
+                        tool_idx = len(tool_calls_map)
+                        tool_calls_map[out_idx] = tool_idx
+                        tc_id = item.get("call_id") or item.get("id") or f"call_{uuid.uuid4().hex[:8]}"
+                        fn_name = item.get("name") or "unknown"
+                        c = {
+                            "id": resp_id,
+                            "object": "chat.completion.chunk",
+                            "created": created,
+                            "model": model_name,
+                            "choices": [{
+                                "index": 0,
+                                "delta": {
+                                    "tool_calls": [{
+                                        "index": tool_idx,
+                                        "id": tc_id,
+                                        "type": "function",
+                                        "function": {"name": fn_name, "arguments": ""}
+                                    }]
+                                },
+                                "finish_reason": None
+                            }]
+                        }
+                        yield f"data: {json.dumps(c)}\n\n".encode("utf-8")
+                elif event_name in ("response.function_call_arguments.delta", "response.output_item.delta"):
+                    out_idx = ev_data.get("output_index", 0)
+                    tool_idx = tool_calls_map.get(out_idx, 0)
+                    delta_val = ev_data.get("delta")
+                    args_delta = delta_val.get("arguments", "") if isinstance(delta_val, dict) else (delta_val or "")
+                    if args_delta:
+                        c = {
+                            "id": resp_id,
+                            "object": "chat.completion.chunk",
+                            "created": created,
+                            "model": model_name,
+                            "choices": [{
+                                "index": 0,
+                                "delta": {
+                                    "tool_calls": [{
+                                        "index": tool_idx,
+                                        "function": {"arguments": args_delta}
+                                    }]
+                                },
+                                "finish_reason": None
+                            }]
+                        }
+                        yield f"data: {json.dumps(c)}\n\n".encode("utf-8")
+                elif event_name in ("response.completed", "response.done"):
+                    finish_reason = "tool_calls" if tool_calls_map else "stop"
+                    usage = ev_data.get("response", {}).get("usage")
+                    c = {
+                        "id": resp_id,
+                        "object": "chat.completion.chunk",
+                        "created": created,
+                        "model": model_name,
+                        "choices": [{"index": 0, "delta": {}, "finish_reason": finish_reason}]
+                    }
+                    if usage:
+                        c["usage"] = {
+                            "prompt_tokens": usage.get("input_tokens", 0),
+                            "completion_tokens": usage.get("output_tokens", 0),
+                            "total_tokens": usage.get("total_tokens", 0)
+                        }
+                    yield f"data: {json.dumps(c)}\n\n".encode("utf-8")
+                    seen_done = True
+                    yield b"data: [DONE]\n\n"
+                    break
+                continue
+
+            pending_lines.append(line_str)
+
+        if not seen_done:
+            yield b"data: [DONE]\n\n"
+        log.info(f"Responses->Chat streaming completed for '{model_name}' ({chunk_count} frames).")
+    except GeneratorExit:
+        log.warning(f"[STREAM DEBUG] Client closed connection for '{model_name}' after {chunk_count} frames.")
+    except Exception as e:
+        log.error(f"Stream exception caught for model '{model_name}': {type(e).__name__}: {e}", exc_info=True)
+        if not seen_done:
+            err_json = json.dumps({"error": {"message": f"Upstream stream error: {e}", "type": "stream_error", "code": 500}})
+            yield f"data: {err_json}\n\n".encode("utf-8")
+            yield b"data: [DONE]\n\n"
+    finally:
+        try:
+            if poll_task is not None and not poll_task.done():
+                poll_task.cancel()
+        except Exception:
+            pass
+        if session is not None:
+            try:
+                session.close()
+            except Exception:
+                pass
+        if lease_id is not None:
+            try:
+                await asyncio.to_thread(release_flow_lease, lease_id)
+            except Exception as e:
+                log.debug("Flow lease release failed for '%s': %s", model_name, e)
+        try:
+            rotator.flow_released()
+            prom_active_flows.set(rotator.active_flows_count)
+        except Exception:
+            pass
+
+
+async def stream_responses_to_anthropic(response, model_name: str, session=None) -> AsyncGenerator[bytes, None]:
+    """Translate upstream OpenAI Responses API SSE events into Anthropic message stream events."""
+    loop = asyncio.get_running_loop()
+    try:
+        lease_id = await asyncio.to_thread(acquire_flow_lease)
+    except Exception as e:
+        log.warning("Flow lease acquire failed for '%s': %s — streaming without lease.", model_name, e)
+        lease_id = None
+    rotator.flow_acquired()
+    prom_active_flows.set(rotator.active_flows_count)
+    last_lease_touch = time.monotonic()
+    poll_task = None
+
+    def sse(event: dict) -> bytes:
+        return f"event: {event['type']}\ndata: {json.dumps(event, separators=(',', ':'))}\n\n".encode()
+
+    msg_id = f"msg_{uuid.uuid4().hex[:24]}"
+    next_index = 0
+    open_block = None  # (index, type)
+    tool_block_for: Dict[int, tuple] = {}  # output_index -> (block_index, call_id)
+    stop_reason = "end_turn"
+    input_tokens = 0
+    output_tokens = 0
+    chunk_count = 0
+    pending_lines: List[str] = []
+
+    def close_open_block():
+        nonlocal open_block
+        if open_block is None:
+            return None
+        ev = {"type": "content_block_stop", "index": open_block[0]}
+        open_block = None
+        return ev
+
+    try:
+        yield sse({"type": "message_start", "message": {
+            "id": msg_id, "type": "message", "role": "assistant", "model": model_name,
+            "content": [], "stop_reason": None, "stop_sequence": None,
+            "usage": {"input_tokens": 0, "output_tokens": 0},
+        }})
+
+        def get_next_line(iter_lines):
+            try:
+                return next(iter_lines)
+            except StopIteration:
+                return "STOP_ITERATION"
+            except Exception as exc:
+                log.error(f"[STREAM DEBUG] Upstream socket error for '{model_name}': {type(exc).__name__}: {exc}")
+                return "SOCKET_ERROR"
+
+        line_iter = response.iter_lines()
+        poll_task = loop.run_in_executor(_STREAM_EXECUTOR, get_next_line, line_iter)
+
+        while True:
+            done, _ = await asyncio.wait({poll_task}, timeout=4.0)
+            if lease_id is not None and time.monotonic() - last_lease_touch >= FLOW_LEASE_HEARTBEAT_SECONDS:
+                try:
+                    await asyncio.to_thread(touch_flow_lease, lease_id)
+                except Exception:
+                    pass
+                last_lease_touch = time.monotonic()
+            if not done:
+                yield b": keep-alive\n\n"
+                continue
+
+            item = poll_task.result()
+            poll_task = loop.run_in_executor(_STREAM_EXECUTOR, get_next_line, line_iter)
+
+            if item == "STOP_ITERATION":
+                break
+            if item == "SOCKET_ERROR":
+                yield sse({"type": "error", "error": {"type": "api_error", "message": f"Upstream socket error for model '{model_name}'"}})
+                break
+
+            line_str = item.decode("utf-8", errors="ignore").strip() if isinstance(item, bytes) else str(item).strip()
+            if not line_str:
+                if not pending_lines:
+                    continue
+                event_name = ""
+                data_lines = []
+                for pl in pending_lines:
+                    if pl.startswith("event:"):
+                        event_name = pl[6:].strip()
+                    elif pl.startswith("data:"):
+                        data_lines.append(pl[5:].strip())
+                pending_lines = []
+                data_body = "\n".join(data_lines)
+                if not data_body or data_body == "[DONE]":
+                    break
+
+                try:
+                    ev_data = json.loads(data_body)
+                except Exception:
+                    continue
+
+                chunk_count += 1
+
+                if event_name in ("response.text.delta", "response.content_part.delta"):
+                    delta_val = ev_data.get("delta")
+                    text = delta_val.get("text", "") if isinstance(delta_val, dict) else (delta_val or "")
+                    if text:
+                        if open_block is None or open_block[1] != "text":
+                            ev = close_open_block()
+                            if ev:
+                                yield sse(ev)
+                            open_block = (next_index, "text")
+                            yield sse({"type": "content_block_start", "index": next_index, "content_block": {"type": "text", "text": ""}})
+                            next_index += 1
+                        yield sse({"type": "content_block_delta", "index": open_block[0], "delta": {"type": "text_delta", "text": text}})
+                elif event_name == "response.output_item.added":
+                    item = ev_data.get("item") or {}
+                    if item.get("type") == "function_call":
+                        ev = close_open_block()
+                        if ev:
+                            yield sse(ev)
+                        out_idx = ev_data.get("output_index", 0)
+                        tc_id = item.get("call_id") or item.get("id") or f"toolu_{uuid.uuid4().hex[:24]}"
+                        tool_block_for[out_idx] = (next_index, tc_id)
+                        open_block = (next_index, "tool_use")
+                        yield sse({
+                            "type": "content_block_start",
+                            "index": next_index,
+                            "content_block": {"type": "tool_use", "id": tc_id, "name": item.get("name") or "unknown", "input": {}},
+                        })
+                        next_index += 1
+                elif event_name in ("response.function_call_arguments.delta", "response.output_item.delta"):
+                    out_idx = ev_data.get("output_index", 0)
+                    if out_idx in tool_block_for:
+                        delta_val = ev_data.get("delta")
+                        args_delta = delta_val.get("arguments", "") if isinstance(delta_val, dict) else (delta_val or "")
+                        if args_delta:
+                            yield sse({
+                                "type": "content_block_delta",
+                                "index": tool_block_for[out_idx][0],
+                                "delta": {"type": "input_json_delta", "partial_json": args_delta},
+                            })
+                elif event_name in ("response.completed", "response.done"):
+                    usage = ev_data.get("response", {}).get("usage") or {}
+                    input_tokens = usage.get("input_tokens", 0)
+                    output_tokens = usage.get("output_tokens", 0)
+                    stop_reason = "tool_use" if tool_block_for else "end_turn"
+                    break
+                continue
+
+            pending_lines.append(line_str)
+
+        ev = close_open_block()
+        if ev:
+            yield sse(ev)
+        yield sse({
+            "type": "message_delta",
+            "delta": {"stop_reason": stop_reason, "stop_sequence": None},
+            "usage": {"output_tokens": output_tokens},
+        })
+        yield sse({"type": "message_stop"})
+        log.info(f"Responses->Anthropic streaming completed for '{model_name}' ({chunk_count} frames).")
+    except GeneratorExit:
+        log.warning(f"[STREAM DEBUG] Client closed SSE connection for '{model_name}'.")
+    except Exception as e:
+        log.error(f"Anthropic stream exception for model '{model_name}': {type(e).__name__}: {e}", exc_info=True)
+        yield sse({"type": "error", "error": {"type": "api_error", "message": f"Stream error: {e}"}})
+    finally:
+        try:
+            if poll_task is not None and not poll_task.done():
+                poll_task.cancel()
+        except Exception:
+            pass
+        if session is not None:
+            try:
+                session.close()
+            except Exception:
+                pass
+        if lease_id is not None:
+            try:
+                await asyncio.to_thread(release_flow_lease, lease_id)
+            except Exception as e:
+                log.debug("Flow lease release failed for '%s': %s", model_name, e)
+        try:
+            rotator.flow_released()
+            prom_active_flows.set(rotator.active_flows_count)
+        except Exception:
+            pass
+
+
+async def stream_chat_to_responses(response, model_name: str, session=None) -> AsyncGenerator[bytes, None]:
+    """Translate upstream OpenAI Chat Completion SSE chunks into OpenAI Responses API SSE events."""
+    loop = asyncio.get_running_loop()
+    try:
+        lease_id = await asyncio.to_thread(acquire_flow_lease)
+    except Exception as e:
+        log.warning("Flow lease acquire failed for '%s': %s — streaming without lease.", model_name, e)
+        lease_id = None
+    rotator.flow_acquired()
+    prom_active_flows.set(rotator.active_flows_count)
+    last_lease_touch = time.monotonic()
+    poll_task = None
+
+    chunk_count = 0
+    seen_done = False
+    resp_id = f"resp_{uuid.uuid4().hex[:12]}"
+    created = int(time.time())
+    started_msg = False
+    started_tools = set()
+
+    try:
+        def get_next_line(iter_lines):
+            try:
+                return next(iter_lines)
+            except StopIteration:
+                return "STOP_ITERATION"
+            except Exception as exc:
+                log.error(f"[STREAM DEBUG] Upstream socket error for '{model_name}': {type(exc).__name__}: {exc}")
+                return "SOCKET_ERROR"
+
+        line_iter = response.iter_lines()
+        poll_task = loop.run_in_executor(_STREAM_EXECUTOR, get_next_line, line_iter)
+
+        yield f"event: response.created\ndata: {json.dumps({'response': {'id': resp_id, 'model': model_name, 'status': 'in_progress'}})}\n\n".encode("utf-8")
+
+        while True:
+            done, _ = await asyncio.wait({poll_task}, timeout=4.0)
+            if lease_id is not None and time.monotonic() - last_lease_touch >= FLOW_LEASE_HEARTBEAT_SECONDS:
+                try:
+                    await asyncio.to_thread(touch_flow_lease, lease_id)
+                except Exception:
+                    pass
+                last_lease_touch = time.monotonic()
+            if not done:
+                yield b": keep-alive\n\n"
+                continue
+
+            item = poll_task.result()
+            poll_task = loop.run_in_executor(_STREAM_EXECUTOR, get_next_line, line_iter)
+
+            if item == "STOP_ITERATION":
+                break
+            if item == "SOCKET_ERROR":
+                err_json = json.dumps({"error": {"message": f"Upstream connection closed abruptly for '{model_name}'.", "type": "upstream_connection_error", "code": 502}})
+                yield f"event: error\ndata: {err_json}\n\n".encode("utf-8")
+                seen_done = True
+                break
+
+            line_str = item.decode("utf-8", errors="ignore").strip() if isinstance(item, bytes) else str(item).strip()
+            if not line_str or not line_str.startswith("data:"):
+                continue
+            data_str = line_str[5:].strip()
+            if data_str == "[DONE]":
+                break
+
+            try:
+                chunk = json.loads(data_str)
+            except Exception:
+                continue
+            if not isinstance(chunk, dict):
+                continue
+
+            chunk_count += 1
+            choices = chunk.get("choices") or []
+            choice = choices[0] if choices else {}
+            delta = choice.get("delta") or {}
+
+            text = delta.get("content")
+            if text:
+                if not started_msg:
+                    started_msg = True
+                    yield f"event: response.output_item.added\ndata: {json.dumps({'output_index': 0, 'item': {'type': 'message', 'role': 'assistant', 'content': []}})}\n\n".encode("utf-8")
+                    yield f"event: response.content_part.added\ndata: {json.dumps({'output_index': 0, 'content_index': 0, 'part': {'type': 'text', 'text': ''}})}\n\n".encode("utf-8")
+                yield f"event: response.text.delta\ndata: {json.dumps({'output_index': 0, 'content_index': 0, 'delta': text})}\n\n".encode("utf-8")
+
+            for tc in delta.get("tool_calls") or []:
+                tidx = tc.get("index", 0) + 1  # offset from message item at 0
+                fn = tc.get("function") or {}
+                if tidx not in started_tools:
+                    started_tools.add(tidx)
+                    tc_id = tc.get("id") or f"call_{uuid.uuid4().hex[:8]}"
+                    yield f"event: response.output_item.added\ndata: {json.dumps({'output_index': tidx, 'item': {'type': 'function_call', 'call_id': tc_id, 'name': fn.get('name') or 'unknown', 'arguments': ''}})}\n\n".encode("utf-8")
+                args = fn.get("arguments")
+                if args:
+                    yield f"event: response.function_call_arguments.delta\ndata: {json.dumps({'output_index': tidx, 'delta': args})}\n\n".encode("utf-8")
+
+            finish = choice.get("finish_reason")
+            if finish:
+                usage = chunk.get("usage") or {}
+                yield f"event: response.completed\ndata: {json.dumps({'response': {'id': resp_id, 'status': 'completed', 'usage': {'input_tokens': usage.get('prompt_tokens', 0), 'output_tokens': usage.get('completion_tokens', 0), 'total_tokens': usage.get('total_tokens', 0)}}})}\n\n".encode("utf-8")
+                seen_done = True
+                break
+
+        if not seen_done:
+            yield f"event: response.completed\ndata: {json.dumps({'response': {'id': resp_id, 'status': 'completed'}})}\n\n".encode("utf-8")
+        log.info(f"Chat->Responses streaming completed for '{model_name}' ({chunk_count} chunks).")
+    except GeneratorExit:
+        log.warning(f"[STREAM DEBUG] Client closed connection for '{model_name}'.")
+    except Exception as e:
+        log.error(f"Stream exception caught for model '{model_name}': {type(e).__name__}: {e}", exc_info=True)
+        if not seen_done:
+            err_json = json.dumps({"error": {"message": f"Upstream stream error: {e}", "type": "stream_error", "code": 500}})
+            yield f"event: error\ndata: {err_json}\n\n".encode("utf-8")
+    finally:
+        try:
+            if poll_task is not None and not poll_task.done():
+                poll_task.cancel()
+        except Exception:
+            pass
+        if session is not None:
+            try:
+                session.close()
+            except Exception:
+                pass
+        if lease_id is not None:
+            try:
+                await asyncio.to_thread(release_flow_lease, lease_id)
+            except Exception as e:
+                log.debug("Flow lease release failed for '%s': %s", model_name, e)
+        try:
+            rotator.flow_released()
+            prom_active_flows.set(rotator.active_flows_count)
+        except Exception:
+            pass
+
+
 @app.get("/dashboard", response_class=HTMLResponse)
 async def dashboard(request: Request):
     return _templates.TemplateResponse(request=request, name="dashboard.html")
@@ -1899,7 +2437,6 @@ async def list_models():
 async def chat_completions(raw_request: Request):
     metrics["total_requests"] += 1
     prom_requests_total.labels(model="chat", endpoint="chat_completions").inc()
-    await wait_for_rotation_drain()
 
     start_time = time.time()
     try:
@@ -1914,8 +2451,10 @@ async def chat_completions(raw_request: Request):
     is_stream = payload.get("stream", False)
     log.info(f"Received request for model '{current_model}' (raw: '{raw_model}' | Stream: {is_stream} | Has Tools: {'tools' in payload})")
 
-    # Record client headers & payload summary for web dashboard inspector
+    # Record client headers & payload summary immediately for web dashboard inspector
     req_entry = record_client_request("/v1/chat/completions", current_model, is_stream, raw_request, payload)
+
+    await wait_for_rotation_drain()
 
     # Ensure end-user identifier is present for models requiring safety_identifier / user (e.g. contributor / vertex models)
     if not payload.get("user"):
@@ -1927,6 +2466,27 @@ async def chat_completions(raw_request: Request):
     last_error_resp: Optional[JSONResponse] = None
     last_error_detail: str = ""
 
+    # Adaptive routing: muse-spark models ONLY exist on upstream /responses
+    if is_responses_model(current_model):
+        primary_url = TARGET_ZEN_RESPONSES_URL
+        primary_payload = chat_to_responses_payload(payload)
+        primary_proto = "responses"
+        fallback_url = TARGET_ZEN_URL
+        fallback_payload = payload
+        fallback_proto = "chat"
+    else:
+        primary_url = TARGET_ZEN_URL
+        primary_payload = payload
+        primary_proto = "chat"
+        fallback_url = TARGET_ZEN_RESPONSES_URL
+        fallback_payload = chat_to_responses_payload(payload)
+        fallback_proto = "responses"
+
+    active_url = primary_url
+    active_payload = primary_payload
+    active_proto = primary_proto
+    tried_fallback = False
+
     for attempt in range(1, MAX_RETRIES_ON_429 + 1):
         session = None
         pooled = False
@@ -1935,22 +2495,21 @@ async def chat_completions(raw_request: Request):
             if is_stream:
                 session = create_fresh_session(is_stream)
             else:
-                session = _acquire_pooled_session(TARGET_ZEN_URL)
+                session = _acquire_pooled_session(active_url)
                 pooled = True
             async with _get_upstream_semaphore():
                 response = await asyncio.to_thread(
                     session.post,
-                    TARGET_ZEN_URL,
-                    json=payload,
+                    active_url,
+                    json=active_payload,
                     headers=headers,
                     impersonate="chrome124",
                     stream=is_stream,
                     proxies=proxies,
                     timeout=STREAM_TIMEOUT if is_stream else 120
                 )
-            # pooled non-stream sessions can be returned immediately after the request
             if pooled and not is_stream:
-                _release_pooled_session(TARGET_ZEN_URL, session)
+                _release_pooled_session(active_url, session)
                 session = None
                 pooled = False
             log_upstream_response(response, current_model, "chat_completions", attempt, proxies is not None)
@@ -2002,8 +2561,13 @@ async def chat_completions(raw_request: Request):
                         headers = build_opencode_headers(raw_request, fresh_session=True)
                         continue
 
-            if response.status_code >= 500:
-                raw_err_text = extract_response_body(response)
+            raw_err_text = extract_response_body(response) if response.status_code != 200 else ""
+            is_model_unavailable = (
+                response.status_code >= 500
+                or (response.status_code == 400 and any(kw in raw_err_text.lower() for kw in ("not supported", "unavailable", "does not exist", "not found")))
+            )
+
+            if is_model_unavailable:
                 last_error_resp = JSONResponse(
                     status_code=response.status_code,
                     content={"error": {"message": raw_err_text or f"Upstream HTTP {response.status_code}", "type": "upstream_server_error", "code": response.status_code}}
@@ -2015,6 +2579,20 @@ async def chat_completions(raw_request: Request):
                     except Exception:
                         pass
                     session = None
+
+                # Fast fallback: if primary endpoint returned 5xx/unavailable, try the alternative endpoint immediately!
+                if not tried_fallback and fallback_url:
+                    tried_fallback = True
+                    log.warning("Upstream HTTP %s for '%s' on %s. Immediately switching to fallback endpoint %s...", response.status_code, current_model, active_url, fallback_url)
+                    active_url = fallback_url
+                    active_payload = fallback_payload
+                    active_proto = fallback_proto
+                    continue
+
+                if attempt >= MAX_RETRIES_ON_5XX:
+                    log.warning("Exhausted %s 5xx/unavailable retries for '%s'. Failing fast.", MAX_RETRIES_ON_5XX, current_model)
+                    break
+
                 delay = compute_backoff_delay(attempt, INITIAL_BACKOFF)
                 log.warning("Upstream HTTP %s for '%s'; retrying without egress rotation in %.2fs.", response.status_code, current_model, delay)
                 await asyncio.sleep(delay)
@@ -2027,7 +2605,6 @@ async def chat_completions(raw_request: Request):
                     except Exception:
                         pass
                     session = None
-                raw_err_text = extract_response_body(response)
                 log.warning("Upstream returned HTTP %s for '%s': %s", response.status_code, current_model, raw_err_text[:500])
                 if req_entry:
                     req_entry["status_code"] = response.status_code
@@ -2047,9 +2624,11 @@ async def chat_completions(raw_request: Request):
 
             if is_stream:
                 try:
-                    stream_gen = stream_response(response, current_model, session=session)
+                    if active_proto == "responses":
+                        stream_gen = stream_responses_to_chat(response, current_model, session=session)
+                    else:
+                        stream_gen = stream_response(response, current_model, session=session, protocol="chat")
                     track_token_usage(current_model, prompt_tokens=100, completion_tokens=150)
-                    # ownership transferred to stream_response — prevent outer cleanup
                     session = None
                     return StreamingResponse(
                         stream_gen,
@@ -2071,13 +2650,23 @@ async def chat_completions(raw_request: Request):
                 with FlowContext():
                     try:
                         res_json = await asyncio.to_thread(response.json)
-                        usage = res_json.get("usage", {})
-                        track_token_usage(
-                            current_model,
-                            prompt_tokens=usage.get("prompt_tokens", DEFAULT_PROMPT_TOKENS),
-                            completion_tokens=usage.get("completion_tokens", DEFAULT_COMPLETION_TOKENS)
-                        )
-                        return JSONResponse(content=res_json)
+                        if active_proto == "responses":
+                            chat_res = responses_to_chat_json(res_json, current_model)
+                            usage = chat_res.get("usage", {})
+                            track_token_usage(
+                                current_model,
+                                prompt_tokens=usage.get("prompt_tokens", DEFAULT_PROMPT_TOKENS),
+                                completion_tokens=usage.get("completion_tokens", DEFAULT_COMPLETION_TOKENS)
+                            )
+                            return JSONResponse(content=chat_res)
+                        else:
+                            usage = res_json.get("usage", {})
+                            track_token_usage(
+                                current_model,
+                                prompt_tokens=usage.get("prompt_tokens", DEFAULT_PROMPT_TOKENS),
+                                completion_tokens=usage.get("completion_tokens", DEFAULT_COMPLETION_TOKENS)
+                            )
+                            return JSONResponse(content=res_json)
                     except Exception:
                         track_token_usage(current_model, prompt_tokens=DEFAULT_PROMPT_TOKENS, completion_tokens=DEFAULT_COMPLETION_TOKENS)
                         return JSONResponse(content={
@@ -2090,7 +2679,7 @@ async def chat_completions(raw_request: Request):
                     finally:
                         if session:
                             if pooled:
-                                _release_pooled_session(TARGET_ZEN_URL, session)
+                                _release_pooled_session(active_url, session)
                             else:
                                 try:
                                     session.close()
@@ -2100,7 +2689,7 @@ async def chat_completions(raw_request: Request):
         except Exception as e:
             if session:
                 if pooled:
-                    _release_pooled_session(TARGET_ZEN_URL, session)
+                    _release_pooled_session(active_url, session)
                 else:
                     try:
                         session.close()
@@ -2113,11 +2702,11 @@ async def chat_completions(raw_request: Request):
             continue
 
     if last_error_resp is not None:
-        log.error(f"All {MAX_RETRIES_ON_429} attempts exhausted for model '{current_model}'. Passing through last upstream error response.")
+        log.error(f"All attempts exhausted for model '{current_model}'. Passing through last upstream error response.")
         return last_error_resp
 
     status = 504 if "timeout" in last_error_detail.lower() else 502
-    log.error(f"All {MAX_RETRIES_ON_429} attempts exhausted for model '{current_model}': {last_error_detail}. Returning {status}.")
+    log.error(f"All attempts exhausted for model '{current_model}': {last_error_detail}. Returning {status}.")
     return JSONResponse(
         status_code=status,
         content={"error": {"message": f"Upstream connection failed after {MAX_RETRIES_ON_429} attempts: {last_error_detail or 'Connection failed'}", "type": "upstream_error", "code": status}},
@@ -2277,6 +2866,320 @@ def openai_to_anthropic(res: dict, model_name: str) -> dict:
             "output_tokens": usage.get("completion_tokens", 0),
         },
     }
+
+
+# -----------------------------------------------------------------------------
+# Universal API Translation Helpers (Chat Completions <-> Responses <-> Messages)
+# -----------------------------------------------------------------------------
+def is_responses_model(model_name: str) -> bool:
+    """Check if model must be directed to /responses endpoint on upstream OpenCode."""
+    if not model_name or not isinstance(model_name, str):
+        return False
+    norm = model_name.lower().strip()
+    return "muse-spark" in norm
+
+
+def chat_to_responses_payload(payload: dict) -> dict:
+    """Translate an OpenAI Chat Completions payload into OpenAI Responses API payload."""
+    out = {
+        "model": payload.get("model"),
+        "stream": bool(payload.get("stream", False)),
+    }
+    if "temperature" in payload:
+        out["temperature"] = payload["temperature"]
+    if "top_p" in payload:
+        out["top_p"] = payload["top_p"]
+    max_tokens = payload.get("max_completion_tokens") or payload.get("max_tokens")
+    if max_tokens is not None:
+        out["max_output_tokens"] = max_tokens
+    if payload.get("user"):
+        out["user"] = payload["user"]
+    if payload.get("safety_identifier"):
+        out["safety_identifier"] = payload["safety_identifier"]
+
+    input_items = []
+    instructions = []
+
+    for msg in payload.get("messages", []):
+        if not isinstance(msg, dict):
+            continue
+        role = msg.get("role")
+        content = msg.get("content")
+        tool_calls = msg.get("tool_calls")
+        if role == "system":
+            if isinstance(content, str) and content:
+                instructions.append(content)
+            elif isinstance(content, list):
+                txt = " ".join(part.get("text", "") for part in content if isinstance(part, dict) and part.get("type") == "text")
+                if txt:
+                    instructions.append(txt)
+        elif role == "user":
+            input_items.append({"role": "user", "content": content if content is not None else ""})
+        elif role == "assistant":
+            if content:
+                input_items.append({"role": "assistant", "content": content})
+            if tool_calls and isinstance(tool_calls, list):
+                for tc in tool_calls:
+                    if not isinstance(tc, dict):
+                        continue
+                    fn = tc.get("function") or {}
+                    input_items.append({
+                        "type": "function_call",
+                        "call_id": tc.get("id") or f"call_{uuid.uuid4().hex[:8]}",
+                        "name": fn.get("name") or "unknown",
+                        "arguments": fn.get("arguments") or "{}"
+                    })
+            if not content and not tool_calls:
+                input_items.append({"role": "assistant", "content": ""})
+        elif role == "tool":
+            input_items.append({
+                "type": "function_call_output",
+                "call_id": msg.get("tool_call_id") or "",
+                "output": content if content is not None else ""
+            })
+
+    if instructions:
+        out["instructions"] = "\n\n".join(instructions)
+    out["input"] = input_items
+
+    # Tools: Responses API accepts flat tools
+    tools = []
+    for t in payload.get("tools", []):
+        if not isinstance(t, dict):
+            continue
+        if t.get("type") == "function":
+            fn = t.get("function") or {}
+            tools.append({
+                "type": "function",
+                "name": fn.get("name") or t.get("name") or "unknown",
+                "description": fn.get("description") or t.get("description", ""),
+                "parameters": fn.get("parameters") or t.get("parameters") or {"type": "object", "properties": {}}
+            })
+        else:
+            tools.append(t)
+    if tools:
+        out["tools"] = tools
+
+    tc = payload.get("tool_choice")
+    if isinstance(tc, str):
+        out["tool_choice"] = tc
+    elif isinstance(tc, dict):
+        fn = tc.get("function") or {}
+        name = fn.get("name") or tc.get("name")
+        if name:
+            out["tool_choice"] = {"type": "function", "name": name}
+        else:
+            out["tool_choice"] = tc.get("type", "auto")
+
+    return out
+
+
+def responses_to_chat_payload(payload: dict) -> dict:
+    """Translate an OpenAI Responses API payload into OpenAI Chat Completions payload."""
+    out = {
+        "model": payload.get("model"),
+        "stream": bool(payload.get("stream", False)),
+    }
+    if "temperature" in payload:
+        out["temperature"] = payload["temperature"]
+    if "top_p" in payload:
+        out["top_p"] = payload["top_p"]
+    if payload.get("max_output_tokens") is not None:
+        out["max_tokens"] = payload["max_output_tokens"]
+    if payload.get("user"):
+        out["user"] = payload["user"]
+    if payload.get("safety_identifier"):
+        out["safety_identifier"] = payload["safety_identifier"]
+
+    messages = []
+    if payload.get("instructions"):
+        messages.append({"role": "system", "content": payload["instructions"]})
+
+    raw_input = payload.get("input")
+    if isinstance(raw_input, str):
+        messages.append({"role": "user", "content": raw_input})
+    elif isinstance(raw_input, list):
+        for item in raw_input:
+            if not isinstance(item, dict):
+                continue
+            item_type = item.get("type")
+            if "role" in item:
+                messages.append({"role": item["role"], "content": item.get("content", "")})
+            elif item_type == "function_call":
+                tc = {
+                    "id": item.get("call_id") or item.get("id") or f"call_{uuid.uuid4().hex[:8]}",
+                    "type": "function",
+                    "function": {
+                        "name": item.get("name") or "unknown",
+                        "arguments": item.get("arguments") or "{}"
+                    }
+                }
+                messages.append({"role": "assistant", "content": None, "tool_calls": [tc]})
+            elif item_type == "function_call_output":
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": item.get("call_id") or "",
+                    "content": item.get("output") or ""
+                })
+
+    out["messages"] = messages
+
+    tools = []
+    for t in payload.get("tools", []):
+        if not isinstance(t, dict):
+            continue
+        if t.get("type") == "function":
+            if "function" in t and isinstance(t["function"], dict):
+                tools.append(t)
+            else:
+                tools.append({
+                    "type": "function",
+                    "function": {
+                        "name": t.get("name") or "unknown",
+                        "description": t.get("description", ""),
+                        "parameters": t.get("parameters") or {"type": "object", "properties": {}}
+                    }
+                })
+        else:
+            tools.append(t)
+    if tools:
+        out["tools"] = tools
+
+    tc = payload.get("tool_choice")
+    if isinstance(tc, dict):
+        name = tc.get("name") or (tc.get("function") or {}).get("name")
+        if name:
+            out["tool_choice"] = {"type": "function", "function": {"name": name}}
+        else:
+            out["tool_choice"] = tc.get("type", "auto")
+    elif isinstance(tc, str):
+        out["tool_choice"] = tc
+
+    return out
+
+
+def anthropic_to_responses_payload(body: dict) -> dict:
+    """Translate Anthropic /v1/messages payload directly to Responses API payload."""
+    chat_payload = anthropic_to_openai(body)
+    return chat_to_responses_payload(chat_payload)
+
+
+def responses_to_chat_json(res_json: dict, model_name: str) -> dict:
+    """Convert Responses API non-streaming JSON to Chat Completion JSON."""
+    resp_id = res_json.get("id") or f"chatcmpl-{uuid.uuid4().hex[:12]}"
+    created = res_json.get("created_at") or int(time.time())
+    text_content = ""
+    tool_calls = []
+
+    output = res_json.get("output", [])
+    if isinstance(output, str):
+        text_content = output
+    elif isinstance(output, list):
+        for item in output:
+            if not isinstance(item, dict):
+                continue
+            itype = item.get("type")
+            if itype == "message":
+                content = item.get("content")
+                if isinstance(content, str):
+                    text_content += content
+                elif isinstance(content, list):
+                    for part in content:
+                        if isinstance(part, dict) and part.get("type") == "text":
+                            text_content += part.get("text", "")
+                        elif isinstance(part, str):
+                            text_content += part
+            elif itype == "function_call":
+                tool_calls.append({
+                    "id": item.get("call_id") or item.get("id") or f"call_{uuid.uuid4().hex[:8]}",
+                    "type": "function",
+                    "function": {
+                        "name": item.get("name") or "unknown",
+                        "arguments": item.get("arguments") or "{}"
+                    }
+                })
+
+    msg = {
+        "role": "assistant",
+        "content": text_content if text_content else (None if tool_calls else "")
+    }
+    if tool_calls:
+        msg["tool_calls"] = tool_calls
+
+    finish_reason = "tool_calls" if tool_calls else "stop"
+    usage = res_json.get("usage") or {}
+    prompt_tokens = usage.get("input_tokens", usage.get("prompt_tokens", DEFAULT_PROMPT_TOKENS))
+    completion_tokens = usage.get("output_tokens", usage.get("completion_tokens", DEFAULT_COMPLETION_TOKENS))
+
+    return {
+        "id": resp_id,
+        "object": "chat.completion",
+        "created": created,
+        "model": model_name,
+        "choices": [
+            {
+                "index": 0,
+                "message": msg,
+                "finish_reason": finish_reason
+            }
+        ],
+        "usage": {
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "total_tokens": prompt_tokens + completion_tokens
+        }
+    }
+
+
+def responses_to_anthropic_json(res_json: dict, model_name: str) -> dict:
+    """Convert Responses API non-streaming JSON to Anthropic message JSON."""
+    chat_json = responses_to_chat_json(res_json, model_name)
+    return openai_to_anthropic(chat_json, model_name)
+
+
+def chat_to_responses_json(res_json: dict, model_name: str) -> dict:
+    """Convert Chat Completion non-streaming JSON to Responses API JSON."""
+    choice = (res_json.get("choices") or [{}])[0]
+    msg = choice.get("message") or {}
+    output = []
+    if msg.get("content"):
+        output.append({
+            "type": "message",
+            "id": f"msg_{uuid.uuid4().hex[:8]}",
+            "role": "assistant",
+            "content": [{"type": "text", "text": msg["content"]}]
+        })
+    for tc in msg.get("tool_calls") or []:
+        if not isinstance(tc, dict):
+            continue
+        fn = tc.get("function") or {}
+        output.append({
+            "type": "function_call",
+            "id": f"fc_{uuid.uuid4().hex[:8]}",
+            "call_id": tc.get("id") or f"call_{uuid.uuid4().hex[:8]}",
+            "name": fn.get("name") or "unknown",
+            "arguments": fn.get("arguments") or "{}"
+        })
+
+    usage = res_json.get("usage") or {}
+    input_tokens = usage.get("prompt_tokens", DEFAULT_PROMPT_TOKENS)
+    output_tokens = usage.get("completion_tokens", DEFAULT_COMPLETION_TOKENS)
+
+    return {
+        "id": res_json.get("id") or f"resp_{uuid.uuid4().hex[:12]}",
+        "object": "response",
+        "created_at": res_json.get("created") or int(time.time()),
+        "model": model_name,
+        "status": "completed",
+        "output": output,
+        "usage": {
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+            "total_tokens": input_tokens + output_tokens
+        }
+    }
+
+
 # -----------------------------------------------------------------------------
 # Anthropic API Compatibility Endpoint (/v1/messages)
 # -----------------------------------------------------------------------------
@@ -2284,7 +3187,6 @@ def openai_to_anthropic(res: dict, model_name: str) -> dict:
 async def anthropic_messages(raw_request: Request):
     metrics["total_requests"] += 1
     prom_requests_total.labels(model="messages", endpoint="anthropic_messages").inc()
-    await wait_for_rotation_drain()
 
     start_time = time.time()
     try:
@@ -2295,17 +3197,37 @@ async def anthropic_messages(raw_request: Request):
     raw_model = body.get("model", "deepseek-v4-flash-free")
     model_name = normalize_upstream_model_name(raw_model)
     body["model"] = model_name
-    openai_body = anthropic_to_openai(body)
-    openai_body["model"] = model_name
-    openai_body = optimize_payload_for_upstream(openai_body)
-    is_stream = bool(openai_body.get("stream", False))
+    is_stream = bool(body.get("stream", False))
 
-    # Record client headers & payload summary for web dashboard inspector
+    # Record client headers & payload summary immediately for web dashboard inspector
     req_entry = record_client_request("/v1/messages", model_name, is_stream, raw_request, body)
+
+    await wait_for_rotation_drain()
 
     headers = build_opencode_headers(raw_request, fresh_session=True)
     last_error_resp: Optional[JSONResponse] = None
     last_error_detail: str = ""
+
+    # Adaptive routing: muse-spark models ONLY exist on upstream /responses
+    if is_responses_model(model_name):
+        primary_url = TARGET_ZEN_RESPONSES_URL
+        primary_payload = anthropic_to_responses_payload(body)
+        primary_proto = "responses"
+        fallback_url = TARGET_ZEN_URL
+        fallback_payload = optimize_payload_for_upstream(anthropic_to_openai(body))
+        fallback_proto = "chat"
+    else:
+        primary_url = TARGET_ZEN_URL
+        primary_payload = optimize_payload_for_upstream(anthropic_to_openai(body))
+        primary_proto = "chat"
+        fallback_url = TARGET_ZEN_RESPONSES_URL
+        fallback_payload = anthropic_to_responses_payload(body)
+        fallback_proto = "responses"
+
+    active_url = primary_url
+    active_payload = primary_payload
+    active_proto = primary_proto
+    tried_fallback = False
 
     for attempt in range(1, MAX_RETRIES_ON_429 + 1):
         session = None
@@ -2315,13 +3237,13 @@ async def anthropic_messages(raw_request: Request):
             if is_stream:
                 session = create_fresh_session(is_stream)
             else:
-                session = _acquire_pooled_session(TARGET_ZEN_URL)
+                session = _acquire_pooled_session(active_url)
                 pooled = True
             async with _get_upstream_semaphore():
                 response = await asyncio.to_thread(
                     session.post,
-                    TARGET_ZEN_URL,
-                    json=openai_body,
+                    active_url,
+                    json=active_payload,
                     headers=headers,
                     impersonate="chrome124",
                     stream=is_stream,
@@ -2329,7 +3251,7 @@ async def anthropic_messages(raw_request: Request):
                     timeout=STREAM_TIMEOUT if is_stream else 120,
                 )
             if pooled and not is_stream:
-                _release_pooled_session(TARGET_ZEN_URL, session)
+                _release_pooled_session(active_url, session)
                 session = None
                 pooled = False
             log_upstream_response(response, model_name, "messages", attempt, proxies is not None)
@@ -2381,8 +3303,13 @@ async def anthropic_messages(raw_request: Request):
                         headers = build_opencode_headers(raw_request, fresh_session=True)
                         continue
 
-            if response.status_code >= 500:
-                raw_err_text = extract_response_body(response)
+            raw_err_text = extract_response_body(response) if response.status_code != 200 else ""
+            is_model_unavailable = (
+                response.status_code >= 500
+                or (response.status_code == 400 and any(kw in raw_err_text.lower() for kw in ("not supported", "unavailable", "does not exist", "not found")))
+            )
+
+            if is_model_unavailable:
                 last_error_resp = JSONResponse(
                     status_code=response.status_code,
                     content={"error": {"message": raw_err_text or f"Upstream HTTP {response.status_code}", "type": "upstream_server_error", "code": response.status_code}}
@@ -2394,6 +3321,20 @@ async def anthropic_messages(raw_request: Request):
                     except Exception:
                         pass
                     session = None
+
+                # Fast fallback: if primary endpoint returned 5xx/unavailable, try alternative endpoint immediately!
+                if not tried_fallback and fallback_url:
+                    tried_fallback = True
+                    log.warning("Upstream HTTP %s for '%s' on %s. Immediately switching to fallback endpoint %s...", response.status_code, model_name, active_url, fallback_url)
+                    active_url = fallback_url
+                    active_payload = fallback_payload
+                    active_proto = fallback_proto
+                    continue
+
+                if attempt >= MAX_RETRIES_ON_5XX:
+                    log.warning("Exhausted %s 5xx/unavailable retries for '%s'. Failing fast.", MAX_RETRIES_ON_5XX, model_name)
+                    break
+
                 delay = compute_backoff_delay(attempt, INITIAL_BACKOFF)
                 log.warning("Upstream HTTP %s for '%s'; retrying without egress rotation in %.2fs.", response.status_code, model_name, delay)
                 await asyncio.sleep(delay)
@@ -2406,7 +3347,6 @@ async def anthropic_messages(raw_request: Request):
                     except Exception:
                         pass
                     session = None
-                raw_err_text = extract_response_body(response)
                 log.warning("Upstream returned HTTP %s for '%s': %s", response.status_code, model_name, raw_err_text[:500])
                 if req_entry:
                     req_entry["status_code"] = response.status_code
@@ -2425,25 +3365,41 @@ async def anthropic_messages(raw_request: Request):
             prom_request_duration.labels(model=_sanitize_model_label(model_name), endpoint="anthropic_messages").observe(time.time() - start_time)
 
             if is_stream:
-                # ownership transferred to anthropic_stream_response
                 _sess = session
                 session = None
-                return StreamingResponse(
-                    anthropic_stream_response(response, model_name, session=_sess),
-                    media_type="text/event-stream",
-                    headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
-                )
+                if active_proto == "responses":
+                    return StreamingResponse(
+                        stream_responses_to_anthropic(response, model_name, session=_sess),
+                        media_type="text/event-stream",
+                        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+                    )
+                else:
+                    return StreamingResponse(
+                        anthropic_stream_response(response, model_name, session=_sess),
+                        media_type="text/event-stream",
+                        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+                    )
             else:
                 with FlowContext():
                     try:
                         res_json = await asyncio.to_thread(response.json)
-                        usage = res_json.get("usage", {})
-                        track_token_usage(
-                            model_name,
-                            prompt_tokens=usage.get("prompt_tokens", DEFAULT_PROMPT_TOKENS),
-                            completion_tokens=usage.get("completion_tokens", DEFAULT_COMPLETION_TOKENS),
-                        )
-                        return JSONResponse(content=openai_to_anthropic(res_json, model_name))
+                        if active_proto == "responses":
+                            anthropic_res = responses_to_anthropic_json(res_json, model_name)
+                            usage = anthropic_res.get("usage", {})
+                            track_token_usage(
+                                model_name,
+                                prompt_tokens=usage.get("input_tokens", DEFAULT_PROMPT_TOKENS),
+                                completion_tokens=usage.get("output_tokens", DEFAULT_COMPLETION_TOKENS),
+                            )
+                            return JSONResponse(content=anthropic_res)
+                        else:
+                            usage = res_json.get("usage", {})
+                            track_token_usage(
+                                model_name,
+                                prompt_tokens=usage.get("prompt_tokens", DEFAULT_PROMPT_TOKENS),
+                                completion_tokens=usage.get("completion_tokens", DEFAULT_COMPLETION_TOKENS),
+                            )
+                            return JSONResponse(content=openai_to_anthropic(res_json, model_name))
                     except Exception:
                         track_token_usage(model_name, prompt_tokens=DEFAULT_PROMPT_TOKENS, completion_tokens=DEFAULT_COMPLETION_TOKENS)
                         return JSONResponse(content={
@@ -2458,7 +3414,7 @@ async def anthropic_messages(raw_request: Request):
                     finally:
                         if session:
                             if pooled:
-                                _release_pooled_session(TARGET_ZEN_URL, session)
+                                _release_pooled_session(active_url, session)
                             else:
                                 try:
                                     session.close()
@@ -2468,7 +3424,7 @@ async def anthropic_messages(raw_request: Request):
         except Exception as e:
             if session:
                 if pooled:
-                    _release_pooled_session(TARGET_ZEN_URL, session)
+                    _release_pooled_session(active_url, session)
                 else:
                     try:
                         session.close()
@@ -2481,11 +3437,11 @@ async def anthropic_messages(raw_request: Request):
             continue
 
     if last_error_resp is not None:
-        log.error(f"All {MAX_RETRIES_ON_429} attempts exhausted for Anthropic model '{model_name}'. Passing through last upstream error response.")
+        log.error(f"All attempts exhausted for Anthropic model '{model_name}'. Passing through last upstream error response.")
         return last_error_resp
 
     status = 504 if "timeout" in last_error_detail.lower() else 502
-    log.error(f"All {MAX_RETRIES_ON_429} attempts exhausted for Anthropic model '{model_name}': {last_error_detail}. Returning {status}.")
+    log.error(f"All attempts exhausted for Anthropic model '{model_name}': {last_error_detail}. Returning {status}.")
     return JSONResponse(
         status_code=status,
         content={"error": {"message": f"Upstream connection failed after {MAX_RETRIES_ON_429} attempts: {last_error_detail or 'Connection failed'}", "type": "upstream_error", "code": status}},
@@ -2499,7 +3455,6 @@ async def anthropic_messages(raw_request: Request):
 async def responses_endpoint(raw_request: Request):
     metrics["total_requests"] += 1
     prom_requests_total.labels(model="responses", endpoint="responses").inc()
-    await wait_for_rotation_drain()
 
     start_time = time.time()
     try:
@@ -2514,8 +3469,10 @@ async def responses_endpoint(raw_request: Request):
     is_stream = body.get("stream", False)
     log.info(f"Received Responses API request for model '{model_name}' (raw: '{raw_model}' | Stream: {is_stream})")
 
-    # Record client headers & payload summary for web dashboard inspector
+    # Record client headers & payload summary immediately for web dashboard inspector
     req_entry = record_client_request("/v1/responses", model_name, is_stream, raw_request, body)
+
+    await wait_for_rotation_drain()
 
     # Ensure end-user identifier is present
     if not body.get("user"):
@@ -2527,6 +3484,19 @@ async def responses_endpoint(raw_request: Request):
     last_error_resp: Optional[JSONResponse] = None
     last_error_detail: str = ""
 
+    # Primary is Responses; fallback is Chat Completions with translation
+    primary_url = TARGET_ZEN_RESPONSES_URL
+    primary_payload = body
+    primary_proto = "responses"
+    fallback_url = TARGET_ZEN_URL
+    fallback_payload = optimize_payload_for_upstream(responses_to_chat_payload(body))
+    fallback_proto = "chat"
+
+    active_url = primary_url
+    active_payload = primary_payload
+    active_proto = primary_proto
+    tried_fallback = False
+
     for attempt in range(1, MAX_RETRIES_ON_429 + 1):
         session = None
         pooled = False
@@ -2535,13 +3505,13 @@ async def responses_endpoint(raw_request: Request):
             if is_stream:
                 session = create_fresh_session(is_stream)
             else:
-                session = _acquire_pooled_session(TARGET_ZEN_RESPONSES_URL)
+                session = _acquire_pooled_session(active_url)
                 pooled = True
             async with _get_upstream_semaphore():
                 response = await asyncio.to_thread(
                     session.post,
-                    TARGET_ZEN_RESPONSES_URL,
-                    json=body,
+                    active_url,
+                    json=active_payload,
                     headers=headers,
                     impersonate="chrome124",
                     stream=is_stream,
@@ -2549,7 +3519,7 @@ async def responses_endpoint(raw_request: Request):
                     timeout=STREAM_TIMEOUT if is_stream else 120,
                 )
             if pooled and not is_stream:
-                _release_pooled_session(TARGET_ZEN_RESPONSES_URL, session)
+                _release_pooled_session(active_url, session)
                 session = None
                 pooled = False
             log_upstream_response(response, model_name, "responses", attempt, proxies is not None)
@@ -2582,8 +3552,32 @@ async def responses_endpoint(raw_request: Request):
                     session = None
                 return last_error_resp
 
-            if response.status_code >= 500:
+            if response.status_code == 401:
                 raw_err_text = extract_response_body(response)
+                last_error_resp = JSONResponse(status_code=401, content={"error": {"message": raw_err_text or "Unauthorized", "type": "unauthorized", "code": 401}})
+                last_error_detail = raw_err_text or "Unauthorized"
+                if "is not supported" in raw_err_text or "Rate limit" in raw_err_text or "FreeUsageLimit" in raw_err_text:
+                    if attempt < MAX_RETRIES_ON_429:
+                        log.warning("Upstream 401 ('%s') for '%s' (attempt %s/%s). Auto-rotating IP and retrying...", raw_err_text[:80], model_name, attempt, MAX_RETRIES_ON_429)
+                        if session and not pooled:
+                            try:
+                                session.close()
+                            except Exception:
+                                pass
+                            session = None
+                        await schedule_rotation_on_429(f"401 error ({raw_err_text[:40]}) on attempt {attempt}")
+                        await wait_for_rotation_drain()
+                        await asyncio.sleep(1.0)
+                        headers = build_opencode_headers(raw_request, fresh_session=True)
+                        continue
+
+            raw_err_text = extract_response_body(response) if response.status_code != 200 else ""
+            is_model_unavailable = (
+                response.status_code >= 500
+                or (response.status_code == 400 and any(kw in raw_err_text.lower() for kw in ("not supported", "unavailable", "does not exist", "not found")))
+            )
+
+            if is_model_unavailable:
                 last_error_resp = JSONResponse(
                     status_code=response.status_code,
                     content={"error": {"message": raw_err_text or f"Upstream HTTP {response.status_code}", "type": "upstream_server_error", "code": response.status_code}}
@@ -2595,6 +3589,20 @@ async def responses_endpoint(raw_request: Request):
                     except Exception:
                         pass
                     session = None
+
+                # Fast fallback: if primary endpoint returned 5xx/unavailable, try alternative endpoint immediately!
+                if not tried_fallback and fallback_url:
+                    tried_fallback = True
+                    log.warning("Upstream HTTP %s for '%s' on %s. Immediately switching to fallback endpoint %s...", response.status_code, model_name, active_url, fallback_url)
+                    active_url = fallback_url
+                    active_payload = fallback_payload
+                    active_proto = fallback_proto
+                    continue
+
+                if attempt >= MAX_RETRIES_ON_5XX:
+                    log.warning("Exhausted %s 5xx/unavailable retries for '%s'. Failing fast.", MAX_RETRIES_ON_5XX, model_name)
+                    break
+
                 delay = compute_backoff_delay(attempt, INITIAL_BACKOFF)
                 log.warning("Upstream HTTP %s for '%s'; retrying without egress rotation in %.2fs.", response.status_code, model_name, delay)
                 await asyncio.sleep(delay)
@@ -2607,7 +3615,6 @@ async def responses_endpoint(raw_request: Request):
                     except Exception:
                         pass
                     session = None
-                raw_err_text = extract_response_body(response)
                 log.warning("Upstream returned HTTP %s for '%s': %s", response.status_code, model_name, raw_err_text[:500])
                 if req_entry:
                     req_entry["status_code"] = response.status_code
@@ -2628,16 +3635,26 @@ async def responses_endpoint(raw_request: Request):
             if is_stream:
                 _sess = session
                 session = None
-                return StreamingResponse(
-                    stream_response(response, model_name, session=_sess, protocol="responses"),
-                    media_type="text/event-stream",
-                    headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
-                )
+                if active_proto == "responses":
+                    return StreamingResponse(
+                        stream_response(response, model_name, session=_sess, protocol="responses"),
+                        media_type="text/event-stream",
+                        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+                    )
+                else:
+                    return StreamingResponse(
+                        stream_chat_to_responses(response, model_name, session=_sess),
+                        media_type="text/event-stream",
+                        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+                    )
             else:
                 with FlowContext():
                     try:
                         res_json = await asyncio.to_thread(response.json)
-                        return JSONResponse(content=res_json)
+                        if active_proto == "responses":
+                            return JSONResponse(content=res_json)
+                        else:
+                            return JSONResponse(content=chat_to_responses_json(res_json, model_name))
                     except Exception:
                         return JSONResponse(content={
                             "id": f"resp-zen-{uuid.uuid4().hex[:12]}",
@@ -2647,7 +3664,7 @@ async def responses_endpoint(raw_request: Request):
                     finally:
                         if session:
                             if pooled:
-                                _release_pooled_session(TARGET_ZEN_RESPONSES_URL, session)
+                                _release_pooled_session(active_url, session)
                             else:
                                 try:
                                     session.close()
@@ -2657,7 +3674,7 @@ async def responses_endpoint(raw_request: Request):
         except Exception as e:
             if session:
                 if pooled:
-                    _release_pooled_session(TARGET_ZEN_RESPONSES_URL, session)
+                    _release_pooled_session(active_url, session)
                 else:
                     try:
                         session.close()
@@ -2670,11 +3687,11 @@ async def responses_endpoint(raw_request: Request):
             continue
 
     if last_error_resp is not None:
-        log.error(f"All {MAX_RETRIES_ON_429} attempts exhausted for Responses model '{model_name}'. Passing through last upstream error response.")
+        log.error(f"All attempts exhausted for Responses model '{model_name}'. Passing through last upstream error response.")
         return last_error_resp
 
     status = 504 if "timeout" in last_error_detail.lower() else 502
-    log.error(f"All {MAX_RETRIES_ON_429} attempts exhausted for Responses model '{model_name}': {last_error_detail}. Returning {status}.")
+    log.error(f"All attempts exhausted for Responses model '{model_name}': {last_error_detail}. Returning {status}.")
     return JSONResponse(
         status_code=status,
         content={"error": {"message": f"Upstream connection failed after {MAX_RETRIES_ON_429} attempts: {last_error_detail or 'Connection failed'}", "type": "upstream_error", "code": status}},
