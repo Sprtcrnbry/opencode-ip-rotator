@@ -943,15 +943,13 @@ app.add_middleware(
 
 class FlowContext:
     def __enter__(self):
-        with rotator.flow_lock:
-            rotator.active_flows_count += 1
-            prom_active_flows.set(rotator.active_flows_count)
+        rotator.flow_acquired()
+        prom_active_flows.set(rotator.active_flows_count)
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
-        with rotator.flow_lock:
-            rotator.active_flows_count = max(0, rotator.active_flows_count - 1)
-            prom_active_flows.set(rotator.active_flows_count)
+        rotator.flow_released()
+        prom_active_flows.set(rotator.active_flows_count)
 
 
 # Opencode CLI fingerprint (exact User-Agent from official OpenCode client).
@@ -1382,21 +1380,21 @@ class EmptyStreamError(Exception):
     pass
 
 async def stream_response(response, model_name: str, session=None, protocol: str = "chat") -> AsyncGenerator[bytes, None]:
-    loop = asyncio.get_event_loop()
-    with rotator.flow_lock:
-        rotator.active_flows_count += 1
-        prom_active_flows.set(rotator.active_flows_count)
-    lease_id = await asyncio.to_thread(acquire_flow_lease)
-
-    async def keep_flow_lease_alive():
-        try:
-            while True:
-                await asyncio.sleep(FLOW_LEASE_HEARTBEAT_SECONDS)
-                await asyncio.to_thread(touch_flow_lease, lease_id)
-        except asyncio.CancelledError:
-            return
-
-    lease_heartbeat = asyncio.create_task(keep_flow_lease_alive())
+    loop = asyncio.get_running_loop()
+    # Acquire DB lease BEFORE counting the flow: if the DB is down and the
+    # acquire raises, we must not leak an incremented counter.
+    try:
+        lease_id = await asyncio.to_thread(acquire_flow_lease)
+    except Exception as e:
+        log.warning("Flow lease acquire failed for '%s': %s — streaming without lease.", model_name, e)
+        lease_id = None
+    rotator.flow_acquired()
+    prom_active_flows.set(rotator.active_flows_count)
+    # Inline lease heartbeat: touched inside the poll loop below. No independent
+    # task — an abandoned generator (client disconnect without aclose) must not
+    # leave a task keeping the DB lease alive forever and blocking rotation.
+    last_lease_touch = time.monotonic()
+    poll_task = None
 
     chunk_count = 0
     seen_done = False
@@ -1419,6 +1417,13 @@ async def stream_response(response, model_name: str, session=None, protocol: str
 
         while True:
             done, _ = await asyncio.wait({poll_task}, timeout=4.0)
+            # Inline lease heartbeat (no independent task to leak on abandon).
+            if lease_id is not None and time.monotonic() - last_lease_touch >= FLOW_LEASE_HEARTBEAT_SECONDS:
+                try:
+                    await asyncio.to_thread(touch_flow_lease, lease_id)
+                except Exception:
+                    pass
+                last_lease_touch = time.monotonic()
             if not done:
                 # Heartbeat; never split a partially buffered SSE frame
                 if pending_frame:
@@ -1492,37 +1497,43 @@ async def stream_response(response, model_name: str, session=None, protocol: str
             yield f"data: {err_json}\n\n".encode("utf-8")
             yield b"data: [DONE]\n\n"
     finally:
-        lease_heartbeat.cancel()
-        await asyncio.gather(lease_heartbeat, return_exceptions=True)
-        await asyncio.to_thread(release_flow_lease, lease_id)
-        with rotator.flow_lock:
-            rotator.active_flows_count = max(0, rotator.active_flows_count - 1)
-            prom_active_flows.set(rotator.active_flows_count)
-        if session:
+        # Order matters: close the session first to unblock the executor thread
+        # stuck in next(iter_lines); cancel the pending poll future; release the
+        # DB lease (never let it skip the counter decrement); always decrement.
+        try:
+            if poll_task is not None and not poll_task.done():
+                poll_task.cancel()
+        except Exception:
+            pass
+        if session is not None:
             try:
                 session.close()
             except Exception:
                 pass
+        if lease_id is not None:
+            try:
+                await asyncio.to_thread(release_flow_lease, lease_id)
+            except Exception as e:
+                log.debug("Flow lease release failed for '%s': %s", model_name, e)
+        try:
+            rotator.flow_released()
+            prom_active_flows.set(rotator.active_flows_count)
+        except Exception:
+            pass
 
 
 async def anthropic_stream_response(response, model_name: str, session=None) -> AsyncGenerator[bytes, None]:
     """Translate upstream OpenAI SSE chunks into Anthropic message stream events."""
-    loop = asyncio.get_event_loop()
-
-    with rotator.flow_lock:
-        rotator.active_flows_count += 1
-        prom_active_flows.set(rotator.active_flows_count)
-    lease_id = await asyncio.to_thread(acquire_flow_lease)
-
-    async def keep_flow_lease_alive():
-        try:
-            while True:
-                await asyncio.sleep(FLOW_LEASE_HEARTBEAT_SECONDS)
-                await asyncio.to_thread(touch_flow_lease, lease_id)
-        except asyncio.CancelledError:
-            return
-
-    lease_heartbeat = asyncio.create_task(keep_flow_lease_alive())
+    loop = asyncio.get_running_loop()
+    try:
+        lease_id = await asyncio.to_thread(acquire_flow_lease)
+    except Exception as e:
+        log.warning("Flow lease acquire failed for '%s': %s — streaming without lease.", model_name, e)
+        lease_id = None
+    rotator.flow_acquired()
+    prom_active_flows.set(rotator.active_flows_count)
+    last_lease_touch = time.monotonic()
+    poll_task = None
 
     def sse(event: dict) -> bytes:
         return f"event: {event['type']}\ndata: {json.dumps(event, separators=(',', ':'))}\n\n".encode()
@@ -1565,6 +1576,12 @@ async def anthropic_stream_response(response, model_name: str, session=None) -> 
 
         while True:
             done, _ = await asyncio.wait({poll_task}, timeout=4.0)
+            if lease_id is not None and time.monotonic() - last_lease_touch >= FLOW_LEASE_HEARTBEAT_SECONDS:
+                try:
+                    await asyncio.to_thread(touch_flow_lease, lease_id)
+                except Exception:
+                    pass
+                last_lease_touch = time.monotonic()
             if not done:
                 yield b": keep-alive\n\n"
                 continue
@@ -1668,17 +1685,26 @@ async def anthropic_stream_response(response, model_name: str, session=None) -> 
         log.error(f"Anthropic stream exception for model '{model_name}': {type(e).__name__}: {e}", exc_info=True)
         yield sse({"type": "error", "error": {"type": "api_error", "message": f"Stream error: {e}"}})
     finally:
-        lease_heartbeat.cancel()
-        await asyncio.gather(lease_heartbeat, return_exceptions=True)
-        await asyncio.to_thread(release_flow_lease, lease_id)
-        with rotator.flow_lock:
-            rotator.active_flows_count = max(0, rotator.active_flows_count - 1)
-            prom_active_flows.set(rotator.active_flows_count)
-        if session:
+        try:
+            if poll_task is not None and not poll_task.done():
+                poll_task.cancel()
+        except Exception:
+            pass
+        if session is not None:
             try:
                 session.close()
             except Exception:
                 pass
+        if lease_id is not None:
+            try:
+                await asyncio.to_thread(release_flow_lease, lease_id)
+            except Exception as e:
+                log.debug("Flow lease release failed for '%s': %s", model_name, e)
+        try:
+            rotator.flow_released()
+            prom_active_flows.set(rotator.active_flows_count)
+        except Exception:
+            pass
 
 @app.get("/dashboard", response_class=HTMLResponse)
 async def dashboard(request: Request):
@@ -1701,6 +1727,30 @@ async def manual_rotate():
         raise HTTPException(status_code=503, detail="WARP rotator did not complete the requested rotation")
     finally:
         signal_rotation_done()
+
+
+@app.post("/api/reset-flows")
+async def reset_flows():
+    """Ops relief: clear a stuck in-memory flow guard plus expired DB leases.
+
+    Safe: only clears the in-memory counter when no live DB leases exist
+    (real streams hold leases via heartbeat); always purges expired leases.
+    Use when /metrics shows active_flows stuck > 0 with no traffic.
+    """
+    before = rotator.active_flows_count
+    try:
+        leases_alive = await asyncio.to_thread(rotator.has_active_flow_leases)
+    except Exception:
+        leases_alive = True  # fail closed — do not reset on DB error
+    reset_to = rotator.reconcile_stale_flows() if not leases_alive else before
+    # reconcile only resets when untouched TTL+grace; force-clear here on explicit ops call
+    if not leases_alive and reset_to > 0:
+        with rotator.flow_lock:
+            rotator.active_flows_count = 0
+            rotator.active_flows_updated_at = time.time()
+        reset_to = 0
+    prom_active_flows.set(reset_to)
+    return {"active_flows_before": before, "active_flows": reset_to, "leases_alive": leases_alive}
 
 @app.get("/metrics")
 async def get_metrics():

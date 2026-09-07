@@ -104,7 +104,64 @@ log = logging.getLogger("rotator")
 
 rotation_lock = threading.Lock()
 active_flows_count = 0
+active_flows_updated_at = 0.0
 flow_lock = threading.Lock()
+
+def flow_acquired() -> int:
+    """Increment in-memory flow guard. Must pair with flow_released()."""
+    global active_flows_count, active_flows_updated_at
+    with flow_lock:
+        active_flows_count += 1
+        active_flows_updated_at = time.time()
+        return active_flows_count
+
+
+def flow_released() -> int:
+    """Decrement in-memory flow guard. Never goes below zero."""
+    global active_flows_count, active_flows_updated_at
+    with flow_lock:
+        active_flows_count = max(0, active_flows_count - 1)
+        active_flows_updated_at = time.time()
+        return active_flows_count
+
+
+def reconcile_stale_flows() -> int:
+    """Self-heal leaked in-memory flow counts.
+
+    Stream generators abandoned on client disconnect may never run their
+    finally block (Starlette does not always aclose on disconnect), leaving
+    active_flows_count stuck > 0 forever and blocking all future rotation.
+    DB leases expire on their own (no heartbeat extends them once the
+    generator is gone), so: if no live DB leases exist and the counter has
+    not been touched for longer than the lease TTL + grace, the counter must
+    be stale — reset it to zero. Returns the (possibly reset) count.
+    """
+    global active_flows_count, active_flows_updated_at
+    try:
+        ttl = float(os.environ.get("FLOW_LEASE_TTL_SECONDS", "90"))
+    except ValueError:
+        ttl = 90.0
+    grace = 30.0
+    with flow_lock:
+        if active_flows_count <= 0:
+            return 0
+        touched_ago = time.time() - active_flows_updated_at
+        if touched_ago < ttl + grace:
+            return active_flows_count
+    # check DB leases outside the lock (does its own sqlite connect)
+    if has_active_flow_leases():
+        return active_flows_count
+    with flow_lock:
+        # re-check age under lock before resetting
+        if active_flows_count > 0 and (time.time() - active_flows_updated_at) >= ttl + grace:
+            log.warning(
+                "Resetting stale active_flows_count=%s (no DB leases, untouched for %.0fs) — leaked by abandoned streams.",
+                active_flows_count, time.time() - active_flows_updated_at,
+            )
+            active_flows_count = 0
+            active_flows_updated_at = time.time()
+        return active_flows_count
+
 _current_ip: Optional[str] = None
 rotation_count = 0
 FLOW_LEASE_DB_PATH = Path(os.environ.get("METRICS_DB_PATH", "/app/data/metrics.db"))
@@ -534,8 +591,10 @@ def get_warp_bin() -> str:
 def rotate_warp(reason: str = "Triggered", force: bool = False) -> bool:
     global _current_ip, rotation_count
     with rotation_lock:
+        # self-heal counters leaked by abandoned stream generators before gating
+        live_flows = reconcile_stale_flows()
         with flow_lock:
-            if not force and (active_flows_count > 0 or has_active_flow_leases()):
+            if not force and (live_flows > 0 or has_active_flow_leases()):
                 log.info("IP rotation skipped — an active streaming flow lease is in progress.")
                 return False
 
