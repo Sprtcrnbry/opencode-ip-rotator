@@ -1794,6 +1794,9 @@ async def stream_responses_to_chat(response, model_name: str, session=None) -> A
                     yield f"data: {data_body}\n\n".encode("utf-8")
                     continue
 
+                if not event_name and isinstance(ev_data, dict):
+                    event_name = ev_data.get("type", "")
+
                 if event_name == "response.created":
                     resp_id = ev_data.get("response", {}).get("id") or resp_id
                     c = {
@@ -1804,9 +1807,14 @@ async def stream_responses_to_chat(response, model_name: str, session=None) -> A
                         "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}]
                     }
                     yield f"data: {json.dumps(c)}\n\n".encode("utf-8")
-                elif event_name in ("response.text.delta", "response.content_part.delta"):
+                elif event_name in ("response.output_text.delta", "response.text.delta", "response.content_part.delta") or (event_name and "text.delta" in event_name):
                     delta_val = ev_data.get("delta")
-                    delta_text = delta_val.get("text", "") if isinstance(delta_val, dict) else (delta_val or "")
+                    if isinstance(delta_val, dict):
+                        delta_text = delta_val.get("text", "")
+                    elif isinstance(delta_val, str):
+                        delta_text = delta_val
+                    else:
+                        delta_text = str(delta_val) if delta_val is not None else ""
                     if delta_text:
                         c = {
                             "id": resp_id,
@@ -1814,6 +1822,18 @@ async def stream_responses_to_chat(response, model_name: str, session=None) -> A
                             "created": created,
                             "model": model_name,
                             "choices": [{"index": 0, "delta": {"content": delta_text}, "finish_reason": None}]
+                        }
+                        yield f"data: {json.dumps(c)}\n\n".encode("utf-8")
+                elif event_name in ("response.reasoning_text.delta", "response.reasoning.delta") or (event_name and "reasoning.delta" in event_name):
+                    delta_val = ev_data.get("delta")
+                    r_text = delta_val.get("text", "") if isinstance(delta_val, dict) else (delta_val or "")
+                    if r_text:
+                        c = {
+                            "id": resp_id,
+                            "object": "chat.completion.chunk",
+                            "created": created,
+                            "model": model_name,
+                            "choices": [{"index": 0, "delta": {"reasoning_content": r_text}, "finish_reason": None}]
                         }
                         yield f"data: {json.dumps(c)}\n\n".encode("utf-8")
                 elif event_name == "response.output_item.added":
@@ -2021,9 +2041,17 @@ async def stream_responses_to_anthropic(response, model_name: str, session=None)
 
                 chunk_count += 1
 
-                if event_name in ("response.text.delta", "response.content_part.delta"):
+                if not event_name and isinstance(ev_data, dict):
+                    event_name = ev_data.get("type", "")
+
+                if event_name in ("response.output_text.delta", "response.text.delta", "response.content_part.delta") or (event_name and "text.delta" in event_name):
                     delta_val = ev_data.get("delta")
-                    text = delta_val.get("text", "") if isinstance(delta_val, dict) else (delta_val or "")
+                    if isinstance(delta_val, dict):
+                        text = delta_val.get("text", "")
+                    elif isinstance(delta_val, str):
+                        text = delta_val
+                    else:
+                        text = str(delta_val) if delta_val is not None else ""
                     if text:
                         if open_block is None or open_block[1] != "text":
                             ev = close_open_block()
@@ -2191,7 +2219,7 @@ async def stream_chat_to_responses(response, model_name: str, session=None) -> A
                     started_msg = True
                     yield f"event: response.output_item.added\ndata: {json.dumps({'output_index': 0, 'item': {'type': 'message', 'role': 'assistant', 'content': []}})}\n\n".encode("utf-8")
                     yield f"event: response.content_part.added\ndata: {json.dumps({'output_index': 0, 'content_index': 0, 'part': {'type': 'text', 'text': ''}})}\n\n".encode("utf-8")
-                yield f"event: response.text.delta\ndata: {json.dumps({'output_index': 0, 'content_index': 0, 'delta': text})}\n\n".encode("utf-8")
+                yield f"event: response.output_text.delta\ndata: {json.dumps({'output_index': 0, 'content_index': 0, 'delta': text})}\n\n".encode("utf-8")
 
             for tc in delta.get("tool_calls") or []:
                 tidx = tc.get("index", 0) + 1  # offset from message item at 0
