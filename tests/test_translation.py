@@ -214,5 +214,50 @@ class TranslationPayloadTests(unittest.TestCase):
         self.assertEqual(resp_json["usage"]["output_tokens"], 14)
 
 
+    def test_normalize_content_for_responses(self):
+        # Plain text list (as emitted by Oh My Pi and other agents)
+        parts = [{"type": "text", "text": "Part 1"}, {"type": "text", "text": "Part 2"}]
+        res = server.normalize_content_for_responses(parts, "user")
+        self.assertEqual(res, "Part 1\n\nPart 2")
+
+        # Multimodal list
+        mm_parts = [
+            {"type": "text", "text": "Describe this:"},
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,123"}}
+        ]
+        res_mm = server.normalize_content_for_responses(mm_parts, "user")
+        self.assertEqual(len(res_mm), 2)
+        self.assertEqual(res_mm[0], {"type": "input_text", "text": "Describe this:"})
+        self.assertEqual(res_mm[1], {"type": "input_image", "image_url": "data:image/png;base64,123"})
+
+    def test_normalize_content_for_chat(self):
+        parts = [
+            {"type": "input_text", "text": "Describe this:"},
+            {"type": "input_image", "image_url": "data:image/png;base64,123"}
+        ]
+        chat_parts = server.normalize_content_for_chat(parts)
+        self.assertEqual(len(chat_parts), 2)
+        self.assertEqual(chat_parts[0], {"type": "text", "text": "Describe this:"})
+        self.assertEqual(chat_parts[1], {"type": "image_url", "image_url": {"url": "data:image/png;base64,123"}})
+
+    def test_chat_to_responses_payload_with_content_array(self):
+        chat_req = {
+            "model": "muse-spark-1.3-contributor-free",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "<system-reminder>...</system-reminder>"},
+                        {"type": "text", "text": "Context replaced..."}
+                    ]
+                }
+            ]
+        }
+        resp_req = server.chat_to_responses_payload(chat_req)
+        self.assertIsInstance(resp_req["input"][0]["content"], str)
+        self.assertIn("<system-reminder>", resp_req["input"][0]["content"])
+        self.assertIn("Context replaced", resp_req["input"][0]["content"])
+
+
 if __name__ == "__main__":
     unittest.main()

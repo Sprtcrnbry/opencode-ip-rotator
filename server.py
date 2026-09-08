@@ -2907,6 +2907,79 @@ def is_responses_model(model_name: str) -> bool:
     return "muse-spark" in norm
 
 
+def normalize_content_for_responses(content, role: str = "user"):
+    """Normalize message content for Responses API:
+    - If None: returns empty string
+    - If str: returns str as-is
+    - If list:
+        - If all parts are text: join them into a single string (100% compatible with Responses API)
+        - If multimodal (images): map text parts to 'input_text' (for user) or 'output_text' (for assistant),
+          and map 'image_url' object {'url': ...} to 'type': 'input_image' with string 'image_url': ...
+    """
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        has_media = any(isinstance(p, dict) and p.get("type") not in ("text", "input_text", "output_text") for p in content)
+        if not has_media:
+            texts = []
+            for p in content:
+                if isinstance(p, str):
+                    texts.append(p)
+                elif isinstance(p, dict):
+                    texts.append(p.get("text") or "")
+                else:
+                    texts.append(str(p))
+            return "\n\n".join(texts)
+        else:
+            parts = []
+            for p in content:
+                if not isinstance(p, dict):
+                    if isinstance(p, str):
+                        target_type = "input_text" if role == "user" else "output_text"
+                        parts.append({"type": target_type, "text": p})
+                    continue
+                ptype = p.get("type")
+                if ptype in ("text", "input_text", "output_text"):
+                    target_type = "input_text" if role == "user" else "output_text"
+                    parts.append({"type": target_type, "text": p.get("text", "")})
+                elif ptype in ("image_url", "input_image"):
+                    img = p.get("image_url") or p.get("image") or p.get("url")
+                    url_str = img.get("url") if isinstance(img, dict) else (img or "")
+                    parts.append({"type": "input_image", "image_url": url_str})
+                else:
+                    parts.append(p)
+            return parts
+    return str(content)
+
+
+def normalize_content_for_chat(content):
+    """Normalize Responses API content for standard OpenAI Chat Completions:
+    - Strings and None are preserved.
+    - Lists: map 'input_text'/'output_text' -> 'text', map 'input_image' with string image_url -> {'type': 'image_url', 'image_url': {'url': ...}}
+    """
+    if content is None or isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for p in content:
+            if not isinstance(p, dict):
+                parts.append({"type": "text", "text": str(p)})
+                continue
+            ptype = p.get("type")
+            if ptype in ("input_text", "output_text", "text"):
+                parts.append({"type": "text", "text": p.get("text", "")})
+            elif ptype in ("input_image", "image_url"):
+                img = p.get("image_url") or p.get("image") or p.get("url")
+                url_str = img if isinstance(img, str) else (img.get("url") if isinstance(img, dict) else "")
+                parts.append({"type": "image_url", "image_url": {"url": url_str}})
+            else:
+                parts.append(p)
+        return parts
+    return str(content)
+
+
 def chat_to_responses_payload(payload: dict) -> dict:
     """Translate an OpenAI Chat Completions payload into OpenAI Responses API payload."""
     out = {
@@ -2942,10 +3015,10 @@ def chat_to_responses_payload(payload: dict) -> dict:
                 if txt:
                     instructions.append(txt)
         elif role == "user":
-            input_items.append({"role": "user", "content": content if content is not None else ""})
+            input_items.append({"role": "user", "content": normalize_content_for_responses(content, "user")})
         elif role == "assistant":
             if content:
-                input_items.append({"role": "assistant", "content": content})
+                input_items.append({"role": "assistant", "content": normalize_content_for_responses(content, "assistant")})
             if tool_calls and isinstance(tool_calls, list):
                 for tc in tool_calls:
                     if not isinstance(tc, dict):
@@ -2960,10 +3033,13 @@ def chat_to_responses_payload(payload: dict) -> dict:
             if not content and not tool_calls:
                 input_items.append({"role": "assistant", "content": ""})
         elif role == "tool":
+            tool_output = content
+            if isinstance(tool_output, list):
+                tool_output = "\n\n".join(p if isinstance(p, str) else (p.get("text") or str(p)) for p in tool_output if isinstance(p, (dict, str)))
             input_items.append({
                 "type": "function_call_output",
                 "call_id": msg.get("tool_call_id") or "",
-                "output": content if content is not None else ""
+                "output": str(tool_output) if tool_output is not None else ""
             })
 
     if instructions:
@@ -3032,7 +3108,7 @@ def responses_to_chat_payload(payload: dict) -> dict:
                 continue
             item_type = item.get("type")
             if "role" in item:
-                messages.append({"role": item["role"], "content": item.get("content", "")})
+                messages.append({"role": item["role"], "content": normalize_content_for_chat(item.get("content", ""))})
             elif item_type == "function_call":
                 tc = {
                     "id": item.get("call_id") or item.get("id") or f"call_{uuid.uuid4().hex[:8]}",
@@ -3507,6 +3583,11 @@ async def responses_endpoint(raw_request: Request):
         body["user"] = "opencode-user"
     if not body.get("safety_identifier"):
         body["safety_identifier"] = body.get("user", "opencode-user")
+
+    if isinstance(body.get("input"), list):
+        for item in body["input"]:
+            if isinstance(item, dict) and "content" in item:
+                item["content"] = normalize_content_for_responses(item["content"], item.get("role", "user"))
 
     headers = build_opencode_headers(raw_request, fresh_session=True)
     last_error_resp: Optional[JSONResponse] = None
