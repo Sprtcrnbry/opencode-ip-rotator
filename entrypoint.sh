@@ -13,6 +13,8 @@ if [ -f /app/data/proxies.txt ] && [ -s /app/data/proxies.txt ]; then
   echo "Proxy pool: $(wc -l < /app/data/proxies.txt 2>/dev/null | tr -d ' ') proxies in /app/data/proxies.txt"
 else
   echo "Proxy pool: none (direct fallback)"
+fi
+
 # Detect and record the host's direct unproxied IP to guard against leaks
 HOST_DIRECT_IP=$(curl -s --max-time 6 https://cloudflare.com/cdn-cgi/trace 2>/dev/null | grep "^ip=" | cut -d= -f2 || true)
 if [ -n "$HOST_DIRECT_IP" ]; then
