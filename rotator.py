@@ -25,12 +25,43 @@ INITIAL_RETRY_DELAY = int(os.environ.get("WARP_RETRY_DELAY", "3"))
 MAX_RETRIES = int(os.environ.get("WARP_MAX_RETRIES", "5"))
 AUTO_RECYCLE_THRESHOLD = int(os.environ.get("AUTO_RECYCLE_THRESHOLD", "50"))
 CUSTOM_OUTBOUND_PROXY = os.environ.get("CUSTOM_OUTBOUND_PROXY", "").strip()
+HOST_DIRECT_IP = os.environ.get("HOST_DIRECT_IP", "").strip()
 WG_DIR = Path("/app/wireguard")
 WG_ACCOUNT = WG_DIR / "wgcf-account.toml"
 WG_PROFILE = WG_DIR / "wgcf-profile.conf"
 WG_QUICK_CONF = Path("/etc/wireguard/wgcf0.conf")
 WIREPROXY_CONFIG = WG_DIR / "wireproxy.conf"
 WIREPROXY_PORT = 41000
+
+# Rotation lifecycle callbacks (registered by server to drain and close sessions)
+_on_rotation_start_callbacks: List[Any] = []
+_on_rotation_end_callbacks: List[Any] = []
+
+def register_rotation_callbacks(on_start=None, on_end=None):
+    if on_start and on_start not in _on_rotation_start_callbacks:
+        _on_rotation_start_callbacks.append(on_start)
+    if on_end and on_end not in _on_rotation_end_callbacks:
+        _on_rotation_end_callbacks.append(on_end)
+
+def _notify_rotation_start():
+    for cb in _on_rotation_start_callbacks:
+        try:
+            cb()
+        except Exception as exc:
+            log.warning("Rotation start callback error: %s", exc)
+
+def _notify_rotation_end(success: bool, new_ip: Optional[str]):
+    for cb in _on_rotation_end_callbacks:
+        try:
+            cb(success, new_ip)
+        except Exception as exc:
+            log.warning("Rotation end callback error: %s", exc)
+
+def _is_external_proxy(proxy: Optional[Dict[str, str]]) -> bool:
+    if not proxy:
+        return False
+    url = proxy.get("http") or proxy.get("https") or ""
+    return not any(h in url for h in ("127.0.0.1:40000", "127.0.0.1:41000", "localhost:40000", "localhost:41000"))
 
 # Proxy Pool Configuration
 PROXY_LIST_FILE = os.environ.get("PROXY_LIST_FILE", "/app/data/proxies.txt")
@@ -190,60 +221,83 @@ def has_active_flow_leases() -> bool:
         log.warning("Unable to inspect active stream leases: %s", exc)
         return False
 
-def get_public_ip() -> Optional[str]:
-    """Fetches current public IP using Cloudflare trace or multi-provider fallbacks."""
+def get_public_ip(proxy: Optional[Dict[str, str]] = None, require_warp: bool = True) -> Optional[str]:
+    """Fetches verified public IP using Cloudflare trace or multi-provider fallbacks.
+    
+    If require_warp is True (default when using WARP/WireGuard), verifies that
+    Cloudflare trace confirms warp=on/plus and that the IP does NOT match
+    the host's direct unproxied IP (HOST_DIRECT_IP).
+    """
+    global HOST_DIRECT_IP
+    if proxy is None:
+        current_proxy = os.environ.get("CUSTOM_OUTBOUND_PROXY", "").strip()
+        if current_proxy:
+            proxy = {"http": current_proxy, "https": current_proxy}
+
     # 1. Cloudflare trace (fastest, native to Cloudflare/WARP)
     for trace_url in ("https://cloudflare.com/cdn-cgi/trace", "https://1.1.1.1/cdn-cgi/trace"):
         try:
             from curl_cffi import requests
-            resp = requests.get(trace_url, impersonate="chrome124", timeout=4)
+            resp = requests.get(trace_url, impersonate="chrome124", timeout=6, proxies=proxy)
             if resp.status_code == 200:
+                is_warp = False
+                ip = None
                 for line in resp.text.splitlines():
                     if line.startswith("ip="):
                         ip = line.split("=", 1)[1].strip()
-                        if ip:
-                            return ip
+                    elif line.startswith("warp="):
+                        val = line.split("=", 1)[1].strip().lower()
+                        if val in ("on", "plus"):
+                            is_warp = True
+
+                # If direct trace returned warp=off and HOST_DIRECT_IP not yet set, record it
+                if ip and not proxy and not is_warp and not HOST_DIRECT_IP:
+                    HOST_DIRECT_IP = ip
+                    os.environ["HOST_DIRECT_IP"] = ip
+                    log.info("Recorded host real IP: %s (will guard against leaking this IP)", HOST_DIRECT_IP)
+
+                # Check for direct host IP leak
+                if ip and HOST_DIRECT_IP and ip == HOST_DIRECT_IP:
+                    log.warning("Detected host real IP (%s) on egress check — rejecting leaked IP.", ip)
+                    continue
+
+                if ip:
+                    if not require_warp or is_warp or _is_external_proxy(proxy):
+                        return ip
+                    log.warning("Cloudflare trace returned warp=off (IP: %s) — rejecting unverified egress.", ip)
+                    continue
         except Exception:
             pass
 
-    # 2. ipify JSON fallback
-    try:
-        from curl_cffi import requests
-        resp = requests.get("https://api.ipify.org?format=json", impersonate="chrome124", timeout=4)
-        if resp.status_code == 200:
-            return resp.json().get("ip")
-    except Exception:
-        pass
-
-    # 3. icanhazip / ifconfig.me fallbacks
-    for fallback_url in ("https://icanhazip.com", "https://ifconfig.me/ip"):
+    # 2. Fallbacks (only if not strictly requiring WARP, e.g. when custom proxies are used)
+    if not require_warp or _is_external_proxy(proxy):
         try:
             from curl_cffi import requests
-            resp = requests.get(fallback_url, impersonate="chrome124", timeout=4)
-            if resp.status_code == 200 and resp.text.strip():
-                return resp.text.strip()
-        except Exception:
-            pass
-
-    return None
-
-
-def get_public_ip_via_proxy(proxy: Dict[str, str]) -> Optional[str]:
-    """Fetches current public IP using a specific proxy."""
-    try:
-        from curl_cffi import requests
-        resp = requests.get("https://api.ipify.org?format=json", impersonate="chrome124", timeout=10, proxies=proxy)
-        if resp.status_code == 200:
-            return resp.json().get("ip")
-    except Exception:
-        try:
-            from curl_cffi import requests
-            resp = requests.get("https://ifconfig.me/ip", impersonate="chrome124", timeout=10, proxies=proxy)
+            resp = requests.get("https://api.ipify.org?format=json", impersonate="chrome124", timeout=6, proxies=proxy)
             if resp.status_code == 200:
-                return resp.text.strip()
+                ip = resp.json().get("ip")
+                if ip and (not HOST_DIRECT_IP or ip != HOST_DIRECT_IP):
+                    return ip
         except Exception:
-            return None
+            pass
+
+        for fallback_url in ("https://icanhazip.com", "https://ifconfig.me/ip"):
+            try:
+                from curl_cffi import requests
+                resp = requests.get(fallback_url, impersonate="chrome124", timeout=6, proxies=proxy)
+                if resp.status_code == 200 and resp.text.strip():
+                    ip = resp.text.strip()
+                    if ip and (not HOST_DIRECT_IP or ip != HOST_DIRECT_IP):
+                        return ip
+            except Exception:
+                pass
+
     return None
+
+
+def get_public_ip_via_proxy(proxy: Dict[str, str], require_warp: bool = True) -> Optional[str]:
+    """Fetches current public IP using a specific proxy."""
+    return get_public_ip(proxy=proxy, require_warp=require_warp)
 
 
 ip_history: List[Dict[str, Any]] = []
@@ -314,13 +368,15 @@ def _bring_up_wireguard_tunnel() -> bool:
     except Exception as e:
         log.warning("wg-quick up error: %s", e)
         return False
-    # verify egress via tunnel (no proxy)
+    # verify egress via tunnel (no proxy, must confirm warp=on and not host direct IP)
     for _ in range(3):
         time.sleep(2)
-        ip = get_public_ip()
-        if ip:
+        ip = get_public_ip(require_warp=True)
+        if ip and (not HOST_DIRECT_IP or ip != HOST_DIRECT_IP):
             return True
-    return _is_wireguard_tunnel_active()
+    log.warning("WireGuard tunnel interface up but failed WARP egress verification — tearing down")
+    _teardown_wireguard_backends()
+    return False
 
 
 def _bring_up_wireproxy() -> bool:
@@ -342,13 +398,15 @@ def _bring_up_wireproxy() -> bool:
         return False
     time.sleep(3)
     proxy = {"http": f"socks5://127.0.0.1:{WIREPROXY_PORT}", "https": f"socks5://127.0.0.1:{WIREPROXY_PORT}"}
-    ip = get_public_ip_via_proxy(proxy)
-    if ip:
+    ip = get_public_ip_via_proxy(proxy, require_warp=True)
+    if ip and (not HOST_DIRECT_IP or ip != HOST_DIRECT_IP):
         env_url = f"socks5://127.0.0.1:{WIREPROXY_PORT}"
         os.environ["CUSTOM_OUTBOUND_PROXY"] = env_url
         # keep module-level var in sync for any stale check
         globals()["CUSTOM_OUTBOUND_PROXY"] = env_url
         return True
+    log.warning("wireproxy started but failed WARP egress verification — killing")
+    subprocess.run(["pkill", "-f", "wireproxy"], capture_output=True, timeout=5, check=False)
     return False
 
 
@@ -405,14 +463,23 @@ def _rotate_wireguard_account(old_ip: Optional[str]) -> bool:
     # burning a new device registration.
     if WG_PROFILE.exists():
         was_tunnel = _is_wireguard_tunnel_active()
-        was_proxy = _is_wireproxy_active()
+        was_proxy = _is_wireproxy_active() or (str(WIREPROXY_PORT) in os.environ.get("CUSTOM_OUTBOUND_PROXY", ""))
         _teardown_wireguard_backends()
-        # Prefer the backend that was active before; otherwise prefer tunnel when capable.
-        prefer_tunnel = _wireguard_tunnel_capable() and (was_tunnel or not was_proxy)
-        if prefer_tunnel:
+        # Prefer the backend that was active before; otherwise prefer wireproxy when capable.
+        if was_proxy or not _wireguard_tunnel_capable():
+            if shutil.which("wireproxy"):
+                if _bring_up_wireproxy():
+                    proxy = {"http": f"socks5://127.0.0.1:{WIREPROXY_PORT}", "https": f"socks5://127.0.0.1:{WIREPROXY_PORT}"}
+                    new_ip = get_public_ip_via_proxy(proxy, require_warp=True)
+                    if new_ip and new_ip != old_ip and (not HOST_DIRECT_IP or new_ip != HOST_DIRECT_IP):
+                        _record_wireguard_success(new_ip, "WireGuard SOCKS5 restart")
+                        return True
+                    log.info("WireGuard light SOCKS5 restart kept IP %s — will re-register", new_ip)
+                    _teardown_wireguard_backends()
+        elif _wireguard_tunnel_capable():
             if _bring_up_wireguard_tunnel():
-                new_ip = get_public_ip()
-                if new_ip and new_ip != old_ip:
+                new_ip = get_public_ip(require_warp=True)
+                if new_ip and new_ip != old_ip and (not HOST_DIRECT_IP or new_ip != HOST_DIRECT_IP):
                     os.environ.pop("CUSTOM_OUTBOUND_PROXY", None)
                     try:
                         globals()["CUSTOM_OUTBOUND_PROXY"] = ""
@@ -421,15 +488,6 @@ def _rotate_wireguard_account(old_ip: Optional[str]) -> bool:
                     _record_wireguard_success(new_ip, "WireGuard tunnel restart")
                     return True
                 log.info("WireGuard light tunnel restart kept IP %s — will re-register", new_ip)
-                _teardown_wireguard_backends()
-        if shutil.which("wireproxy"):
-            if _bring_up_wireproxy():
-                proxy = {"http": f"socks5://127.0.0.1:{WIREPROXY_PORT}", "https": f"socks5://127.0.0.1:{WIREPROXY_PORT}"}
-                new_ip = get_public_ip_via_proxy(proxy)
-                if new_ip and new_ip != old_ip:
-                    _record_wireguard_success(new_ip, "WireGuard SOCKS5 restart")
-                    return True
-                log.info("WireGuard light SOCKS5 restart kept IP %s — will re-register", new_ip)
                 _teardown_wireguard_backends()
         # light restart didn't change IP — fall through to re-register
         log.info("WireGuard light restart did not change IP — re-registering WARP account...")
@@ -482,13 +540,12 @@ def _rotate_wireguard_account(old_ip: Optional[str]) -> bool:
             pass
         return False
 
-    # Prefer real tunnel (kernel or wireguard-go) when TUN is available; else SOCKS5.
-    tried_tunnel = False
-    if _wireguard_tunnel_capable():
-        tried_tunnel = True
+    # Prefer wireproxy if wireproxy was previously active or if tunnel was not capable.
+    prefer_proxy = was_proxy or not _wireguard_tunnel_capable()
+    if not prefer_proxy and _wireguard_tunnel_capable():
         if _bring_up_wireguard_tunnel():
-            new_ip = get_public_ip()
-            if new_ip and new_ip != old_ip:
+            new_ip = get_public_ip(require_warp=True)
+            if new_ip and new_ip != old_ip and (not HOST_DIRECT_IP or new_ip != HOST_DIRECT_IP):
                 os.environ.pop("CUSTOM_OUTBOUND_PROXY", None)
                 try:
                     globals()["CUSTOM_OUTBOUND_PROXY"] = ""
@@ -496,7 +553,7 @@ def _rotate_wireguard_account(old_ip: Optional[str]) -> bool:
                     pass
                 _record_wireguard_success(new_ip, "WireGuard tunnel rotation")
                 return True
-            log.warning("WireGuard tunnel came up but IP did not change (old=%s new=%s) — falling through to SOCKS5", old_ip, new_ip)
+            log.warning("WireGuard tunnel came up but failed WARP verification (old=%s new=%s) — falling through to SOCKS5", old_ip, new_ip)
             _teardown_wireguard_backends()
         else:
             log.warning("WireGuard tunnel bring-up failed — trying SOCKS5 fallback")
@@ -504,15 +561,13 @@ def _rotate_wireguard_account(old_ip: Optional[str]) -> bool:
     if shutil.which("wireproxy"):
         if _bring_up_wireproxy():
             proxy = {"http": f"socks5://127.0.0.1:{WIREPROXY_PORT}", "https": f"socks5://127.0.0.1:{WIREPROXY_PORT}"}
-            new_ip = get_public_ip_via_proxy(proxy)
-            if new_ip and new_ip != old_ip:
+            new_ip = get_public_ip_via_proxy(proxy, require_warp=True)
+            if new_ip and new_ip != old_ip and (not HOST_DIRECT_IP or new_ip != HOST_DIRECT_IP):
                 _record_wireguard_success(new_ip, "WireGuard SOCKS5 rotation")
                 return True
             log.warning("WireGuard SOCKS5 brought up but IP did not change (old=%s new=%s)", old_ip, new_ip)
         else:
             log.warning("WireGuard SOCKS5 bring-up failed")
-    elif tried_tunnel:
-        log.warning("wireproxy not installed, and tunnel rotation did not yield a new IP")
 
     return False
 
@@ -520,7 +575,7 @@ def _rotate_wireguard_account(old_ip: Optional[str]) -> bool:
 def restart_wireguard_proxy() -> bool:
     """Back-compat shim — now re-registers the WARP account so the IP actually rotates.
     Kept for any external caller that still imports it."""
-    old_ip = _current_ip or get_public_ip()
+    old_ip = _current_ip or get_public_ip(require_warp=False)
     return _rotate_wireguard_account(old_ip)
 
 _ip_location_cache: Dict[str, Dict[str, str]] = {}
@@ -598,175 +653,196 @@ def rotate_warp(reason: str = "Triggered", force: bool = False) -> bool:
                 log.info("IP rotation skipped — an active streaming flow lease is in progress.")
                 return False
 
-            old_ip = _current_ip or get_public_ip()
-            log.info(f"Initiating guaranteed IP rotation... (Reason: {reason} | Current IP: {old_ip})")
+            _notify_rotation_start()
+            success = False
+            try:
+                old_ip = _current_ip or get_public_ip(require_warp=False)
+                log.info(f"Initiating guaranteed IP rotation... (Reason: {reason} | Current IP: {old_ip})")
 
-            # Try local WARP CLI rotation first
-            warp_bin = get_warp_bin()
-            warp_available = shutil.which(warp_bin) or os.path.exists(warp_bin)
-            # Check daemon actually answering — avoids 4× delete/new loops when warp-svc dead
-            daemon_ok = False
-            daemon_proxy_mode = False
-            if warp_available:
-                try:
-                    st = subprocess.run([warp_bin, "status"], capture_output=True, text=True, timeout=8, check=False)
-                    out = (st.stdout + st.stderr).lower()
-                    if "unable to connect to cloudflarewarp daemon" in out:
-                        log.warning("WARP daemon not answering — skipping WARP rotation, using proxy fallback.")
-                        warp_available = False
-                    else:
-                        daemon_ok = True
-                        daemon_proxy_mode = "proxy" in out
-                        if st.returncode != 0 and "no registration" in out:
-                            log.warning("WARP status: no registration — will recreate on next attempt.")
-                except Exception as e:
-                    log.warning(f"WARP status check failed: {e} — skipping WARP rotation.")
-                    warp_available = False
-            if warp_available and daemon_ok:
-                max_attempts = 4
-                for attempt in range(1, max_attempts + 1):
+                # If WireGuard / wireproxy is active, rotate WireGuard directly without touching warp-cli
+                wireproxy_active = _is_wireproxy_active() or (
+                    str(WIREPROXY_PORT) in os.environ.get("CUSTOM_OUTBOUND_PROXY", "")
+                )
+                if wireproxy_active:
+                    log.info("WireGuard wireproxy active — rotating WireGuard account directly.")
+                    if _rotate_wireguard_account(old_ip):
+                        success = True
+                        return True
+                    log.warning("Direct WireGuard rotation did not change IP; attempting other rotation fallbacks.")
+
+                # Try local WARP CLI rotation first (only if WireGuard is not the active proxy)
+                warp_bin = get_warp_bin()
+                warp_available = (shutil.which(warp_bin) or os.path.exists(warp_bin)) and not wireproxy_active
+                # Check daemon actually answering — avoids 4× delete/new loops when warp-svc dead
+                daemon_ok = False
+                daemon_proxy_mode = False
+                if warp_available:
                     try:
-                        log.info(f"WARP rotation attempt {attempt}/{max_attempts}... (proxy_mode={daemon_proxy_mode})")
-                        # Light reconnect first; only cycle registration if IP doesn't change or daemon says missing
-                        r1 = subprocess.run([warp_bin, "--accept-tos", "disconnect"], capture_output=True, text=True, timeout=10, check=False)
-                        if r1.returncode != 0:
-                            log.debug(f"disconnect stderr: {r1.stderr.strip()[:200]}")
-                        time.sleep(1)
-
-                        # In proxy mode disconnect+connect is enough; skip delete/new unless forced
-                        need_new_reg = False
-                        if not daemon_proxy_mode and attempt > 1:
-                            need_new_reg = True
-                        # Check if last connect complained about registration
-                        if need_new_reg:
-                            d = subprocess.run([warp_bin, "--accept-tos", "registration", "delete"], capture_output=True, text=True, timeout=10, check=False)
-                            log.debug(f"registration delete: rc={d.returncode} {d.stderr.strip()[:150]}")
-                            time.sleep(1)
-                            n = subprocess.run([warp_bin, "--accept-tos", "registration", "new"], capture_output=True, text=True, timeout=12, check=False)
-                            log.debug(f"registration new: rc={n.returncode} {n.stdout.strip()[:150]} {n.stderr.strip()[:150]}")
-                            if n.returncode != 0 and "already registered" not in (n.stdout + n.stderr).lower():
-                                log.warning(f"registration new failed: {n.stderr.strip()[:200]}")
-                            time.sleep(1)
-
-                        res = subprocess.run([warp_bin, "--accept-tos", "connect"], capture_output=True, text=True, timeout=12, check=False)
-                        if res.returncode != 0:
-                            log.warning(f"warp connect rc={res.returncode}: {res.stderr.strip()[:200]} {res.stdout.strip()[:200]}")
-                            # If registration missing, force recreate next loop
-                            if "registration" in (res.stdout + res.stderr).lower():
-                                daemon_proxy_mode = False
-                                continue
-
-                        time.sleep(3)
-                        # Refresh daemon mode flag after connect
-                        try:
-                            st2 = subprocess.run([warp_bin, "status"], capture_output=True, text=True, timeout=8, check=False)
-                            if "connected" not in st2.stdout.lower() and "connected" not in st2.stderr.lower():
-                                log.warning(f"warp status after connect not Connected: {st2.stdout.strip()[:200]}")
-                                # still check IP — some versions report Connecting but IP already rotated
-                        except Exception:
-                            pass
-                        new_ip = get_public_ip()
-
-                        if new_ip and new_ip != old_ip:
-                            _current_ip = new_ip
-                            rotation_count += 1
-                            loc = get_ip_location(new_ip)
-
-                            timestamp_str = time.strftime("%H:%M:%S", time.localtime())
-                            ip_history.append({
-                                "ip": new_ip,
-                                "country": loc.get("country", "Unknown"),
-                                "flag": loc.get("flag", "🌐"),
-                                "timestamp": timestamp_str,
-                                "reason": reason
-                            })
-                            if len(ip_history) > 20:
-                                ip_history.pop(0)
-
-                            try:
-                                db_path = Path(os.environ.get("METRICS_DB_PATH", "/app/data/metrics.db"))
-                                if db_path.exists():
-                                    conn = sqlite3.connect(str(db_path))
-                                    cursor = conn.cursor()
-                                    cursor.execute(
-                                        "INSERT INTO ip_history (ip, country, flag, timestamp, reason) VALUES (?, ?, ?, ?, ?)",
-                                        (new_ip, loc.get("country", "Unknown"), loc.get("flag", "🌐"), timestamp_str, reason)
-                                    )
-                                    conn.commit()
-                                    conn.close()
-                            except Exception as err:
-                                log.error(f"Failed to write IP rotation to SQLite DB: {err}")
-
-                            log.info(f"Guaranteed WARP IP rotation successful! New Verified IP: {new_ip} {loc.get('flag')} ({loc.get('country')}) (Total Rotations: {rotation_count})")
-
-                            if rotation_count >= AUTO_RECYCLE_THRESHOLD:
-                                log.warning(f"Auto-recycle threshold reached ({rotation_count}/{AUTO_RECYCLE_THRESHOLD}). Triggering container refresh...")
-                                trigger_container_recycle()
-
-                            return True
+                        st = subprocess.run([warp_bin, "status"], capture_output=True, text=True, timeout=8, check=False)
+                        out = (st.stdout + st.stderr).lower()
+                        if "unable to connect to cloudflarewarp daemon" in out:
+                            log.warning("WARP daemon not answering — skipping WARP rotation, using proxy fallback.")
+                            warp_available = False
                         else:
-                            log.warning(f"Attempt {attempt}: Assigned IP ({new_ip}) was identical to old IP ({old_ip}). Retrying fresh registration...")
-                            daemon_proxy_mode = False  # force registration cycle next attempt
-                    except FileNotFoundError:
-                        log.error(f"Cloudflare WARP CLI ('{warp_bin}') was not found. Please install Cloudflare WARP and add warp-cli to PATH.")
-                        break
+                            daemon_ok = True
+                            daemon_proxy_mode = "proxy" in out
+                            if st.returncode != 0 and "no registration" in out:
+                                log.warning("WARP status: no registration — will recreate on next attempt.")
                     except Exception as e:
-                        log.error(f"Error during WARP rotation attempt {attempt}: {e}")
-                        time.sleep(1)
-            else:
-                if not warp_available:
-                    log.warning("WARP CLI/daemon not available — skipping to proxy fallback.")
-                else:
-                    log.warning("WARP daemon not ready — skipping to proxy fallback.")
-            # Userspace WireGuard fallback: re-register via wgcf and bring up tunnel or SOCKS5.
-            # _rotate_wireguard_account already verifies the IP changed and records history.
-            if _rotate_wireguard_account(old_ip):
-                return True
-            # Try remote rotator service as fallback
-            rotator_endpoints = ["http://warp-rotator:8001/rotate", "http://127.0.0.1:8001/rotate"]
-            for endpoint in rotator_endpoints:
-                try:
-                    req = Request(endpoint, data=b"", headers={"User-Agent": "rotator-fallback"}, method="POST")
-                    with urlopen(req, timeout=35) as resp:
-                        if resp.status == 200:
-                            res_data = json.loads(resp.read().decode("utf-8"))
-                            if res_data.get("status") == "success":
-                                _current_ip = res_data.get("verified_ip", _current_ip)
-                                log.info(f"Rotation via remote rotator service ({endpoint}) successful. Verified IP: {_current_ip}")
+                        log.warning(f"WARP status check failed: {e} — skipping WARP rotation.")
+                        warp_available = False
+                if warp_available and daemon_ok:
+                    max_attempts = 4
+                    for attempt in range(1, max_attempts + 1):
+                        try:
+                            log.info(f"WARP rotation attempt {attempt}/{max_attempts}... (proxy_mode={daemon_proxy_mode})")
+                            # Light reconnect first; only cycle registration if IP doesn't change or daemon says missing
+                            r1 = subprocess.run([warp_bin, "--accept-tos", "disconnect"], capture_output=True, text=True, timeout=10, check=False)
+                            if r1.returncode != 0:
+                                log.debug(f"disconnect stderr: {r1.stderr.strip()[:200]}")
+                            time.sleep(1)
+
+                            # In proxy mode disconnect+connect is enough; skip delete/new unless forced
+                            need_new_reg = False
+                            if not daemon_proxy_mode and attempt > 1:
+                                need_new_reg = True
+                            # Check if last connect complained about registration
+                            if need_new_reg:
+                                d = subprocess.run([warp_bin, "--accept-tos", "registration", "delete"], capture_output=True, text=True, timeout=10, check=False)
+                                log.debug(f"registration delete: rc={d.returncode} {d.stderr.strip()[:150]}")
+                                time.sleep(1)
+                                n = subprocess.run([warp_bin, "--accept-tos", "registration", "new"], capture_output=True, text=True, timeout=12, check=False)
+                                log.debug(f"registration new: rc={n.returncode} {n.stdout.strip()[:150]} {n.stderr.strip()[:150]}")
+                                if n.returncode != 0 and "already registered" not in (n.stdout + n.stderr).lower():
+                                    log.warning(f"registration new failed: {n.stderr.strip()[:200]}")
+                                time.sleep(1)
+
+                            res = subprocess.run([warp_bin, "--accept-tos", "connect"], capture_output=True, text=True, timeout=12, check=False)
+                            if res.returncode != 0:
+                                log.warning(f"warp connect rc={res.returncode}: {res.stderr.strip()[:200]} {res.stdout.strip()[:200]}")
+                                # If registration missing, force recreate next loop
+                                if "registration" in (res.stdout + res.stderr).lower():
+                                    daemon_proxy_mode = False
+                                    continue
+
+                            time.sleep(3)
+                            # Refresh daemon mode flag after connect
+                            try:
+                                st2 = subprocess.run([warp_bin, "status"], capture_output=True, text=True, timeout=8, check=False)
+                                if "connected" not in st2.stdout.lower() and "connected" not in st2.stderr.lower():
+                                    log.warning(f"warp status after connect not Connected: {st2.stdout.strip()[:200]}")
+                            except Exception:
+                                pass
+                            new_ip = get_public_ip(require_warp=True)
+
+                            if new_ip and new_ip != old_ip and (not HOST_DIRECT_IP or new_ip != HOST_DIRECT_IP):
+                                _current_ip = new_ip
+                                rotation_count += 1
+                                loc = get_ip_location(new_ip)
+
+                                timestamp_str = time.strftime("%H:%M:%S", time.localtime())
+                                ip_history.append({
+                                    "ip": new_ip,
+                                    "country": loc.get("country", "Unknown"),
+                                    "flag": loc.get("flag", "🌐"),
+                                    "timestamp": timestamp_str,
+                                    "reason": reason
+                                })
+                                if len(ip_history) > 20:
+                                    ip_history.pop(0)
+
+                                try:
+                                    db_path = Path(os.environ.get("METRICS_DB_PATH", "/app/data/metrics.db"))
+                                    if db_path.exists():
+                                        conn = sqlite3.connect(str(db_path))
+                                        cursor = conn.cursor()
+                                        cursor.execute(
+                                            "INSERT INTO ip_history (ip, country, flag, timestamp, reason) VALUES (?, ?, ?, ?, ?)",
+                                            (new_ip, loc.get("country", "Unknown"), loc.get("flag", "🌐"), timestamp_str, reason)
+                                        )
+                                        conn.commit()
+                                        conn.close()
+                                except Exception as err:
+                                    log.error(f"Failed to write IP rotation to SQLite DB: {err}")
+
+                                log.info(f"Guaranteed WARP IP rotation successful! New Verified IP: {new_ip} {loc.get('flag')} ({loc.get('country')}) (Total Rotations: {rotation_count})")
+
+                                if rotation_count >= AUTO_RECYCLE_THRESHOLD:
+                                    log.warning(f"Auto-recycle threshold reached ({rotation_count}/{AUTO_RECYCLE_THRESHOLD}). Triggering container refresh...")
+                                    trigger_container_recycle()
+
+                                success = True
                                 return True
-                except Exception:
-                    pass
-
-            # Try proxy rotation as final fallback
-            log.warning("WARP and remote rotator unavailable. Attempting proxy rotation...")
-            proxy = get_next_proxy()
-            if proxy:
-                new_ip = get_public_ip_via_proxy(proxy)
-                if new_ip and new_ip != old_ip:
-                    _current_ip = new_ip
-                    rotation_count += 1
-                    loc = get_ip_location(new_ip)
-
-                    timestamp_str = time.strftime("%H:%M:%S", time.localtime())
-                    ip_history.append({
-                        "ip": new_ip,
-                        "country": loc.get("country", "Unknown"),
-                        "flag": loc.get("flag", "🌐"),
-                        "timestamp": timestamp_str,
-                        "reason": f"{reason} (via proxy)"
-                    })
-                    if len(ip_history) > 20:
-                        ip_history.pop(0)
-
-                    log.info(f"Proxy IP rotation successful! New Verified IP: {new_ip} {loc.get('flag')} ({loc.get('country')}) (Total Rotations: {rotation_count})")
-                    return True
+                            else:
+                                log.warning(f"Attempt {attempt}: Assigned IP ({new_ip}) invalid or identical to old IP ({old_ip}). Retrying fresh registration...")
+                                daemon_proxy_mode = False  # force registration cycle next attempt
+                        except FileNotFoundError:
+                            log.error(f"Cloudflare WARP CLI ('{warp_bin}') was not found. Please install Cloudflare WARP and add warp-cli to PATH.")
+                            break
+                        except Exception as e:
+                            log.error(f"Error during WARP rotation attempt {attempt}: {e}")
+                            time.sleep(1)
                 else:
-                    log.warning("Proxy rotation failed to provide a different IP.")
-            else:
-                log.warning("No proxies available for rotation.")
+                    if not warp_available:
+                        log.warning("WARP CLI/daemon not available — skipping to proxy fallback.")
+                    else:
+                        log.warning("WARP daemon not ready — skipping to proxy fallback.")
+                # Userspace WireGuard fallback: re-register via wgcf and bring up tunnel or SOCKS5.
+                # _rotate_wireguard_account already verifies the IP changed and records history.
+                if _rotate_wireguard_account(old_ip):
+                    success = True
+                    return True
+                # Try remote rotator service as fallback
+                rotator_endpoints = ["http://warp-rotator:8001/rotate", "http://127.0.0.1:8001/rotate"]
+                for endpoint in rotator_endpoints:
+                    try:
+                        req = Request(endpoint, data=b"", headers={"User-Agent": "rotator-fallback"}, method="POST")
+                        with urlopen(req, timeout=35) as resp:
+                            if resp.status == 200:
+                                res_data = json.loads(resp.read().decode("utf-8"))
+                                if res_data.get("status") == "success":
+                                    cand_ip = res_data.get("verified_ip")
+                                    if cand_ip and (not HOST_DIRECT_IP or cand_ip != HOST_DIRECT_IP):
+                                        _current_ip = cand_ip
+                                        log.info(f"Rotation via remote rotator service ({endpoint}) successful. Verified IP: {_current_ip}")
+                                        success = True
+                                        return True
+                    except Exception:
+                        pass
 
-            log.error("All IP rotation methods failed (WARP, remote rotator, proxy).")
-            return False
+                # Try proxy rotation as final fallback
+                log.warning("WARP and remote rotator unavailable. Attempting proxy rotation...")
+                proxy = get_next_proxy()
+                if proxy:
+                    new_ip = get_public_ip_via_proxy(proxy, require_warp=False)
+                    if new_ip and new_ip != old_ip and (not HOST_DIRECT_IP or new_ip != HOST_DIRECT_IP):
+                        _current_ip = new_ip
+                        rotation_count += 1
+                        loc = get_ip_location(new_ip)
+
+                        timestamp_str = time.strftime("%H:%M:%S", time.localtime())
+                        ip_history.append({
+                            "ip": new_ip,
+                            "country": loc.get("country", "Unknown"),
+                            "flag": loc.get("flag", "🌐"),
+                            "timestamp": timestamp_str,
+                            "reason": f"{reason} (via proxy)"
+                        })
+                        if len(ip_history) > 20:
+                            ip_history.pop(0)
+
+                        log.info(f"Proxy IP rotation successful! New Verified IP: {new_ip} {loc.get('flag')} ({loc.get('country')}) (Total Rotations: {rotation_count})")
+                        success = True
+                        return True
+                    else:
+                        log.warning("Proxy rotation failed to provide a different IP.")
+                else:
+                    log.warning("No proxies available for rotation.")
+
+                log.error("All IP rotation methods failed (WARP, remote rotator, proxy).")
+                return False
+            finally:
+                _notify_rotation_end(success, _current_ip)
 
 def trigger_container_recycle():
     """Triggers self-destruction/recycle script if inside container."""
@@ -801,36 +877,37 @@ def health_check_loop(endpoint: str, interval: int, initial_delay: int, max_retr
                 _current_ip = new_ip
                 log.info(f"WARP verified public IP updated: {_current_ip}")
 
-        # Auto-reconnect WARP if it was disconnected (e.g. after server shutdown)
-        try:
-            warp_bin = get_warp_bin()
-            if shutil.which(warp_bin) or os.path.exists(warp_bin):
-                status = subprocess.run([warp_bin, "status"], capture_output=True, text=True, timeout=10, check=False)
-                out = status.stdout + status.stderr
-                if "Unable to connect to CloudflareWARP daemon" in out:
-                    log.debug("WARP daemon not answering — health check skip reconnect.")
-                elif "Disconnected" in out:
-                    log.warning("WARP tunnel is disconnected — auto-reconnecting...")
-                    # Version-agnostic registration check: status tells us if missing
-                    if "No registration" in out or "Registration missing" in out or "not registered" in out.lower():
-                        log.warning("No WARP registration found — creating one before reconnect...")
-                        subprocess.run([warp_bin, "--accept-tos", "registration", "new"], capture_output=True, text=True, timeout=15, check=False)
-                        time.sleep(2)
-                    else:
-                        # Double-check via registration show for new CLI
-                        rs = subprocess.run([warp_bin, "--accept-tos", "registration", "show"], capture_output=True, text=True, timeout=8, check=False)
-                        if rs.returncode != 0 and "Device ID" not in rs.stdout:
-                            # Old CLI fallback: try plural, ignore failure
+        # Auto-reconnect WARP if it was disconnected (only if wireproxy/custom proxy is not active)
+        if not _is_wireproxy_active() and not os.environ.get("CUSTOM_OUTBOUND_PROXY"):
+            try:
+                warp_bin = get_warp_bin()
+                if shutil.which(warp_bin) or os.path.exists(warp_bin):
+                    status = subprocess.run([warp_bin, "status"], capture_output=True, text=True, timeout=10, check=False)
+                    out = status.stdout + status.stderr
+                    if "Unable to connect to CloudflareWARP daemon" in out:
+                        log.debug("WARP daemon not answering — health check skip reconnect.")
+                    elif "Disconnected" in out:
+                        log.warning("WARP tunnel is disconnected — auto-reconnecting...")
+                        # Version-agnostic registration check: status tells us if missing
+                        if "No registration" in out or "Registration missing" in out or "not registered" in out.lower():
+                            log.warning("No WARP registration found — creating one before reconnect...")
                             subprocess.run([warp_bin, "--accept-tos", "registration", "new"], capture_output=True, text=True, timeout=15, check=False)
                             time.sleep(2)
-                    subprocess.run([warp_bin, "--accept-tos", "connect"], capture_output=True, text=True, timeout=15, check=False)
-                    time.sleep(3)
-                    new_ip = get_public_ip()
-                    if new_ip:
-                        _current_ip = new_ip
-                        log.info(f"WARP reconnected. Verified IP: {new_ip}")
-        except Exception as e:
-            log.debug(f"WARP auto-reconnect check error: {e}")
+                        else:
+                            # Double-check via registration show for new CLI
+                            rs = subprocess.run([warp_bin, "--accept-tos", "registration", "show"], capture_output=True, text=True, timeout=8, check=False)
+                            if rs.returncode != 0 and "Device ID" not in rs.stdout:
+                                # Old CLI fallback: try plural, ignore failure
+                                subprocess.run([warp_bin, "--accept-tos", "registration", "new"], capture_output=True, text=True, timeout=15, check=False)
+                                time.sleep(2)
+                        subprocess.run([warp_bin, "--accept-tos", "connect"], capture_output=True, text=True, timeout=15, check=False)
+                        time.sleep(3)
+                        new_ip = get_public_ip(require_warp=True)
+                        if new_ip and (not HOST_DIRECT_IP or new_ip != HOST_DIRECT_IP):
+                            _current_ip = new_ip
+                            log.info(f"WARP reconnected. Verified IP: {new_ip}")
+            except Exception as e:
+                log.debug(f"WARP auto-reconnect check error: {e}")
         try:
             req = Request(endpoint, headers={"User-Agent": "WARP-Guard/1.0"}, method="HEAD")
             with urlopen(req, timeout=10) as resp:

@@ -27,13 +27,11 @@ class BuildOpencodeHeadersTests(unittest.TestCase):
         self.assertNotEqual(first["x-opencode-session"], second["x-opencode-session"])
         self.assertNotEqual(first["x-opencode-request"], second["x-opencode-request"])
 
-    def test_loopback_x_real_ip_is_dropped(self):
-        headers = server.build_opencode_headers(FakeRequest({"x-real-ip": " 127.0.0.1 "}))
-        self.assertNotIn("x-real-ip", headers)
-
-    def test_public_x_real_ip_is_forwarded_trimmed(self):
-        headers = server.build_opencode_headers(FakeRequest({"x-real-ip": " 203.0.113.7 "}))
-        self.assertEqual(headers.get("x-real-ip"), "203.0.113.7")
+    def test_client_ip_headers_are_always_dropped(self):
+        for header_name in ("x-real-ip", "x-forwarded-for", "cf-connecting-ip", "true-client-ip", "x-client-ip", "forwarded"):
+            headers = server.build_opencode_headers(FakeRequest({header_name: "203.0.113.7"}))
+            self.assertNotIn(header_name, headers)
+            self.assertNotIn(header_name.lower(), headers)
 
     def test_downstream_opencode_headers_pass_through_and_extraneous_dropped(self):
         hdrs = server.build_opencode_headers(FakeRequest({

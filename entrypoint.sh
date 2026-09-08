@@ -13,7 +13,13 @@ if [ -f /app/data/proxies.txt ] && [ -s /app/data/proxies.txt ]; then
   echo "Proxy pool: $(wc -l < /app/data/proxies.txt 2>/dev/null | tr -d ' ') proxies in /app/data/proxies.txt"
 else
   echo "Proxy pool: none (direct fallback)"
+# Detect and record the host's direct unproxied IP to guard against leaks
+HOST_DIRECT_IP=$(curl -s --max-time 6 https://cloudflare.com/cdn-cgi/trace 2>/dev/null | grep "^ip=" | cut -d= -f2 || true)
+if [ -n "$HOST_DIRECT_IP" ]; then
+  echo "Baseline host direct IP detected: $HOST_DIRECT_IP (leak protection active)"
+  export HOST_DIRECT_IP
 fi
+
 mkdir -p /run/dbus /var/run/dbus 2>/dev/null || true
 if [ ! -e /run/dbus/pid ] && [ ! -e /var/run/dbus/pid ]; then
   if command -v service >/dev/null 2>&1; then
@@ -120,13 +126,15 @@ start_wireguard_tunnel() {
     pkill -f "wireguard-go $WG_IFACE" 2>/dev/null || true
     return 1
   fi
-  local ip
-  ip=$(curl -s --max-time 8 https://cloudflare.com/cdn-cgi/trace 2>/dev/null | grep "^ip=" | cut -d= -f2)
-  if [ -n "$ip" ]; then
-    echo "  WireGuard tunnel ($WG_IFACE) egress OK — IP: $ip"
+  local trace_out ip warp_status
+  trace_out=$(curl -s --max-time 8 https://cloudflare.com/cdn-cgi/trace 2>/dev/null || true)
+  ip=$(echo "$trace_out" | grep "^ip=" | cut -d= -f2)
+  warp_status=$(echo "$trace_out" | grep "^warp=" | cut -d= -f2)
+  if [ -n "$ip" ] && { [ "$warp_status" = "on" ] || [ "$warp_status" = "plus" ]; } && { [ -z "$HOST_DIRECT_IP" ] || [ "$ip" != "$HOST_DIRECT_IP" ]; }; then
+    echo "  WireGuard tunnel ($WG_IFACE) egress OK — IP: $ip (warp=$warp_status)"
     return 0
   fi
-  echo "  WireGuard tunnel egress verification failed — tearing down"
+  echo "  WireGuard tunnel egress verification failed (ip=$ip warp=$warp_status direct=$HOST_DIRECT_IP) — tearing down"
   wg-quick down wgcf0 >/dev/null 2>&1 || true
   pkill -f "wireguard-go $WG_IFACE" 2>/dev/null || true
   return 1
@@ -152,15 +160,17 @@ EOF
   nohup wireproxy -c "$WG_DIR/wireproxy.conf" >/tmp/wireproxy.log 2>&1 &
   sleep 3
   # Verify egress through the tunnel before advertising it.
-  local ip
-  ip=$(curl -s --max-time 8 --proxy "socks5h://127.0.0.1:$WIREPROXY_PORT" https://cloudflare.com/cdn-cgi/trace 2>/dev/null | grep "^ip=" | cut -d= -f2)
-  if [ -n "$ip" ]; then
-    echo "  WireGuard (wgcf/wireproxy) egress OK — IP: $ip"
+  local trace_out ip warp_status
+  trace_out=$(curl -s --max-time 8 --proxy "socks5h://127.0.0.1:$WIREPROXY_PORT" https://cloudflare.com/cdn-cgi/trace 2>/dev/null || true)
+  ip=$(echo "$trace_out" | grep "^ip=" | cut -d= -f2)
+  warp_status=$(echo "$trace_out" | grep "^warp=" | cut -d= -f2)
+  if [ -n "$ip" ] && { [ "$warp_status" = "on" ] || [ "$warp_status" = "plus" ]; } && { [ -z "$HOST_DIRECT_IP" ] || [ "$ip" != "$HOST_DIRECT_IP" ]; }; then
+    echo "  WireGuard (wgcf/wireproxy) egress OK — IP: $ip (warp=$warp_status)"
     export CUSTOM_OUTBOUND_PROXY="socks5://127.0.0.1:$WIREPROXY_PORT"
     echo "CUSTOM_OUTBOUND_PROXY=$CUSTOM_OUTBOUND_PROXY" > /tmp/warp-env
     return 0
   fi
-  echo "  WireGuard SOCKS5 egress verification failed"
+  echo "  WireGuard SOCKS5 egress verification failed (ip=$ip warp=$warp_status direct=$HOST_DIRECT_IP)"
   tail -n 20 /tmp/wireproxy.log 2>/dev/null || true
   return 1
 }
@@ -415,12 +425,15 @@ if warp-cli --accept-tos status 2>&1 | grep -qi "Proxy" && warp-cli --accept-tos
   fi
 fi
 
-# Show verified egress IP (try direct and via proxy)
-EGRESS_IP=$(curl -s --max-time 5 https://cloudflare.com/cdn-cgi/trace 2>/dev/null | grep "^ip=" | cut -d= -f2)
-if [ -z "$EGRESS_IP" ] && [ -n "${CUSTOM_OUTBOUND_PROXY:-}" ]; then
-  EGRESS_IP=$(curl -s --max-time 5 --proxy "$CUSTOM_OUTBOUND_PROXY" https://cloudflare.com/cdn-cgi/trace 2>/dev/null | grep "^ip=" | cut -d= -f2)
+# Show verified egress IP (prefer proxy if configured)
+if [ -n "${CUSTOM_OUTBOUND_PROXY:-}" ]; then
+  TRACE_OUT=$(curl -s --max-time 6 --proxy "$CUSTOM_OUTBOUND_PROXY" https://cloudflare.com/cdn-cgi/trace 2>/dev/null || true)
+else
+  TRACE_OUT=$(curl -s --max-time 6 https://cloudflare.com/cdn-cgi/trace 2>/dev/null || true)
 fi
-echo "Verified egress IP: ${EGRESS_IP:-unknown}"
+EGRESS_IP=$(echo "$TRACE_OUT" | grep "^ip=" | cut -d= -f2)
+EGRESS_WARP=$(echo "$TRACE_OUT" | grep "^warp=" | cut -d= -f2)
+echo "Verified egress IP: ${EGRESS_IP:-unknown} (warp=${EGRESS_WARP:-off})"
 echo "warp-cli status:"
 warp-cli --accept-tos status 2>&1 | head -n 20 || true
 if [ -n "${CUSTOM_OUTBOUND_PROXY:-}" ]; then echo "Using outbound proxy: $CUSTOM_OUTBOUND_PROXY"; fi

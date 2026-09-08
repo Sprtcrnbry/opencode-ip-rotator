@@ -352,28 +352,27 @@ _discovery_stop = threading.Event()
 
 # -----------------------------------------------------------------------------
 # Request Queue (drains during rotation)
-# -----------------------------------------------------------------------------
 _rotation_in_progress = threading.Event()
-_request_drain_event = asyncio.Event()
-_request_drain_event.set()
 
 ROTATION_DRAIN_TIMEOUT = float(os.environ.get("ROTATION_DRAIN_TIMEOUT", "30"))
 
 async def wait_for_rotation_drain():
     if not _rotation_in_progress.is_set():
         return
-    try:
-        await asyncio.wait_for(_request_drain_event.wait(), timeout=ROTATION_DRAIN_TIMEOUT)
-    except asyncio.TimeoutError:
-        log.warning("Rotation drain wait timed out after %.0fs; proceeding anyway.", ROTATION_DRAIN_TIMEOUT)
+    deadline = time.monotonic() + ROTATION_DRAIN_TIMEOUT
+    while _rotation_in_progress.is_set():
+        if time.monotonic() >= deadline:
+            log.warning("Rotation drain wait timed out after %.0fs; proceeding anyway.", ROTATION_DRAIN_TIMEOUT)
+            break
+        await asyncio.sleep(0.1)
 
 def signal_rotation_start():
     _rotation_in_progress.set()
-    _request_drain_event.clear()
+    _close_all_sessions()
 
 def signal_rotation_done():
+    _close_all_sessions()
     _rotation_in_progress.clear()
-    _request_drain_event.set()
 
 # -----------------------------------------------------------------------------
 # Dual-WARP (active/passive tracking)
@@ -889,12 +888,22 @@ async def lifespan(application: FastAPI):
     model_usage_stats = load_metrics_from_db()
     _discovery_stop.clear()
 
-    # Ensure WARP tunnel is connected on startup (shutdown disconnects it).
+    # Register rotator callbacks so background rotations drain requests and close sessions
     try:
-        subprocess.run([rotator.get_warp_bin(), "--accept-tos", "connect"], capture_output=True, timeout=15, check=False)
-        log.info("WARP connect requested on startup")
+        rotator.register_rotation_callbacks(
+            on_start=signal_rotation_start,
+            on_end=lambda success, ip: signal_rotation_done(),
+        )
     except Exception as e:
-        log.warning(f"Could not connect WARP on startup: {e}")
+        log.warning(f"Could not register rotator callbacks: {e}")
+
+    # Ensure WARP tunnel is connected on startup if not using WireGuard / outbound proxy
+    if not rotator._is_wireproxy_active() and not os.environ.get("CUSTOM_OUTBOUND_PROXY"):
+        try:
+            subprocess.run([rotator.get_warp_bin(), "--accept-tos", "connect"], capture_output=True, timeout=15, check=False)
+            log.info("WARP connect requested on startup")
+        except Exception as e:
+            log.warning(f"Could not connect WARP on startup: {e}")
 
     # Initialize in-process WARP rotator background monitor
     try:
@@ -915,11 +924,12 @@ async def lifespan(application: FastAPI):
     _token_writer_stop.set()
     _flush_token_pending()
     _discovery_stop.set()
-    try:
-        subprocess.run([rotator.get_warp_bin(), "--accept-tos", "disconnect"], capture_output=True, timeout=10, check=False)
-        log.info("WARP disconnected on shutdown")
-    except Exception:
-        pass
+    if not rotator._is_wireproxy_active() and not os.environ.get("CUSTOM_OUTBOUND_PROXY"):
+        try:
+            subprocess.run([rotator.get_warp_bin(), "--accept-tos", "disconnect"], capture_output=True, timeout=10, check=False)
+            log.info("WARP disconnected on shutdown")
+        except Exception:
+            pass
 
 app = FastAPI(title="OpenCode Zen v3.0 Ultra Resilient Proxy", lifespan=lifespan)
 
@@ -1076,9 +1086,16 @@ def build_opencode_headers(raw_request: Request, fresh_session: bool = False) ->
     headers["x-opencode-project"] = raw_request.headers.get("x-opencode-project", "/opencode")
     headers["x-opencode-request"] = raw_request.headers.get("x-opencode-request") or f"req_{uuid.uuid4().hex}"
 
-    real_ip = raw_request.headers.get("x-real-ip")
-    if real_ip and not _is_loopback_ip(real_ip):
-        headers["x-real-ip"] = real_ip.strip()
+    # Security/Privacy: Never leak or forward client IP addresses upstream.
+    for ip_header in (
+        "x-real-ip",
+        "x-forwarded-for",
+        "cf-connecting-ip",
+        "true-client-ip",
+        "x-client-ip",
+        "forwarded",
+    ):
+        headers.pop(ip_header, None)
 
     # Pass through only legitimate custom x-opencode-* headers
     for k, v in raw_request.headers.items():
