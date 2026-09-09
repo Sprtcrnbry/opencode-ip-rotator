@@ -15,11 +15,13 @@ Unified Cloudflare WARP IP rotator and OpenAI/Anthropic/Responses proxy for Open
 
 - **Unified single container** — `warp-svc`/`wireguard-go`/`wireproxy` + FastAPI in one image, no IPC, in-memory flow locking.
 - **Resilient egress chain** — `WARP tunnel → WARP proxy (40000) → WireGuard tunnel (wgcf0, kernel or wireguard-go) → WireGuard SOCKS5 (wgcf+wireproxy :41000) → custom proxies → direct` — verified via `cloudflare.com/cdn-cgi/trace`.
+- **Egress leak protection** — Fails closed with HTTP 503 if no verified WARP/WireGuard proxy or tunnel is active, preventing physical host IP exposure.
 - **Zero-latency streaming** — SSE passthrough with lease-guarded rotation, HTTP/2 keep-alive pool (`curl_cffi` `chrome124`).
-- **Dashboard** (`/dashboard`) — IP, location, active flows, rotations, model usage, inspector for recent requests.
+- **Universal API translation & adaptive routing** — Seamless translation across OpenAI Chat Completions (`/v1/chat/completions`), Anthropic Messages (`/v1/messages`), and OpenAI Responses (`/v1/responses`). Automatically routes Responses-only models (e.g. `muse-spark-*`).
+- **Reasoning parameter sanitization** — Automatically maps client `reasoning_effort`, boolean `reasoning`, and Anthropic `thinking` blocks to upstream `struct Reasoning` to prevent HTTP 400 Bad Request errors.
+- **Dashboard (`/dashboard`)** — Live IP, location, active flows, rotations, model usage sorted by top largest first with interactive column sorting, and client request inspector with header/payload preview.
 - **SQLite persistence** — `data/metrics.db` (WAL) stores model usage, `ip_history` (20 in-mem, 100 on disk), warp quality.
 - **Model auto-discovery** — `models.dev` + upstream `/v1/models` enrich every model with context/output/reasoning/tool/attachment metadata; `big-pickle` + `*-free` filtered.
-- **OpenAI / Anthropic / Responses compat** — `/v1/chat/completions`, `/v1/messages`, `/v1/responses`, `/v1/models`.
 - **Custom proxy pool** — `data/proxies.txt` or `PROXY_LIST` env, round-robin, used as last fallback and as outbound proxy for upstream calls.
 - **Safety** — flow-lease + `rotation_lock` prevents stream truncation, `ROTATION_DRAIN_TIMEOUT`, idempotent warp re-registration, Prometheus metrics.
 
@@ -133,7 +135,33 @@ The proxy maps dummy keys (`any`, `test`, `dummy`, etc.) to `Bearer public` and 
 }
 ```
 
-`/v1/messages` is translated to OpenAI internally and uses the same egress chain.
+`/v1/messages` is translated to OpenAI format internally and uses the same resilient egress chain.
+
+### OpenAI Responses provider (`/v1/responses`)
+
+```jsonc
+{
+  "provider": {
+    "opencode-zen-responses": {
+      "npm": "@ai-sdk/openai-compatible",
+      "options": { "baseURL": "http://127.0.0.1:8000/v1/responses", "apiKey": "public" },
+      "name": "OpenCode Responses API"
+    }
+  }
+}
+```
+
+### Protocol & Reasoning Parameter Translation
+
+The proxy automatically bridges differences between AI client SDKs and upstream OpenCode Zen:
+
+- **Adaptive Model Routing**: Models that exist exclusively on OpenCode's Responses API (such as `muse-spark-1.3-contributor-free` and `muse-spark-1.2-contributor-free`) are automatically routed to the upstream Responses API (`/v1/responses`) regardless of whether the client calls `/v1/chat/completions`, `/v1/messages`, or `/v1/responses`.
+- **Reasoning Sanitization**:
+  - Upstream `/v1/responses` expects `reasoning` as a struct/dict (`{"effort": "high"}` or `{}`) and rejects top-level `reasoning_effort` with HTTP 400.
+  - The proxy intercepts `reasoning_effort` strings (`"high"`, `"medium"`, `"low"`), boolean `reasoning: true/false`, and Anthropic `thinking` blocks (`budget_tokens`), converting them into compliant `struct Reasoning` payloads.
+  - When translating from `/responses` to `/chat/completions`, `reasoning.effort` is converted back to `reasoning_effort` string.
+- **Developer Role Support**: `role: "developer"` (o1/o3/gpt-4o standard) is automatically mapped into system `instructions`.
+- **Tool Calling & Multimodal**: Tool calls (`function_call`), tool outputs (`function_call_output`), and image blocks are transparently converted between Chat Completions and Responses API.
 
 ### Custom proxy pool
 
@@ -148,17 +176,17 @@ socks5://proxy2.example.com:1080
 
 Merged file+env, deduped, round-robin. Consumed as `{"http": url, "https": url}` for `curl_cffi`.
 
-### Egress fallback chain
+### Egress fallback chain & leak protection
 
 Container picks the first working egress:
 
-1. **WARP tunnel** `warp-svc` + `warp-cli` `mode warp` (needs TUN + `NET_ADMIN` + working `nft`).
-2. **WARP proxy** `warp-cli` `mode proxy` `127.0.0.1:40000` (same daemon, SOCKS5).
-3. **WireGuard tunnel** `wgcf` profile → `wg-quick` `wgcf0` (kernel if present, else `wireguard-go` userspace, still needs TUN).
-4. **WireGuard SOCKS5** `wgcf` + `wireproxy` `127.0.0.1:41000` (pure userspace, no TUN) — account/profile in `/app/wireguard` (ephemeral layer, survives `restart` but not `down`).
+1. **WARP proxy** `warp-svc` in userspace SOCKS5 mode `127.0.0.1:40000` (pre-configured via `mdm.xml` to avoid kernel nftables panics on minimal VPS kernels).
+2. **WARP tunnel** `warp-svc` + `warp-cli` `mode warp` (when TUN + `NET_ADMIN` + kernel `nft` are available).
+3. **WireGuard SOCKS5** `wgcf` + `wireproxy` `127.0.0.1:41000` (pure userspace, no TUN). Accounts and profiles persist in `/app/data/wireguard` to prevent Cloudflare 429 registration rate limits across restarts.
+4. **WireGuard tunnel** `wgcf` profile → `wg-quick` `wgcf0` (kernel if present, else `wireguard-go` userspace).
 5. **Custom proxies / direct**.
 
-Rotation mirrors the chain. WARP does `disconnect/connect` then `registration delete/new` only when IP didn't change (proxy mode skips delete). WireGuard does light restart with the same profile first, then `wgcf register --accept-tos` + `generate` if still stuck, then tunnel → SOCKS5. All paths verify `cloudflare.com/cdn-cgi/trace` IP changed and record to `ip_history`.
+**Fail-Closed Leak Protection**: If `HOST_DIRECT_IP` is detected and neither a verified WARP proxy nor a WireGuard tunnel is active, the proxy returns `HTTP 503` (`Egress protection active`), preventing physical VPS host IP exposure.
 
 ---
 
@@ -166,16 +194,16 @@ Rotation mirrors the chain. WARP does `disconnect/connect` then `registration de
 
 | Endpoint | Method | Description |
 |---|---:|---|
-| `/v1/chat/completions` | `POST` | OpenAI chat, retries on 429/5xx, rotates IP, SSE streaming. |
-| `/v1/messages` | `POST` | Anthropic compat (translated to OpenAI). |
-| `/v1/responses` | `POST` | Responses API (`/v1/responses`). |
+| `/v1/chat/completions` | `POST` | OpenAI chat, automatic routing for Responses models, retries on 429/5xx, rotates IP, SSE streaming. |
+| `/v1/messages` | `POST` | Anthropic compat with `thinking` translation (translated to OpenAI / Responses). |
+| `/v1/responses` | `POST` | Responses API with reasoning sanitization (`reasoning_effort` → `struct Reasoning`). |
 | `/v1/models` | `GET` | Discovered `big-pickle` + `*-free` models with context/output/flag metadata. |
-| `/dashboard` | `GET` | HTML dashboard. |
-| `/metrics` | `GET` | JSON: `verified_public_ip`, `uptime`, `model_usage`, `ip_history`, `warp_quality`, `recent_requests`. |
+| `/dashboard` | `GET` | Live HTML dashboard with model usage pre-sorted by largest first, interactive column sorting, and request inspector. |
+| `/metrics` | `GET` | JSON metrics with `model_usage` pre-sorted by top consumer models (`total_tokens DESC`), `verified_public_ip`, `uptime`, `ip_history`, `warp_quality`. |
 | `/metrics-prometheus` | `GET` | Prometheus exposition. |
 | `/health` | `GET` | `{"status":"healthy","database":"connected",...}` + `proxy_warp_health` gauge. |
 | `/api/rotate` | `POST` | Manual rotation (lease-guarded). |
-| `/api/recent-requests` | `GET` | Ring buffer (50) of redacted headers + payload summaries. |
+| `/api/recent-requests` | `GET` | Ring buffer (50) of redacted headers + payload summaries with tool call resolution. |
 
 Upstream `429` is preserved with `Retry-After`/`X-Rate-Limit-Reason`; 429 triggers async rotation with 10s cooldown (`ROTATION_429_COOLDOWN_SECONDS`) and `ROTATION_DRAIN_TIMEOUT` (30s) to avoid coroutine pile-up.
 
