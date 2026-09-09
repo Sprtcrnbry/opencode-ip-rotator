@@ -274,7 +274,7 @@ def load_metrics_from_db() -> Dict[str, Dict[str, any]]:
         return {}
     try:
         rows = _db_fetchall(
-            "SELECT model_name, requests, prompt_tokens, completion_tokens, total_tokens, estimated_cost_usd FROM model_usage"
+            "SELECT model_name, requests, prompt_tokens, completion_tokens, total_tokens, estimated_cost_usd FROM model_usage ORDER BY total_tokens DESC, requests DESC"
         )
         stats = {}
         for r in rows:
@@ -2424,7 +2424,17 @@ async def get_metrics():
         "metrics": metrics,
         "active_flows": rotator.active_flows_count,
         "discovered_models": discovered_models,
-        "model_usage": model_usage_stats,
+        "model_usage": dict(
+            sorted(
+                model_usage_stats.items(),
+                key=lambda x: (
+                    x[1].get("total_tokens", 0) if isinstance(x[1], dict) else 0,
+                    x[1].get("requests", 0) if isinstance(x[1], dict) else 0,
+                    x[1].get("estimated_cost_usd", 0) if isinstance(x[1], dict) else 0,
+                ),
+                reverse=True,
+            )
+        ),
         "ip_history": rotator_history,
         "warp_quality": dict(warp_quality_stats),
         "dual_warp": dict(_dual_warp),

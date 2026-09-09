@@ -375,6 +375,26 @@ class TranslationPayloadTests(unittest.TestCase):
         self.assertEqual(msg["content"], "Answer: 42")
         self.assertEqual(msg["reasoning_content"], "Step 1: Analyzed input. Step 2: Computed result.")
 
+    def test_model_usage_sorted_by_total_tokens(self):
+        sample_stats = {
+            "model-small": {"requests": 5, "prompt_tokens": 50, "completion_tokens": 50, "total_tokens": 100, "estimated_cost_usd": 0.001},
+            "model-huge": {"requests": 200, "prompt_tokens": 10000, "completion_tokens": 20000, "total_tokens": 30000, "estimated_cost_usd": 0.5},
+            "model-mid": {"requests": 20, "prompt_tokens": 500, "completion_tokens": 500, "total_tokens": 1000, "estimated_cost_usd": 0.02},
+        }
+        sorted_dict = dict(
+            sorted(
+                sample_stats.items(),
+                key=lambda x: (
+                    x[1].get("total_tokens", 0),
+                    x[1].get("requests", 0),
+                    x[1].get("estimated_cost_usd", 0),
+                ),
+                reverse=True,
+            )
+        )
+        keys = list(sorted_dict.keys())
+        self.assertEqual(keys, ["model-huge", "model-mid", "model-small"])
+
 
 if __name__ == "__main__":
     unittest.main()

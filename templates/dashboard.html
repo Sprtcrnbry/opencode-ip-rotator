@@ -83,7 +83,14 @@
             <div class="overflow-x-auto">
                 <table class="w-full text-left text-xs">
                     <thead class="bg-slate-50/60 text-slate-400 font-medium uppercase border-b border-slate-100 text-[10px] tracking-wider">
-                        <tr><th class="px-5 py-2.5">Model</th><th class="px-5 py-2.5">Requests</th><th class="px-5 py-2.5">Prompt Tokens</th><th class="px-5 py-2.5">Completion Tokens</th><th class="px-5 py-2.5">Total Tokens</th><th class="px-5 py-2.5 text-right">Saved USD</th></tr>
+                        <tr>
+                            <th class="px-5 py-2.5 cursor-pointer hover:text-slate-700 select-none transition-colors" onclick="toggleModelSort('model')" title="Sort by Model Name">Model<span id="sort-model"></span></th>
+                            <th class="px-5 py-2.5 cursor-pointer hover:text-slate-700 select-none transition-colors" onclick="toggleModelSort('requests')" title="Sort by Requests">Requests<span id="sort-requests"></span></th>
+                            <th class="px-5 py-2.5 cursor-pointer hover:text-slate-700 select-none transition-colors" onclick="toggleModelSort('prompt_tokens')" title="Sort by Prompt Tokens">Prompt Tokens<span id="sort-prompt_tokens"></span></th>
+                            <th class="px-5 py-2.5 cursor-pointer hover:text-slate-700 select-none transition-colors" onclick="toggleModelSort('completion_tokens')" title="Sort by Completion Tokens">Completion Tokens<span id="sort-completion_tokens"></span></th>
+                            <th class="px-5 py-2.5 cursor-pointer hover:text-slate-700 select-none transition-colors text-slate-900" onclick="toggleModelSort('total_tokens')" title="Sort by Total Tokens">Total Tokens<span id="sort-total_tokens" class="text-slate-800 font-bold"> ▼</span></th>
+                            <th class="px-5 py-2.5 text-right cursor-pointer hover:text-slate-700 select-none transition-colors" onclick="toggleModelSort('estimated_cost_usd')" title="Sort by Saved USD">Saved USD<span id="sort-estimated_cost_usd"></span></th>
+                        </tr>
                     </thead>
                     <tbody id="usage-table-body" class="divide-y divide-slate-100 font-mono text-slate-700">
                         <tr><td colspan="6" class="px-5 py-6 text-center text-slate-400 italic font-sans text-xs">No active completions logged yet. Send prompts from OpenCode to track live metrics.</td></tr>
@@ -218,8 +225,58 @@
         let currentReqPage = 1;
 
         let cachedDiscoveredModels = [];
+        let modelSortColumn = 'total_tokens';
+        let modelSortAsc = false;
+
+        function sortModelKeys() {
+            cachedModelKeys.sort((a, b) => {
+                const uA = cachedUsageData[a] || {};
+                const uB = cachedUsageData[b] || {};
+                if (modelSortColumn === 'model') {
+                    const valA = a.toLowerCase();
+                    const valB = b.toLowerCase();
+                    return modelSortAsc ? valA.localeCompare(valB) : valB.localeCompare(valA);
+                }
+                const valA = Number(uA[modelSortColumn]) || 0;
+                const valB = Number(uB[modelSortColumn]) || 0;
+                if (valA !== valB) {
+                    return modelSortAsc ? valA - valB : valB - valA;
+                }
+                const tA = Number(uA.total_tokens) || 0;
+                const tB = Number(uB.total_tokens) || 0;
+                if (tA !== tB) return tB - tA;
+                return (Number(uB.requests) || 0) - (Number(uA.requests) || 0);
+            });
+        }
+
+        function toggleModelSort(col) {
+            if (modelSortColumn === col) {
+                modelSortAsc = !modelSortAsc;
+            } else {
+                modelSortColumn = col;
+                modelSortAsc = (col === 'model');
+            }
+            updateSortIndicators();
+            sortModelKeys();
+            currentModelPage = 1;
+            renderModelTable();
+        }
+
+        function updateSortIndicators() {
+            ['model', 'requests', 'prompt_tokens', 'completion_tokens', 'total_tokens', 'estimated_cost_usd'].forEach(col => {
+                const el = document.getElementById(`sort-${col}`);
+                if (!el) return;
+                if (modelSortColumn === col) {
+                    el.innerText = modelSortAsc ? ' ▲' : ' ▼';
+                    el.className = 'text-slate-800 font-bold';
+                } else {
+                    el.innerText = '';
+                }
+            });
+        }
 
         function renderModelTable() {
+            updateSortIndicators();
             const tableBody = document.getElementById('usage-table-body');
             const totalPages = Math.max(1, Math.ceil(cachedModelKeys.length / PAGE_SIZE));
             if (currentModelPage > totalPages) currentModelPage = totalPages;
@@ -466,6 +523,7 @@
 
                 cachedUsageData = data.model_usage || {};
                 cachedModelKeys = Object.keys(cachedUsageData);
+                sortModelKeys();
                 let grandTotalUsd = 0;
                 cachedModelKeys.forEach(m => { grandTotalUsd += (cachedUsageData[m].estimated_cost_usd || 0); });
                 document.getElementById('total-saved').innerText = '$' + grandTotalUsd.toFixed(4);
