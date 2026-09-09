@@ -258,6 +258,123 @@ class TranslationPayloadTests(unittest.TestCase):
         self.assertIn("<system-reminder>", resp_req["input"][0]["content"])
         self.assertIn("Context replaced", resp_req["input"][0]["content"])
 
+    def test_normalize_reasoning_for_responses(self):
+        # 1. reasoning_effort string converts to reasoning dict and removes reasoning_effort
+        p1 = {"reasoning_effort": "high"}
+        res1 = server.normalize_reasoning_for_responses(p1)
+        self.assertNotIn("reasoning_effort", res1)
+        self.assertEqual(res1["reasoning"], {"effort": "high"})
+
+        # 2. boolean reasoning: True -> {}, False -> dropped
+        p2_true = {"reasoning": True}
+        res2_true = server.normalize_reasoning_for_responses(p2_true)
+        self.assertEqual(res2_true["reasoning"], {})
+
+        p2_false = {"reasoning": False}
+        res2_false = server.normalize_reasoning_for_responses(p2_false)
+        self.assertNotIn("reasoning", res2_false)
+
+        # 3. string reasoning converts to struct
+        p3 = {"reasoning": "medium"}
+        res3 = server.normalize_reasoning_for_responses(p3)
+        self.assertEqual(res3["reasoning"], {"effort": "medium"})
+
+        # 4. uppercase effort inside struct is normalized
+        p4 = {"reasoning": {"effort": "HIGH"}}
+        res4 = server.normalize_reasoning_for_responses(p4)
+        self.assertEqual(res4["reasoning"], {"effort": "high"})
+
+        # 5. Anthropic thinking blocks mapped to effort tiers
+        p5_high = {"thinking": {"type": "enabled", "budget_tokens": 16000}}
+        res5_high = server.normalize_reasoning_for_responses(p5_high)
+        self.assertNotIn("thinking", res5_high)
+        self.assertEqual(res5_high["reasoning"], {"effort": "high"})
+
+        p5_med = {"thinking": {"type": "enabled", "budget_tokens": 8000}}
+        res5_med = server.normalize_reasoning_for_responses(p5_med)
+        self.assertEqual(res5_med["reasoning"], {"effort": "medium"})
+
+        p5_low = {"thinking": {"type": "enabled", "budget_tokens": 2000}}
+        res5_low = server.normalize_reasoning_for_responses(p5_low)
+        self.assertEqual(res5_low["reasoning"], {"effort": "low"})
+
+        p5_enabled = {"thinking": {"type": "enabled"}}
+        res5_enabled = server.normalize_reasoning_for_responses(p5_enabled)
+        self.assertEqual(res5_enabled["reasoning"], {})
+
+    def test_normalize_reasoning_for_chat(self):
+        # 1. struct reasoning converted to string reasoning_effort
+        p1 = {"reasoning": {"effort": "high"}}
+        res1 = server.normalize_reasoning_for_chat(p1)
+        self.assertNotIn("reasoning", res1)
+        self.assertEqual(res1["reasoning_effort"], "high")
+
+        # 2. boolean True -> 'medium'
+        p2 = {"reasoning": True}
+        res2 = server.normalize_reasoning_for_chat(p2)
+        self.assertNotIn("reasoning", res2)
+        self.assertEqual(res2["reasoning_effort"], "medium")
+
+        # 3. boolean False -> dropped
+        p3 = {"reasoning": False}
+        res3 = server.normalize_reasoning_for_chat(p3)
+        self.assertNotIn("reasoning", res3)
+        self.assertNotIn("reasoning_effort", res3)
+
+        # 4. Anthropic thinking mapped to reasoning_effort
+        p4 = {"thinking": {"type": "enabled", "budget_tokens": 20000}}
+        res4 = server.normalize_reasoning_for_chat(p4)
+        self.assertNotIn("thinking", res4)
+        self.assertEqual(res4["reasoning_effort"], "high")
+
+    def test_chat_to_responses_payload_reasoning(self):
+        chat_req = {
+            "model": "muse-spark-1.3-contributor-free",
+            "messages": [
+                {"role": "developer", "content": "You are a test assistant."},
+                {"role": "user", "content": "Hello"}
+            ],
+            "reasoning_effort": "high"
+        }
+        resp_req = server.chat_to_responses_payload(chat_req)
+        self.assertNotIn("reasoning_effort", resp_req)
+        self.assertEqual(resp_req["reasoning"], {"effort": "high"})
+        self.assertIn("You are a test assistant.", resp_req["instructions"])
+
+    def test_responses_to_chat_payload_reasoning(self):
+        resp_req = {
+            "model": "nemotron-3-ultra-free",
+            "input": "Solve this equation",
+            "reasoning": {"effort": "high"}
+        }
+        chat_req = server.responses_to_chat_payload(resp_req)
+        self.assertNotIn("reasoning", chat_req)
+        self.assertEqual(chat_req["reasoning_effort"], "high")
+
+    def test_anthropic_to_responses_payload_thinking(self):
+        anthropic_req = {
+            "model": "muse-spark-1.3-contributor-free",
+            "messages": [{"role": "user", "content": "Hi"}],
+            "thinking": {"type": "enabled", "budget_tokens": 8000}
+        }
+        resp_req = server.anthropic_to_responses_payload(anthropic_req)
+        self.assertNotIn("thinking", resp_req)
+        self.assertEqual(resp_req["reasoning"], {"effort": "medium"})
+
+    def test_responses_to_chat_json_reasoning_content(self):
+        resp_json = {
+            "id": "resp_reasoning_1",
+            "model": "muse-spark-1.3-contributor-free",
+            "output": [
+                {"type": "reasoning", "summary": "Step 1: Analyzed input. Step 2: Computed result."},
+                {"type": "message", "role": "assistant", "content": [{"type": "text", "text": "Answer: 42"}]}
+            ]
+        }
+        chat_json = server.responses_to_chat_json(resp_json, "muse-spark-1.3-contributor-free")
+        msg = chat_json["choices"][0]["message"]
+        self.assertEqual(msg["content"], "Answer: 42")
+        self.assertEqual(msg["reasoning_content"], "Step 1: Analyzed input. Step 2: Computed result.")
+
 
 if __name__ == "__main__":
     unittest.main()

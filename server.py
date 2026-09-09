@@ -2527,6 +2527,7 @@ async def chat_completions(raw_request: Request):
     raw_model = payload.get("model", "deepseek-v4-flash-free")
     current_model = normalize_upstream_model_name(raw_model)
     payload["model"] = current_model
+    payload = normalize_reasoning_for_chat(payload)
     payload = optimize_payload_for_upstream(payload)
     is_stream = payload.get("stream", False)
     log.info(f"Received request for model '{current_model}' (raw: '{raw_model}' | Stream: {is_stream} | Has Tools: {'tools' in payload})")
@@ -2826,6 +2827,82 @@ def _blocks_text(content) -> str:
             parts.append(b)
     return "\n".join(p for p in parts if p)
 
+def normalize_reasoning_for_responses(payload: dict) -> dict:
+    """Normalize reasoning parameters for OpenCode Responses API:
+    - Strips top-level 'reasoning_effort' and maps to reasoning: {'effort': ...}.
+    - Converts boolean reasoning (True -> {}, False -> dropped).
+    - Converts string reasoning (e.g. 'high' -> {'effort': 'high'}).
+    - Maps Anthropic 'thinking' blocks if present.
+    - Ensures 'reasoning' is either a valid dict or omitted entirely.
+    """
+    effort = payload.pop("reasoning_effort", None)
+    th = payload.pop("thinking", None)
+    r = payload.get("reasoning")
+
+    if isinstance(r, bool):
+        if r:
+            payload["reasoning"] = {}
+        else:
+            payload.pop("reasoning", None)
+    elif isinstance(r, str):
+        payload["reasoning"] = {"effort": r.strip().lower()}
+    elif isinstance(r, dict):
+        if "effort" in r and isinstance(r["effort"], str):
+            r["effort"] = r["effort"].strip().lower()
+    elif r is not None:
+        payload.pop("reasoning", None)
+
+    if effort is not None and str(effort).strip():
+        eff_str = str(effort).strip().lower()
+        if "reasoning" not in payload or not isinstance(payload["reasoning"], dict):
+            payload["reasoning"] = {"effort": eff_str}
+        else:
+            payload["reasoning"]["effort"] = eff_str
+    elif th and "reasoning" not in payload:
+        if isinstance(th, dict):
+            b = th.get("budget_tokens")
+            if isinstance(b, (int, float)):
+                payload["reasoning"] = {"effort": "high" if b >= 16000 else ("medium" if b >= 4000 else "low")}
+            elif th.get("type") == "enabled":
+                payload["reasoning"] = {}
+        elif isinstance(th, str) and th.strip():
+            payload["reasoning"] = {"effort": th.strip().lower()}
+
+    return payload
+
+
+def normalize_reasoning_for_chat(payload: dict) -> dict:
+    """Normalize reasoning parameters for OpenAI Chat Completions API:
+    - Ensures reasoning_effort is a string if present.
+    - If struct 'reasoning' is present, extracts effort into reasoning_effort and removes 'reasoning'.
+    - If boolean 'reasoning' is True and no effort, sets reasoning_effort = 'medium'.
+    - Maps Anthropic 'thinking' blocks to reasoning_effort if present.
+    """
+    r = payload.pop("reasoning", None)
+    th = payload.pop("thinking", None)
+    effort = payload.get("reasoning_effort")
+
+    if not effort:
+        if isinstance(r, dict) and r.get("effort"):
+            payload["reasoning_effort"] = str(r["effort"]).strip().lower()
+        elif isinstance(r, str) and r.strip():
+            payload["reasoning_effort"] = r.strip().lower()
+        elif r is True:
+            payload["reasoning_effort"] = "medium"
+        elif th:
+            if isinstance(th, dict):
+                b = th.get("budget_tokens")
+                if isinstance(b, (int, float)):
+                    payload["reasoning_effort"] = "high" if b >= 16000 else ("medium" if b >= 4000 else "low")
+                elif th.get("type") == "enabled":
+                    payload["reasoning_effort"] = "medium"
+            elif isinstance(th, str) and th.strip():
+                payload["reasoning_effort"] = th.strip().lower()
+    elif isinstance(effort, str):
+        payload["reasoning_effort"] = effort.strip().lower()
+
+    return payload
+
 
 def anthropic_to_openai(body: dict) -> dict:
     """Translate an Anthropic /v1/messages payload into OpenAI chat/completions format."""
@@ -2837,6 +2914,10 @@ def anthropic_to_openai(body: dict) -> dict:
             out[k] = body[k]
     if body.get("stop_sequences"):
         out["stop"] = body["stop_sequences"]
+
+    if body.get("thinking"):
+        out["thinking"] = body["thinking"]
+    out = normalize_reasoning_for_chat(out)
 
     messages = []
     system_text = _blocks_text(body.get("system"))
@@ -3066,6 +3147,15 @@ def chat_to_responses_payload(payload: dict) -> dict:
     if payload.get("safety_identifier"):
         out["safety_identifier"] = payload["safety_identifier"]
 
+    # Forward reasoning parameters into Responses format
+    if "reasoning_effort" in payload:
+        out["reasoning_effort"] = payload["reasoning_effort"]
+    if "reasoning" in payload:
+        out["reasoning"] = payload["reasoning"]
+    if "thinking" in payload:
+        out["thinking"] = payload["thinking"]
+    out = normalize_reasoning_for_responses(out)
+
     input_items = []
     instructions = []
 
@@ -3075,7 +3165,7 @@ def chat_to_responses_payload(payload: dict) -> dict:
         role = msg.get("role")
         content = msg.get("content")
         tool_calls = msg.get("tool_calls")
-        if role == "system":
+        if role in ("system", "developer"):
             if isinstance(content, str) and content:
                 instructions.append(content)
             elif isinstance(content, list):
@@ -3163,6 +3253,15 @@ def responses_to_chat_payload(payload: dict) -> dict:
     if payload.get("safety_identifier"):
         out["safety_identifier"] = payload["safety_identifier"]
 
+    # Forward reasoning parameters into Chat Completions format
+    if "reasoning_effort" in payload:
+        out["reasoning_effort"] = payload["reasoning_effort"]
+    if "reasoning" in payload:
+        out["reasoning"] = payload["reasoning"]
+    if "thinking" in payload:
+        out["thinking"] = payload["thinking"]
+    out = normalize_reasoning_for_chat(out)
+
     messages = []
     if payload.get("instructions"):
         messages.append({"role": "system", "content": payload["instructions"]})
@@ -3241,6 +3340,7 @@ def responses_to_chat_json(res_json: dict, model_name: str) -> dict:
     resp_id = res_json.get("id") or f"chatcmpl-{uuid.uuid4().hex[:12]}"
     created = res_json.get("created_at") or int(time.time())
     text_content = ""
+    reasoning_content = ""
     tool_calls = []
 
     output = res_json.get("output", [])
@@ -3257,10 +3357,24 @@ def responses_to_chat_json(res_json: dict, model_name: str) -> dict:
                     text_content += content
                 elif isinstance(content, list):
                     for part in content:
-                        if isinstance(part, dict) and part.get("type") == "text":
-                            text_content += part.get("text", "")
+                        if isinstance(part, dict):
+                            ptype = part.get("type")
+                            if ptype in ("text", "output_text"):
+                                text_content += part.get("text", "")
+                            elif ptype in ("reasoning", "reasoning_text", "thought"):
+                                reasoning_content += part.get("text", "") or part.get("reasoning", "")
                         elif isinstance(part, str):
                             text_content += part
+            elif itype in ("reasoning", "thought"):
+                rc = item.get("content") or item.get("summary") or item.get("text")
+                if isinstance(rc, str):
+                    reasoning_content += rc
+                elif isinstance(rc, list):
+                    for part in rc:
+                        if isinstance(part, dict):
+                            reasoning_content += part.get("text", "")
+                        elif isinstance(part, str):
+                            reasoning_content += part
             elif itype == "function_call":
                 tool_calls.append({
                     "id": item.get("call_id") or item.get("id") or f"call_{uuid.uuid4().hex[:8]}",
@@ -3275,6 +3389,8 @@ def responses_to_chat_json(res_json: dict, model_name: str) -> dict:
         "role": "assistant",
         "content": text_content if text_content else (None if tool_calls else "")
     }
+    if reasoning_content:
+        msg["reasoning_content"] = reasoning_content
     if tool_calls:
         msg["tool_calls"] = tool_calls
 
@@ -3650,9 +3766,13 @@ async def responses_endpoint(raw_request: Request):
     except Exception:
         body = {}
 
+    if "messages" in body and "input" not in body:
+        body = chat_to_responses_payload(body)
+
     raw_model = body.get("model", "deepseek-v4-flash-free")
     model_name = normalize_upstream_model_name(raw_model)
     body["model"] = model_name
+    body = normalize_reasoning_for_responses(body)
     body = optimize_payload_for_upstream(body)
     is_stream = body.get("stream", False)
     log.info(f"Received Responses API request for model '{model_name}' (raw: '{raw_model}' | Stream: {is_stream})")
