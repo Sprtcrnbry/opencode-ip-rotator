@@ -1162,7 +1162,7 @@ def summarize_payload_for_log(payload: dict) -> dict:
         if k in ("messages", "input") and isinstance(v, list):
             # OpenAI messages or Responses input
             summary[f"{k}_count"] = len(v)
-            summary[f"{k}_roles"] = [m.get("role") for m in v if isinstance(m, dict)][:10]
+            summary[f"{k}_roles"] = [(m.get("role") or m.get("type")) for m in v if isinstance(m, dict)][:10]
             # alias for dashboard compat
             if k == "input":
                 summary["messages_count"] = summary["input_count"]
