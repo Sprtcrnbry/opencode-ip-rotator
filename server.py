@@ -89,6 +89,16 @@ def load_proxy_list():
     if _proxy_pool:
         log.info(f"Loaded {len(_proxy_pool)} custom proxies into pool.")
 
+# Load persisted warp-env if present
+if Path("/tmp/warp-env").exists():
+    try:
+        for _line in Path("/tmp/warp-env").read_text(encoding="utf-8").splitlines():
+            if "=" in _line and not _line.startswith("#"):
+                _k, _v = _line.split("=", 1)
+                os.environ[_k.strip()] = _v.strip()
+    except Exception:
+        pass
+
 def get_next_outbound_proxy() -> Optional[Dict[str, str]]:
     global _proxy_index
     with _proxy_lock:
@@ -99,6 +109,31 @@ def get_next_outbound_proxy() -> Optional[Dict[str, str]]:
         custom_proxy = os.environ.get("CUSTOM_OUTBOUND_PROXY", "").strip()
         if custom_proxy:
             return {"http": custom_proxy, "https": custom_proxy}
+        # Dynamic check for local WARP SOCKS5 proxy (40000) or wireproxy (41000)
+        if rotator.is_local_proxy_alive(40000):
+            return {"http": "socks5://127.0.0.1:40000", "https": "socks5://127.0.0.1:40000"}
+        if rotator.is_local_proxy_alive(rotator.WIREPROXY_PORT):
+            return {"http": f"socks5://127.0.0.1:{rotator.WIREPROXY_PORT}", "https": f"socks5://127.0.0.1:{rotator.WIREPROXY_PORT}"}
+        return None
+
+def is_egress_safe(proxies: Optional[Dict[str, str]]) -> bool:
+    """Returns True if request has a proxy or an active verified tunnel interface.
+    If HOST_DIRECT_IP is detected and no proxy or tunnel is active, returns False to prevent IP leak.
+    """
+    if proxies:
+        return True
+    host_ip = os.environ.get("HOST_DIRECT_IP", "").strip() or rotator.HOST_DIRECT_IP
+    if not host_ip:
+        return True
+    if rotator._is_wireguard_tunnel_active():
+        return True
+    try:
+        r = subprocess.run(["ip", "link", "show", "dev", "CloudflareWARP"], capture_output=True, text=True, timeout=2, check=False)
+        if r.returncode == 0 and "UP" in r.stdout:
+            return True
+    except Exception:
+        pass
+    return False
 
 # -----------------------------------------------------------------------------
 # SQLite — WAL mode + retry for concurrent safety
@@ -2537,6 +2572,12 @@ async def chat_completions(raw_request: Request):
         pooled = False
         try:
             proxies = get_next_outbound_proxy()
+            if not is_egress_safe(proxies):
+                log.error("Egress leak prevented: no verified proxy or WARP tunnel active and HOST_DIRECT_IP is set.")
+                raise HTTPException(
+                    status_code=503,
+                    detail="Egress protection active: no verified WARP/proxy egress available. Direct host IP leak prevented."
+                )
             if is_stream:
                 session = create_fresh_session(is_stream)
             else:
@@ -2731,6 +2772,16 @@ async def chat_completions(raw_request: Request):
                                 except Exception:
                                     pass
 
+        except HTTPException:
+            if session:
+                if pooled:
+                    _release_pooled_session(active_url, session)
+                else:
+                    try:
+                        session.close()
+                    except Exception:
+                        pass
+            raise
         except Exception as e:
             if session:
                 if pooled:
@@ -3355,6 +3406,12 @@ async def anthropic_messages(raw_request: Request):
         pooled = False
         try:
             proxies = get_next_outbound_proxy()
+            if not is_egress_safe(proxies):
+                log.error("Egress leak prevented: no verified proxy or WARP tunnel active and HOST_DIRECT_IP is set.")
+                raise HTTPException(
+                    status_code=503,
+                    detail="Egress protection active: no verified WARP/proxy egress available. Direct host IP leak prevented."
+                )
             if is_stream:
                 session = create_fresh_session(is_stream)
             else:
@@ -3542,6 +3599,16 @@ async def anthropic_messages(raw_request: Request):
                                 except Exception:
                                     pass
 
+        except HTTPException:
+            if session:
+                if pooled:
+                    _release_pooled_session(active_url, session)
+                else:
+                    try:
+                        session.close()
+                    except Exception:
+                        pass
+            raise
         except Exception as e:
             if session:
                 if pooled:
@@ -3628,6 +3695,12 @@ async def responses_endpoint(raw_request: Request):
         pooled = False
         try:
             proxies = get_next_outbound_proxy()
+            if not is_egress_safe(proxies):
+                log.error("Egress leak prevented: no verified proxy or WARP tunnel active and HOST_DIRECT_IP is set.")
+                raise HTTPException(
+                    status_code=503,
+                    detail="Egress protection active: no verified WARP/proxy egress available. Direct host IP leak prevented."
+                )
             if is_stream:
                 session = create_fresh_session(is_stream)
             else:
@@ -3797,6 +3870,16 @@ async def responses_endpoint(raw_request: Request):
                                 except Exception:
                                     pass
 
+        except HTTPException:
+            if session:
+                if pooled:
+                    _release_pooled_session(active_url, session)
+                else:
+                    try:
+                        session.close()
+                    except Exception:
+                        pass
+            raise
         except Exception as e:
             if session:
                 if pooled:

@@ -26,12 +26,28 @@ MAX_RETRIES = int(os.environ.get("WARP_MAX_RETRIES", "5"))
 AUTO_RECYCLE_THRESHOLD = int(os.environ.get("AUTO_RECYCLE_THRESHOLD", "50"))
 CUSTOM_OUTBOUND_PROXY = os.environ.get("CUSTOM_OUTBOUND_PROXY", "").strip()
 HOST_DIRECT_IP = os.environ.get("HOST_DIRECT_IP", "").strip()
-WG_DIR = Path("/app/wireguard")
+WG_DIR = Path(os.environ.get("WG_DIR", "/app/data/wireguard"))
+if not WG_DIR.exists() and Path("/app/wireguard").exists():
+    try:
+        WG_DIR.mkdir(parents=True, exist_ok=True)
+        for item in Path("/app/wireguard").glob("*"):
+            if item.is_file():
+                shutil.copy2(item, WG_DIR / item.name)
+    except Exception:
+        pass
 WG_ACCOUNT = WG_DIR / "wgcf-account.toml"
 WG_PROFILE = WG_DIR / "wgcf-profile.conf"
 WG_QUICK_CONF = Path("/etc/wireguard/wgcf0.conf")
 WIREPROXY_CONFIG = WG_DIR / "wireproxy.conf"
 WIREPROXY_PORT = 41000
+
+def is_local_proxy_alive(port: int, timeout: float = 0.2) -> bool:
+    import socket
+    try:
+        with socket.create_connection(("127.0.0.1", port), timeout=timeout):
+            return True
+    except (OSError, ConnectionRefusedError):
+        return False
 
 # Rotation lifecycle callbacks (registered by server to drain and close sessions)
 _on_rotation_start_callbacks: List[Any] = []
@@ -231,8 +247,26 @@ def get_public_ip(proxy: Optional[Dict[str, str]] = None, require_warp: bool = T
     global HOST_DIRECT_IP
     if proxy is None:
         current_proxy = os.environ.get("CUSTOM_OUTBOUND_PROXY", "").strip()
+        if not current_proxy:
+            if is_local_proxy_alive(40000):
+                current_proxy = "socks5://127.0.0.1:40000"
+            elif is_local_proxy_alive(WIREPROXY_PORT):
+                current_proxy = f"socks5://127.0.0.1:{WIREPROXY_PORT}"
         if current_proxy:
             proxy = {"http": current_proxy, "https": current_proxy}
+
+    # If no proxy available and HOST_DIRECT_IP is set, guard against direct egress leak
+    if proxy is None and HOST_DIRECT_IP:
+        if not _is_wireguard_tunnel_active():
+            warp_tun_up = False
+            try:
+                r = subprocess.run(["ip", "link", "show", "dev", "CloudflareWARP"], capture_output=True, text=True, timeout=2, check=False)
+                warp_tun_up = (r.returncode == 0 and "UP" in r.stdout)
+            except Exception:
+                pass
+            if not warp_tun_up:
+                log.warning("No proxy or active tunnel interface available and HOST_DIRECT_IP (%s) is set — skipping unproxied public IP check to prevent leak.", HOST_DIRECT_IP)
+                return None
 
     # 1. Cloudflare trace (fastest, native to Cloudflare/WARP)
     for trace_url in ("https://cloudflare.com/cdn-cgi/trace", "https://1.1.1.1/cdn-cgi/trace"):
@@ -445,6 +479,8 @@ def _rotate_wireguard_account(old_ip: Optional[str]) -> bool:
     WG_DIR.mkdir(parents=True, exist_ok=True)
 
     # Keep backups so a failed re-register doesn't brick a working tunnel.
+    was_tunnel = False
+    was_proxy = False
     bak_account: Optional[bytes] = None
     bak_profile: Optional[bytes] = None
     bak_quick: Optional[bytes] = None
@@ -492,15 +528,14 @@ def _rotate_wireguard_account(old_ip: Optional[str]) -> bool:
         # light restart didn't change IP — fall through to re-register
         log.info("WireGuard light restart did not change IP — re-registering WARP account...")
 
-    # Phase 2: re-register a fresh WARP account
-    log.info("WireGuard rotation: re-registering WARP account via wgcf...")
+    # Phase 2: regenerate profile or register if account missing (reuse existing account to avoid 429 rate limit)
+    log.info("WireGuard rotation: generating profile via wgcf...")
     _teardown_wireguard_backends()
-    for p in (WG_ACCOUNT, WG_PROFILE):
-        try:
-            if p.exists():
-                p.unlink()
-        except Exception:
-            pass
+    try:
+        if WG_PROFILE.exists():
+            WG_PROFILE.unlink()
+    except Exception:
+        pass
     try:
         if WG_QUICK_CONF.exists():
             WG_QUICK_CONF.unlink()
@@ -508,10 +543,11 @@ def _rotate_wireguard_account(old_ip: Optional[str]) -> bool:
         pass
 
     try:
-        r1 = subprocess.run(["wgcf", "register", "--accept-tos"], cwd=str(WG_DIR), capture_output=True, text=True, timeout=30, check=False)
-        if r1.returncode != 0:
-            log.warning("wgcf register failed: %s %s", r1.stdout.strip()[:400], r1.stderr.strip()[:400])
-            raise RuntimeError("wgcf register failed")
+        if not WG_ACCOUNT.exists():
+            r1 = subprocess.run(["wgcf", "register", "--accept-tos"], cwd=str(WG_DIR), capture_output=True, text=True, timeout=30, check=False)
+            if r1.returncode != 0:
+                log.warning("wgcf register failed: %s %s", r1.stdout.strip()[:400], r1.stderr.strip()[:400])
+                raise RuntimeError("wgcf register failed")
         r2 = subprocess.run(["wgcf", "generate", "--profile", str(WG_PROFILE)], cwd=str(WG_DIR), capture_output=True, text=True, timeout=20, check=False)
         if r2.returncode != 0:
             log.warning("wgcf generate failed: %s %s", r2.stdout.strip()[:400], r2.stderr.strip()[:400])
@@ -716,6 +752,18 @@ def rotate_warp(reason: str = "Triggered", force: bool = False) -> bool:
                                 if n.returncode != 0 and "already registered" not in (n.stdout + n.stderr).lower():
                                     log.warning(f"registration new failed: {n.stderr.strip()[:200]}")
                                 time.sleep(1)
+                                # Re-apply proxy mode so warp-svc never reverts to tunnel mode and panics on nft
+                                subprocess.run([warp_bin, "--accept-tos", "mode", "proxy"], capture_output=True, timeout=8, check=False)
+                                subprocess.run([warp_bin, "--accept-tos", "proxy", "port", "40000"], capture_output=True, timeout=8, check=False)
+                                try:
+                                    p_dir = Path("/app/data/warp-client")
+                                    p_dir.mkdir(parents=True, exist_ok=True)
+                                    for fname in ("reg.json", "conf.json"):
+                                        src = Path(f"/var/lib/cloudflare-warp/{fname}")
+                                        if src.exists():
+                                            shutil.copy2(src, p_dir / fname)
+                                except Exception:
+                                    pass
 
                             res = subprocess.run([warp_bin, "--accept-tos", "connect"], capture_output=True, text=True, timeout=12, check=False)
                             if res.returncode != 0:

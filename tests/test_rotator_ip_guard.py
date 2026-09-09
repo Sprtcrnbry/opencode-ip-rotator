@@ -96,6 +96,49 @@ class RotatorIpGuardTests(unittest.TestCase):
             self.assertFalse(server._rotation_in_progress.is_set())
             self.assertTrue(mock_close.called)
 
+    def test_is_egress_safe_with_proxy(self):
+        proxy = {"http": "socks5://127.0.0.1:40000", "https": "socks5://127.0.0.1:40000"}
+        self.assertTrue(server.is_egress_safe(proxy))
+
+    def test_is_egress_safe_without_host_direct_ip(self):
+        with patch.dict(os.environ, {"HOST_DIRECT_IP": ""}), patch.object(rotator, "HOST_DIRECT_IP", ""):
+            self.assertTrue(server.is_egress_safe(None))
+
+    def test_is_egress_safe_blocks_leak_when_host_direct_ip_set(self):
+        with patch.dict(os.environ, {"HOST_DIRECT_IP": "141.11.190.114"}), \
+             patch.object(rotator, "HOST_DIRECT_IP", "141.11.190.114"), \
+             patch.object(rotator, "_is_wireguard_tunnel_active", return_value=False), \
+             patch("subprocess.run", return_value=MagicMock(returncode=1)):
+            self.assertFalse(server.is_egress_safe(None))
+
+    def test_get_next_outbound_proxy_detects_local_warp_proxy(self):
+        with patch.dict(os.environ, {"CUSTOM_OUTBOUND_PROXY": ""}), \
+             patch.object(server, "_proxy_pool", []), \
+             patch.object(rotator, "is_local_proxy_alive", side_effect=lambda port: port == 40000):
+            proxy = server.get_next_outbound_proxy()
+            self.assertEqual(proxy, {"http": "socks5://127.0.0.1:40000", "https": "socks5://127.0.0.1:40000"})
+
+    def test_get_next_outbound_proxy_detects_wireproxy(self):
+        with patch.dict(os.environ, {"CUSTOM_OUTBOUND_PROXY": ""}), \
+             patch.object(server, "_proxy_pool", []), \
+             patch.object(rotator, "is_local_proxy_alive", side_effect=lambda port: port == rotator.WIREPROXY_PORT):
+            proxy = server.get_next_outbound_proxy()
+            self.assertEqual(proxy, {
+                "http": f"socks5://127.0.0.1:{rotator.WIREPROXY_PORT}",
+                "https": f"socks5://127.0.0.1:{rotator.WIREPROXY_PORT}"
+            })
+
+    def test_get_public_ip_skips_unproxied_check_when_host_ip_and_no_tunnel(self):
+        rotator.HOST_DIRECT_IP = "141.11.190.114"
+        with patch.dict(os.environ, {"CUSTOM_OUTBOUND_PROXY": "", "HOST_DIRECT_IP": "141.11.190.114"}), \
+             patch.object(rotator, "is_local_proxy_alive", return_value=False), \
+             patch.object(rotator, "_is_wireguard_tunnel_active", return_value=False), \
+             patch("subprocess.run", return_value=MagicMock(returncode=1)), \
+             patch("curl_cffi.requests.get") as mock_get:
+            ip = rotator.get_public_ip(proxy=None, require_warp=True)
+            self.assertIsNone(ip)
+            self.assertFalse(mock_get.called)
+
 
 if __name__ == "__main__":
     unittest.main()
