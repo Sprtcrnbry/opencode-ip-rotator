@@ -395,6 +395,64 @@ class TranslationPayloadTests(unittest.TestCase):
         keys = list(sorted_dict.keys())
         self.assertEqual(keys, ["model-huge", "model-mid", "model-small"])
 
+    def test_strip_encrypted_content_recursive(self):
+        sample = {
+            "model": "test",
+            "encrypted_content": "bad_token_1",
+            "nested": {
+                "encrypted_content": "bad_token_2",
+                "keep": "me"
+            },
+            "array": [
+                {"encrypted_content": "bad_token_3", "val": 123},
+                "string_item"
+            ]
+        }
+        res = server.strip_encrypted_content(sample)
+        self.assertNotIn("encrypted_content", res)
+        self.assertNotIn("encrypted_content", res["nested"])
+        self.assertEqual(res["nested"]["keep"], "me")
+        self.assertNotIn("encrypted_content", res["array"][0])
+        self.assertEqual(res["array"][0]["val"], 123)
+
+    def test_sanitize_responses_input_reasoning(self):
+        raw_inputs = [
+            {"role": "user", "content": "hello"},
+            {
+                "type": "reasoning",
+                "summary": [{"type": "summary_text", "text": "thought"}],
+                "encrypted_content": "ciphertext_xyz"
+            },
+            {
+                "type": "reasoning",
+                "encrypted_content": "ciphertext_abc"
+            }
+        ]
+        sanitized = server.sanitize_responses_input(raw_inputs)
+        self.assertEqual(len(sanitized), 3)
+        self.assertEqual(sanitized[0], {"role": "user", "content": "hello"})
+        # First reasoning item: encrypted_content stripped, summary preserved
+        self.assertNotIn("encrypted_content", sanitized[1])
+        self.assertEqual(sanitized[1]["summary"], [{"type": "summary_text", "text": "thought"}])
+        # Second reasoning item: encrypted_content stripped, default summary: [] created
+        self.assertNotIn("encrypted_content", sanitized[2])
+        self.assertEqual(sanitized[2]["summary"], [])
+
+    def test_optimize_payload_strips_encrypted_content(self):
+        payload = {
+            "model": "muse-spark-1.3-contributor-free",
+            "input": [
+                {"type": "reasoning", "encrypted_content": "secret", "summary": []},
+                {"role": "user", "content": "hi"}
+            ],
+            "encrypted_content": "top_secret"
+        }
+        optimized = server.optimize_payload_for_upstream(payload)
+        self.assertNotIn("encrypted_content", optimized)
+        self.assertNotIn("encrypted_content", optimized["input"][0])
+        self.assertEqual(optimized["input"][0]["summary"], [])
+
 
 if __name__ == "__main__":
     unittest.main()
+

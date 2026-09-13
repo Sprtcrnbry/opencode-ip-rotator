@@ -1009,9 +1009,110 @@ def _is_loopback_ip(value: str) -> bool:
         return False
 
 
+def strip_encrypted_content(obj: Any) -> Any:
+    """Recursively remove 'encrypted_content' from dicts/lists to avoid HTTP 400:
+    '[invalid_request_error] reasoning encrypted_content was not issued to this caller'."""
+    if isinstance(obj, dict):
+        obj.pop("encrypted_content", None)
+        for v in obj.values():
+            strip_encrypted_content(v)
+    elif isinstance(obj, list):
+        for elem in obj:
+            strip_encrypted_content(elem)
+    return obj
+
+
+def normalize_content_for_responses(content, role: str = "user"):
+    """Normalize message content for Responses API:
+    - If None: returns empty string
+    - If str: returns str as-is
+    - If list:
+        - If all parts are text: join them into a single string (100% compatible with Responses API)
+        - If multimodal (images): map text parts to 'input_text' (for user) or 'output_text' (for assistant),
+          and map 'image_url' object {'url': ...} to 'type': 'input_image' with string 'image_url': ...
+    """
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        has_media = any(isinstance(p, dict) and p.get("type") not in ("text", "input_text", "output_text") for p in content)
+        if not has_media:
+            texts = []
+            for p in content:
+                if isinstance(p, str):
+                    texts.append(p)
+                elif isinstance(p, dict):
+                    texts.append(p.get("text") or "")
+                else:
+                    texts.append(str(p))
+            return "\n\n".join(texts)
+        else:
+            parts = []
+            for p in content:
+                if not isinstance(p, dict):
+                    if isinstance(p, str):
+                        target_type = "input_text" if role == "user" else "output_text"
+                        parts.append({"type": target_type, "text": p})
+                    continue
+                ptype = p.get("type")
+                if ptype in ("text", "input_text", "output_text"):
+                    target_type = "input_text" if role == "user" else "output_text"
+                    parts.append({"type": target_type, "text": p.get("text", "")})
+                elif ptype in ("image_url", "input_image"):
+                    img = p.get("image_url") or p.get("image") or p.get("url")
+                    url_str = img.get("url") if isinstance(img, dict) else (img or "")
+                    parts.append({"type": "input_image", "image_url": url_str})
+                else:
+                    parts.append(p)
+            return parts
+    return str(content)
+
+
+def sanitize_responses_input(input_items: list) -> list:
+    """Sanitize input items for OpenAI Responses API:
+    - Recursively strips caller-specific 'encrypted_content' from reasoning items and other structures
+      to prevent '400 [invalid_request_error] reasoning encrypted_content was not issued to this caller'.
+    - Ensures reasoning items (type == 'reasoning') have required 'summary' field (defaulting to [])
+      to prevent '400 [invalid_request_error] missing required field summary'.
+    - Normalizes content for items with 'role' and 'content'.
+    """
+    if not isinstance(input_items, list):
+        return input_items
+
+    sanitized = []
+    for item in input_items:
+        if not isinstance(item, dict):
+            sanitized.append(item)
+            continue
+
+        it = dict(item)
+        strip_encrypted_content(it)
+
+        itype = it.get("type")
+        if itype == "reasoning":
+            if "summary" not in it or it["summary"] is None:
+                it["summary"] = []
+        elif "role" in it and "content" in it:
+            it["content"] = normalize_content_for_responses(it["content"], it.get("role", "user"))
+
+        sanitized.append(it)
+    return sanitized
+
+
 def optimize_payload_for_upstream(payload: dict) -> dict:
     """Ensures payload size stays safely within upstream OpenCode Zen's ingress limits (< 1.5MB)
     and strictly validates tool/assistant message pairings to prevent HTTP 400 Bad Request."""
+    if not isinstance(payload, dict):
+        return payload
+
+    # Always strip encrypted_content across the entire payload
+    strip_encrypted_content(payload)
+
+    # Sanitize Responses API input items if present
+    if "input" in payload and isinstance(payload["input"], list):
+        payload["input"] = sanitize_responses_input(payload["input"])
+
     # Upstream Zen only supports tool_choice="auto" / "required" / {"type":"function",...} — normalize bare strings only
     tc = payload.get("tool_choice")
     if isinstance(tc, str) and tc not in ("auto", "required", "none"):
@@ -1020,6 +1121,7 @@ def optimize_payload_for_upstream(payload: dict) -> dict:
     messages = payload.get("messages")
     if not isinstance(messages, list) or not messages:
         return payload
+
 
     try:
         candidate_messages = messages
@@ -2659,6 +2761,19 @@ async def chat_completions(raw_request: Request):
                         continue
 
             raw_err_text = extract_response_body(response) if response.status_code != 200 else ""
+            if response.status_code == 400 and ("encrypted_content" in raw_err_text.lower() or "not issued to this caller" in raw_err_text.lower()):
+                log.warning("Upstream rejected encrypted_content for '%s': %s. Stripping encrypted_content and retrying immediately...", current_model, raw_err_text[:120])
+                if session and not pooled:
+                    try:
+                        session.close()
+                    except Exception:
+                        pass
+                    session = None
+                strip_encrypted_content(active_payload)
+                if isinstance(active_payload.get("input"), list):
+                    active_payload["input"] = sanitize_responses_input(active_payload["input"])
+                continue
+
             is_model_unavailable = (
                 response.status_code >= 500
                 or (response.status_code == 400 and any(kw in raw_err_text.lower() for kw in ("not supported", "unavailable", "does not exist", "not found")))
@@ -3066,52 +3181,6 @@ def is_responses_model(model_name: str) -> bool:
     return "muse-spark" in norm
 
 
-def normalize_content_for_responses(content, role: str = "user"):
-    """Normalize message content for Responses API:
-    - If None: returns empty string
-    - If str: returns str as-is
-    - If list:
-        - If all parts are text: join them into a single string (100% compatible with Responses API)
-        - If multimodal (images): map text parts to 'input_text' (for user) or 'output_text' (for assistant),
-          and map 'image_url' object {'url': ...} to 'type': 'input_image' with string 'image_url': ...
-    """
-    if content is None:
-        return ""
-    if isinstance(content, str):
-        return content
-    if isinstance(content, list):
-        has_media = any(isinstance(p, dict) and p.get("type") not in ("text", "input_text", "output_text") for p in content)
-        if not has_media:
-            texts = []
-            for p in content:
-                if isinstance(p, str):
-                    texts.append(p)
-                elif isinstance(p, dict):
-                    texts.append(p.get("text") or "")
-                else:
-                    texts.append(str(p))
-            return "\n\n".join(texts)
-        else:
-            parts = []
-            for p in content:
-                if not isinstance(p, dict):
-                    if isinstance(p, str):
-                        target_type = "input_text" if role == "user" else "output_text"
-                        parts.append({"type": target_type, "text": p})
-                    continue
-                ptype = p.get("type")
-                if ptype in ("text", "input_text", "output_text"):
-                    target_type = "input_text" if role == "user" else "output_text"
-                    parts.append({"type": target_type, "text": p.get("text", "")})
-                elif ptype in ("image_url", "input_image"):
-                    img = p.get("image_url") or p.get("image") or p.get("url")
-                    url_str = img.get("url") if isinstance(img, dict) else (img or "")
-                    parts.append({"type": "input_image", "image_url": url_str})
-                else:
-                    parts.append(p)
-            return parts
-    return str(content)
-
 
 def normalize_content_for_chat(content):
     """Normalize Responses API content for standard OpenAI Chat Completions:
@@ -3212,7 +3281,8 @@ def chat_to_responses_payload(payload: dict) -> dict:
 
     if instructions:
         out["instructions"] = "\n\n".join(instructions)
-    out["input"] = input_items
+    out["input"] = sanitize_responses_input(input_items)
+    strip_encrypted_content(out)
 
     # Tools: Responses API accepts flat tools
     tools = []
@@ -3608,6 +3678,19 @@ async def anthropic_messages(raw_request: Request):
                         continue
 
             raw_err_text = extract_response_body(response) if response.status_code != 200 else ""
+            if response.status_code == 400 and ("encrypted_content" in raw_err_text.lower() or "not issued to this caller" in raw_err_text.lower()):
+                log.warning("Upstream rejected encrypted_content for '%s': %s. Stripping encrypted_content and retrying immediately...", model_name, raw_err_text[:120])
+                if session and not pooled:
+                    try:
+                        session.close()
+                    except Exception:
+                        pass
+                    session = None
+                strip_encrypted_content(active_payload)
+                if isinstance(active_payload.get("input"), list):
+                    active_payload["input"] = sanitize_responses_input(active_payload["input"])
+                continue
+
             is_model_unavailable = (
                 response.status_code >= 500
                 or (response.status_code == 400 and any(kw in raw_err_text.lower() for kw in ("not supported", "unavailable", "does not exist", "not found")))
@@ -3799,9 +3882,8 @@ async def responses_endpoint(raw_request: Request):
         body["safety_identifier"] = body.get("user", "opencode-user")
 
     if isinstance(body.get("input"), list):
-        for item in body["input"]:
-            if isinstance(item, dict) and "content" in item:
-                item["content"] = normalize_content_for_responses(item["content"], item.get("role", "user"))
+        body["input"] = sanitize_responses_input(body["input"])
+    strip_encrypted_content(body)
 
     headers = build_opencode_headers(raw_request, fresh_session=True)
     last_error_resp: Optional[JSONResponse] = None
@@ -3901,6 +3983,19 @@ async def responses_endpoint(raw_request: Request):
                         continue
 
             raw_err_text = extract_response_body(response) if response.status_code != 200 else ""
+            if response.status_code == 400 and ("encrypted_content" in raw_err_text.lower() or "not issued to this caller" in raw_err_text.lower()):
+                log.warning("Upstream rejected encrypted_content for '%s': %s. Stripping encrypted_content and retrying immediately...", model_name, raw_err_text[:120])
+                if session and not pooled:
+                    try:
+                        session.close()
+                    except Exception:
+                        pass
+                    session = None
+                strip_encrypted_content(active_payload)
+                if isinstance(active_payload.get("input"), list):
+                    active_payload["input"] = sanitize_responses_input(active_payload["input"])
+                continue
+
             is_model_unavailable = (
                 response.status_code >= 500
                 or (response.status_code == 400 and any(kw in raw_err_text.lower() for kw in ("not supported", "unavailable", "does not exist", "not found")))
